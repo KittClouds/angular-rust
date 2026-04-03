@@ -2,8 +2,8 @@ import { Injectable, computed, inject, signal } from '@angular/core';
 
 import { getSetting, setSetting } from '../dexie/settings.service';
 import { ScopeService } from './scope.service';
+import { PhoenixBackendService } from '../../services/phoenix-backend.service';
 import { PhoenixStoreService } from '../../services/phoenix-store.service';
-import { PhoenixWasmService } from '../../services/phoenix-wasm.service';
 
 export interface Thread {
     id: string;
@@ -330,7 +330,7 @@ type PhoenixThreadMessageRecord = {
 
 @Injectable({ providedIn: 'root' })
 export class PhoenixChatService {
-    private readonly phoenix = inject(PhoenixWasmService);
+    private readonly phoenix = inject(PhoenixBackendService);
     private readonly scopeService = inject(ScopeService);
     private readonly storeService = inject(PhoenixStoreService);
 

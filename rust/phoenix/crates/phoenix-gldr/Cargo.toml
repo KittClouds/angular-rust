@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+phoenix-graph = { path = "../phoenix-graph" }
 phoenix-graptor = { path = "../phoenix-graptor" }
 phoenix-lex = { path = "../phoenix-lex" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }

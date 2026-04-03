@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-triverse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-graptor = { path = "../phoenix-graptor" }
+phoenix-lex = { path = "../phoenix-lex" }
+phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-types = { path = "../phoenix-types" }
+rustc-hash.workspace = true
+scirs2-graph = "0.4.1"
+serde_json.workspace = true

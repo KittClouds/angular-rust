@@ -8,6 +8,8 @@ authors.workspace = true
 [dependencies]
 phoenix-analytics = { path = "../phoenix-analytics" }
 phoenix-chat = { path = "../phoenix-chat" }
+phoenix-graph = { path = "../phoenix-graph" }
+phoenix-graph-native = { path = "../phoenix-graph-native" }
 phoenix-gldr = { path = "../phoenix-gldr" }
 phoenix-graptor = { path = "../phoenix-graptor" }
 phoenix-lex = { path = "../phoenix-lex" }
@@ -15,7 +17,9 @@ phoenix-om = { path = "../phoenix-om" }
 phoenix-om-graptor = { path = "../phoenix-om-graptor" }
 phoenix-scanner = { path = "../phoenix-scanner" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-store-kyu = { path = "../phoenix-store-kyu" }
 phoenix-structure = { path = "../phoenix-structure" }
+phoenix-triverse = { path = "../phoenix-triverse" }
 phoenix-types = { path = "../phoenix-types" }
 serde.workspace = true
 serde_json.workspace = true

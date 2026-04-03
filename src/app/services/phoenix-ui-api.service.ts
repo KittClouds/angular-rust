@@ -6,8 +6,8 @@ import {
     groupDiscoveryMentions,
 } from '../lib/phoenix/phoenix-discovery';
 import { smartGraphRegistry } from '../lib/registry';
+import { PhoenixBackendService } from './phoenix-backend.service';
 import { PhoenixStoreService } from './phoenix-store.service';
-import { PhoenixWasmService } from './phoenix-wasm.service';
 
 export interface ProvenanceContext {
     vaultId?: string;
@@ -59,7 +59,7 @@ type DictionaryEntry = {
 
 @Injectable({ providedIn: 'root' })
 export class PhoenixUiApiService {
-    private readonly phoenix = inject(PhoenixWasmService);
+    private readonly phoenix = inject(PhoenixBackendService);
     private readonly store = inject(PhoenixStoreService);
 
     private ready = false;
@@ -83,7 +83,7 @@ export class PhoenixUiApiService {
         this.readyCallbacks.add(callback);
     }
 
-    async loadWasm(): Promise<void> {
+    async loadRuntime(): Promise<void> {
         if (this.readyPromise) {
             return this.readyPromise;
         }
@@ -95,8 +95,12 @@ export class PhoenixUiApiService {
         return this.readyPromise;
     }
 
+    async loadWasm(): Promise<void> {
+        await this.loadRuntime();
+    }
+
     async hydrateWithEntities(): Promise<void> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.hydrateWithEntitiesInternal();
     }
 
@@ -137,7 +141,7 @@ export class PhoenixUiApiService {
             folderPath?: string;
         }>,
     ): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const sessionId = await this.ensureMainSession();
         const documents = notes.map((note) => this.noteInputToDocument({
             id: note.id,
@@ -162,14 +166,14 @@ export class PhoenixUiApiService {
         version?: number,
         meta?: { title?: string; narrativeId?: string; folderPath?: string },
     ): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const note = await this.resolveNoteIngestInput(id, text, version, meta);
         await this.ingestNoteInputs([note], await this.ensureMainSession());
         return { success: true };
     }
 
     async indexNote(id: string, text: string, scope?: SearchScope): Promise<void> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const note = await this.resolveNoteIngestInput(id, text, undefined, {
             narrativeId: scope?.narrativeId,
             folderPath: scope?.folderPath,
@@ -182,7 +186,7 @@ export class PhoenixUiApiService {
     }
 
     async searchScoped(query: string, limit = 20, scope?: SearchScope): Promise<any[]> {
-        await this.loadWasm();
+        await this.loadRuntime();
         if (!query.trim()) {
             return [];
         }
@@ -214,7 +218,7 @@ export class PhoenixUiApiService {
     }
 
     async scan(text: string, provenance?: ProvenanceContext): Promise<any> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const scan = await this.phoenix.scan({
             text,
             scope: this.toPhoenixScope({ folderPath: provenance?.parentPath }),
@@ -235,7 +239,7 @@ export class PhoenixUiApiService {
     }
 
     async scanDiscovery(text: string): Promise<PhoenixDiscoveryCandidate[]> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const scan = await this.phoenix.scan({
             text,
             scope: {},
@@ -248,7 +252,7 @@ export class PhoenixUiApiService {
     }
 
     async scanImplicitAsync(text: string): Promise<DecorationSpan[]> {
-        await this.loadWasm();
+        await this.loadRuntime();
         if (!this.dictionary.length) {
             await this.hydrateWithEntities();
         }
@@ -256,33 +260,33 @@ export class PhoenixUiApiService {
     }
 
     async analyzeText(text: string): Promise<any> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return this.phoenix.analyzeText(text);
     }
 
     async knowledgeInit(): Promise<{ success: boolean; message?: string; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('knowledge-init');
         await this.refreshKnowledgeGraph();
         return { success: true, message: 'Phoenix knowledge graph ready' };
     }
 
     async knowledgeLoad(): Promise<{ success: boolean; message?: string; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('knowledge-load');
         await this.refreshKnowledgeGraph();
         return { success: true, message: 'Phoenix knowledge graph loaded' };
     }
 
     async knowledgeSync(): Promise<{ success: boolean; message?: string; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('knowledge-sync');
         await this.refreshKnowledgeGraph();
         return { success: true, message: 'Phoenix knowledge graph synced' };
     }
 
     async knowledgeSave(): Promise<{ success: boolean; message?: string; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return { success: true, message: 'Phoenix graph is already persisted' };
     }
 
@@ -292,7 +296,7 @@ export class PhoenixUiApiService {
         label?: string;
         props?: Record<string, unknown>;
     }): Promise<{ success: boolean; message?: string; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('knowledge-add-node');
         await this.phoenix.storeCommand('relation:upsert', {
             relation: 'graph_vertices',
@@ -326,7 +330,7 @@ export class PhoenixUiApiService {
         weight?: number;
         props?: Record<string, unknown>;
     }): Promise<{ success: boolean; message?: string; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('knowledge-add-edge');
         await this.phoenix.storeCommand('relation:upsert', {
             relation: 'graph_edges',
@@ -393,7 +397,7 @@ export class PhoenixUiApiService {
     }
 
     async gldrInit(): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-init');
         const session = await this.phoenix.createSession('phoenix-ui-gldr', {});
         this.gldrSessionId = String(session?.sessionId || '');
@@ -401,7 +405,7 @@ export class PhoenixUiApiService {
     }
 
     async gldrRegisterEntity(_name: string, _entityId: string): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return { success: true };
     }
 
@@ -410,7 +414,7 @@ export class PhoenixUiApiService {
         fields: Record<string, string>,
         _mentions: Array<{ entityId: string; count: number }>,
     ): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-index-chunk');
         const sessionId = await this.ensureGldrSession();
         await this.ingestDocumentsIntoSession(sessionId, [{
@@ -431,7 +435,7 @@ export class PhoenixUiApiService {
             embedding: Float32Array;
         }>,
     ): Promise<{ success: boolean; error?: string; count?: number; dim?: number }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-index-embeddings');
         const sessionId = await this.ensureGldrSession();
         await this.ingestDocumentsIntoSession(
@@ -455,17 +459,17 @@ export class PhoenixUiApiService {
         _sourceId: string,
         _edge: { targetId: string; relType: string; confidence?: number; source?: string },
     ): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return { success: true };
     }
 
     async gldrLoadCooccurrences(_minCount = 2): Promise<{ success: boolean; edgesLoaded?: number; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return { success: true, edgesLoaded: 0 };
     }
 
     async gldrSearch(query: string, config: Record<string, unknown> = {}): Promise<string> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-search');
         const sessionId = await this.ensureGldrSession();
         const limit = typeof config['topChunks'] === 'number' ? Number(config['topChunks']) : 12;
@@ -493,7 +497,7 @@ export class PhoenixUiApiService {
         embedding: Float32Array,
         config: Record<string, unknown> = {},
     ): Promise<string> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-search-embedding');
         const sessionId = await this.ensureGldrSession();
         const limit = typeof config['topChunks'] === 'number' ? Number(config['topChunks']) : 12;
@@ -518,7 +522,7 @@ export class PhoenixUiApiService {
     }
 
     async gldrSearchNodes(query: string, config: Record<string, unknown> = {}): Promise<string> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-search-nodes');
         const sessionId = await this.ensureGldrSession();
         const limit = typeof config['topChunks'] === 'number' ? Number(config['topChunks']) : 12;
@@ -545,7 +549,7 @@ export class PhoenixUiApiService {
         embedding: Float32Array,
         config: Record<string, unknown> = {},
     ): Promise<string> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-search-nodes-embedding');
         const sessionId = await this.ensureGldrSession();
         const limit = typeof config['topChunks'] === 'number' ? Number(config['topChunks']) : 12;
@@ -569,7 +573,7 @@ export class PhoenixUiApiService {
     }
 
     async gldrStats(): Promise<string> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('gldr-stats');
         if (!this.gldrSessionId) {
             return JSON.stringify({ entities: 0, chunks: 0, edges: 0 });
@@ -583,7 +587,7 @@ export class PhoenixUiApiService {
     }
 
     async systemCreateSession(config: Record<string, unknown> = {}): Promise<{ sessionId: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const label = typeof config['label'] === 'string' ? String(config['label']) : 'phoenix-ui-session';
         const scope = this.toPhoenixScope(config['scope'] as SearchScope | undefined);
         const response = await this.phoenix.createSession(label, scope);
@@ -591,7 +595,7 @@ export class PhoenixUiApiService {
     }
 
     async systemIngest<T = any>(sessionId: string, request: Record<string, unknown>): Promise<T> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.store.ensureDerivedLoaded('system-ingest');
         const result = await (this.phoenix.ingest({ sessionId, ...request }) as Promise<T>);
         this.store.markDerivedDirty();
@@ -599,33 +603,33 @@ export class PhoenixUiApiService {
     }
 
     async systemSearch<T = any>(sessionId: string, request: Record<string, unknown>): Promise<T> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return this.phoenix.query({ sessionId, ...request }) as Promise<T>;
     }
 
     async systemCommit<T = any>(sessionId: string, request: Record<string, unknown> = {}): Promise<T> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return this.phoenix.commit(sessionId, request) as Promise<T>;
     }
 
     async systemGetState<T = any>(sessionId: string): Promise<T> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return this.phoenix.sessionState(sessionId) as Promise<T>;
     }
 
     async systemGetStats<T = any>(sessionId: string): Promise<T> {
-        await this.loadWasm();
+        await this.loadRuntime();
         return this.phoenix.sessionStats(sessionId) as Promise<T>;
     }
 
     async systemClose(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        await this.loadWasm();
+        await this.loadRuntime();
         await this.phoenix.storeCommand('session:close', { sessionId });
         return { success: true };
     }
 
     async systemRun<T = any>(request: Record<string, unknown>): Promise<T> {
-        await this.loadWasm();
+        await this.loadRuntime();
         const created = typeof request['sessionId'] === 'string' ? null : await this.systemCreateSession({});
         const sessionId = typeof request['sessionId'] === 'string' ? String(request['sessionId']) : created!.sessionId;
         const result: Record<string, unknown> = { sessionId };

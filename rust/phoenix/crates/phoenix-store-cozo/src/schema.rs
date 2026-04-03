@@ -273,6 +273,19 @@ const SEMANTIC_DOCUMENTS: &[PhoenixColumnSpec] = &[
     col("vec", PhoenixColumnType::VectorF32(384), false, false),
     col("model_id", PhoenixColumnType::String, false, false),
     col("leaf_count", PhoenixColumnType::Int, false, false),
+    col("evidence_refs", PhoenixColumnType::Json, true, false),
+    col("updated_at", PhoenixColumnType::Int, false, false),
+];
+
+const SEMANTIC_NODE_PROTOTYPES: &[PhoenixColumnSpec] = &[
+    col("node_id", PhoenixColumnType::String, false, true),
+    col("node_kind", PhoenixColumnType::String, false, false),
+    col("document_id", PhoenixColumnType::String, true, false),
+    col("narrative_id", PhoenixColumnType::String, true, false),
+    col("folder_id", PhoenixColumnType::String, true, false),
+    col("vec", PhoenixColumnType::VectorF32(384), false, false),
+    col("model_id", PhoenixColumnType::String, false, false),
+    col("evidence_refs", PhoenixColumnType::Json, true, false),
     col("updated_at", PhoenixColumnType::Int, false, false),
 ];
 
@@ -666,6 +679,22 @@ const GRAPH_EDGES: &[PhoenixColumnSpec] = &[
     col("edge_type", PhoenixColumnType::String, false, false),
 ];
 
+const GRAPH_CANDIDATE_EDGES: &[PhoenixColumnSpec] = &[
+    col("source_id", PhoenixColumnType::String, false, true),
+    col("target_id", PhoenixColumnType::String, false, true),
+    col("edge_type", PhoenixColumnType::String, false, true),
+    col("document_id", PhoenixColumnType::String, true, false),
+    col("narrative_id", PhoenixColumnType::String, true, false),
+    col("valid_from_doc", PhoenixColumnType::String, true, false),
+    col("valid_from_boundary", PhoenixColumnType::Int, true, false),
+    col("valid_to_doc", PhoenixColumnType::String, true, false),
+    col("valid_to_boundary", PhoenixColumnType::Int, true, false),
+    col("assertion_kind", PhoenixColumnType::String, true, false),
+    col("weight", PhoenixColumnType::Int, false, false),
+    col("attributes", PhoenixColumnType::Json, false, false),
+    col("data", PhoenixColumnType::Json, true, false),
+];
+
 const GRAPH_NODE_INDEX: &[PhoenixColumnSpec] = &[
     col("id", PhoenixColumnType::String, false, true),
     col("idx", PhoenixColumnType::Int, false, false),
@@ -720,6 +749,7 @@ pub const ALL_RELATIONS: &[PhoenixRelationSpec] = &[
     PhoenixRelationSpec::new("om_graph_index", OM_GRAPH_INDEX),
     PhoenixRelationSpec::new("semantic_vectors", SEMANTIC_VECTORS),
     PhoenixRelationSpec::new("semantic_documents", SEMANTIC_DOCUMENTS),
+    PhoenixRelationSpec::new("semantic_node_prototypes", SEMANTIC_NODE_PROTOTYPES),
     PhoenixRelationSpec::new("workspace_artifacts", WORKSPACE_ARTIFACTS),
     PhoenixRelationSpec::new("chat_runs", CHAT_RUNS),
     PhoenixRelationSpec::new("chat_run_events", CHAT_RUN_EVENTS),
@@ -748,6 +778,7 @@ pub const ALL_RELATIONS: &[PhoenixRelationSpec] = &[
     PhoenixRelationSpec::new("document_boundaries", DOCUMENT_BOUNDARIES),
     PhoenixRelationSpec::new("graph_vertices", GRAPH_VERTICES),
     PhoenixRelationSpec::new("graph_edges", GRAPH_EDGES),
+    PhoenixRelationSpec::new("graph_candidate_edges", GRAPH_CANDIDATE_EDGES),
     PhoenixRelationSpec::new("graph_node_index", GRAPH_NODE_INDEX),
     PhoenixRelationSpec::new("graph_properties", GRAPH_PROPERTIES),
     PhoenixRelationSpec::new("graph_vertex_labels", GRAPH_VERTEX_LABELS),
@@ -758,6 +789,7 @@ pub const ALL_RELATIONS: &[PhoenixRelationSpec] = &[
 pub const DERIVED_SNAPSHOT_RELATIONS: &[&str] = &[
     "semantic_vectors",
     "semantic_documents",
+    "semantic_node_prototypes",
     "hnsw_index",
     "docid_map",
     "chunkid_map",
@@ -769,6 +801,7 @@ pub const DERIVED_SNAPSHOT_RELATIONS: &[&str] = &[
     "document_boundaries",
     "graph_vertices",
     "graph_edges",
+    "graph_candidate_edges",
     "graph_node_index",
     "graph_properties",
     "graph_vertex_labels",
@@ -818,6 +851,7 @@ pub const CORE_RELATIONS: &[&str] = &[
     "om_graph_index",
     "semantic_vectors",
     "semantic_documents",
+    "semantic_node_prototypes",
     "spans",
     "chunks",
     "raptor_nodes",
@@ -828,5 +862,6 @@ pub const CORE_RELATIONS: &[&str] = &[
     "document_boundaries",
     "graph_vertices",
     "graph_edges",
+    "graph_candidate_edges",
     "graph_properties",
 ];

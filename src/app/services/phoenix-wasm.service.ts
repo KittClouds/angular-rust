@@ -11,6 +11,7 @@ import {
     PROTOCOL_VERSION,
     REQUEST_FLAG_HAS_SESSION,
     REQUEST_FLAG_HAS_TEMPORAL,
+    REQUEST_FLAG_INCLUDE_CANDIDATE_GRAPH,
     REQUEST_FLAG_TARGET_CHUNKS,
     REQUEST_FLAG_TARGET_GRAPH,
     REQUEST_FLAG_TARGET_NODES,
@@ -19,6 +20,11 @@ import {
     writePacketHeader,
 } from '../lib/phoenix/wasm-protocol';
 import { EmbeddingWorkerService } from '../lib/services/embedding-worker.service';
+import {
+    NliWorkerService,
+    type NliClassificationResult,
+    type NliPairClassificationInput,
+} from '../lib/services/nli-worker.service';
 import { createNoopNgZone, createWorkerOutsideAngular } from '../lib/core/worker-zone';
 
 export interface PhoenixScope {
@@ -297,17 +303,43 @@ type PhoenixSemanticDocumentVector = {
     documentId: string;
     values: Float32Array;
     leafCount: number;
+    evidenceRefs: string[];
 };
 
+type PhoenixSemanticCandidatePrototypeInput = {
+    nodeId: string;
+    nodeKind: string;
+    documentId?: string;
+    narrativeId?: string;
+    folderId?: string;
+    text: string;
+    evidenceRefs: string[];
+};
+
+type PhoenixSemanticPrototypeVectorRecord = {
+    nodeId: string;
+    nodeKind: string;
+    documentId: string | undefined;
+    narrativeId: string | undefined;
+    folderId: string | undefined;
+    evidenceRefs: string[];
+    values: Float32Array;
+};
+
+type PhoenixSemanticNliJudgmentInput = NliPairClassificationInput;
+
 const SEMANTIC_EMBEDDING_MODEL_ID = 'mongodb-leaf';
+const SEMANTIC_NLI_MODEL_ID = 'onnx-community/ModernBERT-base-nli-ONNX';
 const SEMANTIC_VECTOR_DIM = 384;
 const SEMANTIC_EMBED_BATCH_SIZE = 16;
+const SEMANTIC_NLI_BATCH_SIZE = 4;
 const QUERY_BINARY_HEADER_LEN = 22 * 4;
 const EMBED_UPSERT_HEADER_LEN = 4 * 4;
 
 @Injectable({ providedIn: 'root' })
 export class PhoenixWasmService {
     private readonly embeddingWorker = inject(EmbeddingWorkerService);
+    private readonly nliWorker = inject(NliWorkerService);
     private worker: Worker | null = null;
     private workerReady = false;
     private loadPromise: Promise<void> | null = null;
@@ -372,6 +404,7 @@ export class PhoenixWasmService {
                     graptor: true,
                     gldr: true,
                     semantic: true,
+                    candidateGraph: true,
                 },
             },
             storagePath: null,
@@ -786,6 +819,10 @@ export class PhoenixWasmService {
         await this.embeddingWorker.initialize(SEMANTIC_EMBEDDING_MODEL_ID);
     }
 
+    private async ensureSemanticNliWorker(): Promise<void> {
+        await this.nliWorker.initialize(SEMANTIC_NLI_MODEL_ID);
+    }
+
     private async embedQueryText(queryText: string): Promise<Float32Array> {
         return this.enqueueEmbeddingTask(async () => {
             await this.ensureSemanticEmbeddingWorker();
@@ -806,7 +843,10 @@ export class PhoenixWasmService {
 
         await this.ensureSemanticEmbeddingWorker();
         let writeChain = Promise.resolve();
-        const documentAccumulator = new Map<string, { sum: Float32Array; leafCount: number }>();
+        const documentAccumulator = new Map<
+            string,
+            { sum: Float32Array; leafCount: number; evidenceRefs: Set<string> }
+        >();
         await this.embeddingWorker.embedStream(
             chunks.map((chunk) => chunk.text),
             (batch) => {
@@ -821,6 +861,7 @@ export class PhoenixWasmService {
                         accumulateSemanticDocumentVector(
                             documentAccumulator,
                             chunk.documentId,
+                            chunk.spanId,
                             values,
                         );
                         return {
@@ -844,8 +885,98 @@ export class PhoenixWasmService {
                     documentId: record.documentId,
                     leafCount: record.leafCount,
                     values: Array.from(record.values),
+                    evidenceRefs: record.evidenceRefs,
                 })),
             });
+        }
+
+        const prototypeInputs = normalizeSemanticCandidatePrototypeInputs(
+            await this.storeCommand('semantic:listCandidatePrototypeInputs', { documentIds }),
+        );
+        if (prototypeInputs.length) {
+            let prototypeWriteChain = Promise.resolve();
+            await this.embeddingWorker.embedStream(
+                prototypeInputs.map((row) => row.text),
+                (batch) => {
+                    const batchStart = batch.batchIndex * SEMANTIC_EMBED_BATCH_SIZE;
+                    const records = batch.embeddings
+                        .map((embedding, index) => {
+                            const row = prototypeInputs[batchStart + index];
+                            if (!row) {
+                                return null;
+                            }
+                            return {
+                                nodeId: row.nodeId,
+                                nodeKind: row.nodeKind,
+                                documentId: row.documentId,
+                                narrativeId: row.narrativeId,
+                                folderId: row.folderId,
+                                evidenceRefs: row.evidenceRefs,
+                                values: this.toSemanticVector(embedding),
+                            };
+                        })
+                        .filter(
+                            (
+                                record,
+                            ): record is PhoenixSemanticPrototypeVectorRecord => record !== null,
+                        );
+                    if (!records.length) {
+                        return;
+                    }
+                    prototypeWriteChain = prototypeWriteChain.then(() =>
+                        this.storeCommand('semantic:upsertPrototypeVectors', {
+                            rows: records.map((record) => ({
+                                nodeId: record.nodeId,
+                                nodeKind: record.nodeKind,
+                                documentId: record.documentId ?? null,
+                                narrativeId: record.narrativeId ?? null,
+                                folderId: record.folderId ?? null,
+                                evidenceRefs: record.evidenceRefs,
+                                values: Array.from(record.values),
+                            })),
+                        }),
+                    );
+                },
+                SEMANTIC_EMBED_BATCH_SIZE,
+            );
+            await prototypeWriteChain;
+        }
+
+        await this.storeCommand('semantic:refreshCandidateGraphEdges', {
+            documentIds,
+            nodeIds: prototypeInputs.map((row) => row.nodeId),
+        });
+
+        const nliInputs = normalizeSemanticNliJudgmentInputs(
+            await this.storeCommand('semantic:listNliJudgmentInputs', {
+                documentIds,
+                nodeIds: prototypeInputs.map((row) => row.nodeId),
+            }),
+        );
+        if (!nliInputs.length) {
+            return;
+        }
+
+        await this.embeddingWorker.dispose().catch(() => undefined);
+        await this.ensureSemanticNliWorker();
+        const nliStatus = await this.nliWorker.getStatus();
+        const nliResults: NliClassificationResult[] = [];
+        try {
+            await this.nliWorker.classifyStream(
+                nliInputs,
+                (batch) => {
+                    nliResults.push(...batch.results);
+                },
+                SEMANTIC_NLI_BATCH_SIZE,
+            );
+            const summary = await this.storeCommand('semantic:applyNliJudgments', {
+                modelId: SEMANTIC_NLI_MODEL_ID,
+                device: nliStatus.device,
+                results: nliResults,
+            });
+            console.info('[PhoenixWasmService] Applied local NLI candidate judgments.', summary);
+        } finally {
+            await this.nliWorker.dispose().catch(() => undefined);
         }
     }
 
@@ -1699,8 +1830,9 @@ function normalizeSemanticLeafChunks(value: unknown): PhoenixSemanticLeafChunk[]
 }
 
 function accumulateSemanticDocumentVector(
-    accumulator: Map<string, { sum: Float32Array; leafCount: number }>,
+    accumulator: Map<string, { sum: Float32Array; leafCount: number; evidenceRefs: Set<string> }>,
     documentId: string,
+    spanId: string,
     values: Float32Array,
 ): void {
     if (!documentId) {
@@ -1712,17 +1844,20 @@ function accumulateSemanticDocumentVector(
     }
     let entry = accumulator.get(documentId);
     if (!entry) {
-        entry = { sum: new Float32Array(normalized.length), leafCount: 0 };
+        entry = { sum: new Float32Array(normalized.length), leafCount: 0, evidenceRefs: new Set<string>() };
         accumulator.set(documentId, entry);
     }
     for (let index = 0; index < normalized.length; index += 1) {
         entry.sum[index] += normalized[index];
     }
     entry.leafCount += 1;
+    if (spanId) {
+        entry.evidenceRefs.add(`chunk:${spanId}`);
+    }
 }
 
 function finalizeSemanticDocumentVectors(
-    accumulator: Map<string, { sum: Float32Array; leafCount: number }>,
+    accumulator: Map<string, { sum: Float32Array; leafCount: number; evidenceRefs: Set<string> }>,
 ): PhoenixSemanticDocumentVector[] {
     const rows: PhoenixSemanticDocumentVector[] = [];
     for (const [documentId, entry] of accumulator) {
@@ -1741,9 +1876,79 @@ function finalizeSemanticDocumentVectors(
             documentId,
             values,
             leafCount: entry.leafCount,
+            evidenceRefs: Array.from(entry.evidenceRefs),
         });
     }
     return rows;
+}
+
+function normalizeSemanticCandidatePrototypeInputs(value: unknown): PhoenixSemanticCandidatePrototypeInput[] {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+    return value
+        .map((row): PhoenixSemanticCandidatePrototypeInput | null => {
+            if (!row || typeof row !== 'object') {
+                return null;
+            }
+            const record = row as Record<string, unknown>;
+            if (typeof record['nodeId'] !== 'string' || typeof record['nodeKind'] !== 'string') {
+                return null;
+            }
+            const text = typeof record['text'] === 'string' ? record['text'].trim() : '';
+            if (!text) {
+                return null;
+            }
+            return {
+                nodeId: record['nodeId'],
+                nodeKind: record['nodeKind'],
+                documentId: typeof record['documentId'] === 'string' ? record['documentId'] : undefined,
+                narrativeId: typeof record['narrativeId'] === 'string' ? record['narrativeId'] : undefined,
+                folderId: typeof record['folderId'] === 'string' ? record['folderId'] : undefined,
+                text,
+                evidenceRefs: Array.isArray(record['evidenceRefs'])
+                    ? record['evidenceRefs'].filter((value): value is string => typeof value === 'string')
+                    : [],
+            };
+        })
+        .filter((row): row is PhoenixSemanticCandidatePrototypeInput => row !== null);
+}
+
+function normalizeSemanticNliJudgmentInputs(value: unknown): PhoenixSemanticNliJudgmentInput[] {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+    return value
+        .map((row): PhoenixSemanticNliJudgmentInput | null => {
+            if (!row || typeof row !== 'object') {
+                return null;
+            }
+            const record = row as Record<string, unknown>;
+            const requiredFields = [
+                'judgmentId',
+                'groupId',
+                'sourceId',
+                'targetId',
+                'edgeType',
+                'direction',
+                'premise',
+                'hypothesis',
+            ] as const;
+            if (requiredFields.some((field) => typeof record[field] !== 'string')) {
+                return null;
+            }
+            return {
+                judgmentId: record['judgmentId'] as string,
+                groupId: record['groupId'] as string,
+                sourceId: record['sourceId'] as string,
+                targetId: record['targetId'] as string,
+                edgeType: record['edgeType'] as string,
+                direction: record['direction'] as string,
+                premise: record['premise'] as string,
+                hypothesis: record['hypothesis'] as string,
+            };
+        })
+        .filter((row): row is PhoenixSemanticNliJudgmentInput => row !== null);
 }
 
 function l2NormalizeSemanticVector(values: Float32Array): Float32Array | null {
@@ -1784,6 +1989,7 @@ function buildSemanticQueryBinaryPayload(
     const flags =
         (sessionId ? REQUEST_FLAG_HAS_SESSION : 0) |
         (temporalJson ? REQUEST_FLAG_HAS_TEMPORAL : 0) |
+        (request['includeCandidateGraph'] === true ? REQUEST_FLAG_INCLUDE_CANDIDATE_GRAPH : 0) |
         buildQueryTargetFlags(request['targets']);
 
     const sessionRef = arena.push(sessionId);

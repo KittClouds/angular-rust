@@ -14,7 +14,7 @@ export const appConfig: ApplicationConfig = {
     provideBrowserGlobalErrorListeners(),
     provideAppInitializer(() => {
       const phoenixUiApi = inject(PhoenixUiApiService);
-      void phoenixUiApi.loadWasm().catch((err) => {
+      void phoenixUiApi.loadRuntime().catch((err) => {
         console.error('[Boot] Phoenix warmup failed:', err);
       });
     }),

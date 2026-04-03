@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use fst::{Map, MapBuilder};
 use phoenix_alex::{
-    is_stop_word_with_profile, normalized_has_meaningful_token, normalize_raw,
+    is_stop_word_with_profile, normalize_raw, normalized_has_meaningful_token,
     split_sentence_ranges, strip_possessive, Lexicon,
 };
 use phoenix_types::{
@@ -88,7 +88,13 @@ impl PhoenixScanner {
         let fuzzy_candidates = if self.config.fuzzy_mode == FuzzyMode::Off {
             Vec::new()
         } else {
-            build_fuzzy_candidates(text, &base_tokens, scope, lexicon, &self.config.stopword_profile)
+            build_fuzzy_candidates(
+                text,
+                &base_tokens,
+                scope,
+                lexicon,
+                &self.config.stopword_profile,
+            )
         };
 
         let mut mention_candidates = exact_candidates;
@@ -513,9 +519,11 @@ fn guess_pos(token: &str, masked: bool) -> PosTag {
     if lower.ends_with("ly") {
         return PosTag::Adverb;
     }
-    if ["ous", "ful", "ive", "al", "less", "able", "ic", "ish", "ant", "ent"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+    if [
+        "ous", "ful", "ive", "al", "less", "able", "ic", "ish", "ant", "ent",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
     {
         return PosTag::Adjective;
     }
@@ -873,11 +881,7 @@ fn build_discovery_mentions(
     // A single pass over tokens; only words that are NOT capitalized get inserted.
     let lowercase_surfaces: HashSet<String> = tokens
         .iter()
-        .filter(|t| {
-            !t.capitalized
-                && t.token_class == Some(TokenClass::Word)
-                && !t.masked
-        })
+        .filter(|t| !t.capitalized && t.token_class == Some(TokenClass::Word) && !t.masked)
         .map(|t| normalize_raw(slice(text, t.range)))
         .filter(|n| !n.is_empty())
         .collect();
@@ -1864,8 +1868,7 @@ mod tests {
             artifact
                 .mentions
                 .iter()
-                .all(|m| m.source != Some(MentionSource::Discovery)
-                    || m.surface != "Stayed"),
+                .all(|m| m.source != Some(MentionSource::Discovery) || m.surface != "Stayed"),
             "Verb 'Stayed' at sentence start with lowercase alias should be suppressed"
         );
     }
@@ -1874,7 +1877,8 @@ mod tests {
     fn prefix_stop_words_are_skipped() {
         let scanner = PhoenixScanner::default();
         let artifact = scanner.scan(&ScanRequest {
-            text: "Then Isolde stayed. Then Isolde left. The Circle opened. The Circle closed.".to_owned(),
+            text: "Then Isolde stayed. Then Isolde left. The Circle opened. The Circle closed."
+                .to_owned(),
             scope: ScopeKey::default(),
             session_id: Some(phoenix_types::SessionId("disc-stop-prefix".to_owned())),
             resolver_seed: Vec::new(),
@@ -1898,7 +1902,8 @@ mod tests {
             artifact
                 .mentions
                 .iter()
-                .all(|m| m.source != Some(MentionSource::Discovery) || !m.surface.starts_with("Then ") && !m.surface.starts_with("The ")),
+                .all(|m| m.source != Some(MentionSource::Discovery)
+                    || !m.surface.starts_with("Then ") && !m.surface.starts_with("The ")),
             "Entities prefixed with stop-words should have been stripped"
         );
     }
@@ -1918,8 +1923,7 @@ mod tests {
             artifact
                 .mentions
                 .iter()
-                .all(|m| m.source != Some(MentionSource::Discovery)
-                    || m.surface != "Ice"),
+                .all(|m| m.source != Some(MentionSource::Discovery) || m.surface != "Ice"),
             "Common word 'Ice' that appears lowercase should be suppressed"
         );
     }
@@ -1938,8 +1942,7 @@ mod tests {
             artifact
                 .mentions
                 .iter()
-                .all(|m| m.source != Some(MentionSource::Discovery)
-                    || m.surface != "Nah"),
+                .all(|m| m.source != Some(MentionSource::Discovery) || m.surface != "Nah"),
             "Dialogue-lead word 'Nah' after quote should be suppressed"
         );
     }
@@ -1985,8 +1988,7 @@ mod tests {
             artifact
                 .mentions
                 .iter()
-                .all(|m| m.source != Some(MentionSource::Discovery)
-                    || m.surface != "Hold"),
+                .all(|m| m.source != Some(MentionSource::Discovery) || m.surface != "Hold"),
             "Common word 'Hold' at sentence start with lowercase alias should be suppressed"
         );
     }

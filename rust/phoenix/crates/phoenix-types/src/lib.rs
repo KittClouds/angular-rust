@@ -209,6 +209,7 @@ pub struct FeatureFlags {
     pub graptor: bool,
     pub gldr: bool,
     pub semantic: bool,
+    pub candidate_graph: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +233,7 @@ impl Default for RuntimeConfig {
                 graptor: true,
                 gldr: true,
                 semantic: false,
+                candidate_graph: true,
             },
         }
     }
@@ -376,6 +378,8 @@ pub struct QueryRequest {
     pub limit: Option<usize>,
     pub temporal: Option<TemporalMarker>,
     pub semantic_query_vector: Option<SemanticQueryVector>,
+    #[serde(default)]
+    pub include_candidate_graph: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -429,6 +433,8 @@ pub struct GraphDeltaRequest {
     pub changed_documents: Vec<DocumentId>,
     pub limit: Option<usize>,
     pub since_commit: Option<CommitId>,
+    #[serde(default)]
+    pub include_candidate_graph: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

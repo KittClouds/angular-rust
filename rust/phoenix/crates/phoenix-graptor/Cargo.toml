@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 daachorse.workspace = true
 phoenix-alex = { path = "../phoenix-alex" }
+phoenix-graph = { path = "../phoenix-graph" }
 phoenix-scanner = { path = "../phoenix-scanner" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
 phoenix-structure = { path = "../phoenix-structure" }

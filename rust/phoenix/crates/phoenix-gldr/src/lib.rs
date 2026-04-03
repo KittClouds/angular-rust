@@ -1,4 +1,8 @@
-use phoenix_graptor::{GraptorEdge, GraptorGraph, GraptorVertex};
+use std::collections::{HashSet, VecDeque};
+
+use phoenix_graptor::{
+    load_graph_snapshot_with_candidate_graph, GraptorEdge, GraptorGraph, GraptorVertex,
+};
 use phoenix_lex::LexIndex;
 use phoenix_store_cozo::{PhoenixCozoStore, SemanticNeighbor, StoreError};
 use phoenix_types::{
@@ -58,6 +62,26 @@ impl PhoenixGldr {
         lex: &LexIndex,
         request: &QueryRequest,
     ) -> Result<QueryResult, StoreError> {
+        self.query_with_snapshot(store, lex, request, None)
+    }
+
+    pub fn query_with_graph(
+        &self,
+        store: &PhoenixCozoStore,
+        lex: &LexIndex,
+        request: &QueryRequest,
+        graph: &GraptorGraph,
+    ) -> Result<QueryResult, StoreError> {
+        self.query_with_snapshot(store, lex, request, Some(graph))
+    }
+
+    fn query_with_snapshot(
+        &self,
+        store: &PhoenixCozoStore,
+        lex: &LexIndex,
+        request: &QueryRequest,
+        snapshot: Option<&GraptorGraph>,
+    ) -> Result<QueryResult, StoreError> {
         let limit = request.limit.unwrap_or(5).max(1);
         let semantic_requested = request
             .targets
@@ -86,7 +110,16 @@ impl PhoenixGldr {
                     .map(|hit| leaf_vertex_id(&hit.span_id)),
             )
             .collect();
-        let graph = load_subgraph(store, &seed_vertex_ids, self.config.subgraph_hops)?;
+        let graph = if let Some(snapshot) = snapshot {
+            load_subgraph_from_graph(snapshot, &seed_vertex_ids, self.config.subgraph_hops)
+        } else {
+            load_subgraph(
+                store,
+                &seed_vertex_ids,
+                self.config.subgraph_hops,
+                request.include_candidate_graph,
+            )?
+        };
         let temporal = TemporalFilter::from_marker(request.temporal.as_ref());
         let wants_chunks = request.targets.is_empty()
             || request.targets.iter().any(|target| {
@@ -158,6 +191,13 @@ impl PhoenixGldr {
                     "Semantic target requested without a query vector; GLDR used lexical and graph retrieval only."
                         .to_owned()
                 },
+            });
+        }
+        if request.include_candidate_graph {
+            diagnostics.push(Diagnostic {
+                code: "PX_GLDR_CANDIDATE_GRAPH".to_owned(),
+                message: "GLDR included candidate embedding edges during local graph expansion."
+                    .to_owned(),
             });
         }
         if request.temporal.is_some() {
@@ -598,9 +638,15 @@ fn load_subgraph(
     store: &PhoenixCozoStore,
     seed_vertex_ids: &[String],
     max_hops: usize,
+    include_candidate_graph: bool,
 ) -> Result<GraptorGraph, StoreError> {
     if seed_vertex_ids.is_empty() {
         return Ok(GraptorGraph::default());
+    }
+
+    if include_candidate_graph {
+        let snapshot = load_graph_snapshot_with_candidate_graph(store, true)?;
+        return Ok(build_bounded_subgraph(&snapshot, seed_vertex_ids, max_hops));
     }
 
     let max_hops = max_hops.max(1);
@@ -614,6 +660,14 @@ fn load_subgraph(
         touched[id] := seeds[id]
 "#,
     );
+    if include_candidate_graph {
+        script.push_str(
+            r#"
+        neighbor[src, dst] := *graph_candidate_edges{ source_id: src, target_id: dst, edge_type, document_id, narrative_id, valid_from_doc, valid_from_boundary, valid_to_doc, valid_to_boundary, assertion_kind, weight, attributes, data }
+        neighbor[src, dst] := *graph_candidate_edges{ source_id: dst, target_id: src, edge_type, document_id, narrative_id, valid_from_doc, valid_from_boundary, valid_to_doc, valid_to_boundary, assertion_kind, weight, attributes, data }
+"#,
+        );
+    }
     for hop in 1..=max_hops {
         let frontier = if hop == 1 {
             "seeds".to_owned()
@@ -640,6 +694,17 @@ fn load_subgraph(
             c3 = to_string(w)
     "#,
     );
+    if include_candidate_graph {
+        script.push_str(
+            r#"
+
+        ?[kind, c0, c1, c2, c3, c4, c5] := kind = "e",
+            touched[c0], touched[c1],
+            *graph_candidate_edges{ source_id: c0, target_id: c1, edge_type: c2, weight: w, attributes: c4, data: c5 },
+            c3 = to_string(w)
+    "#,
+        );
+    }
 
     let mut graph = GraptorGraph::default();
 
@@ -776,6 +841,7 @@ fn load_subgraph(
                     weight: edge_weight,
                     attributes: row.get(5).cloned().unwrap_or(Value::Null),
                     data: row.get(6).cloned().filter(|v| !v.is_null()),
+                    layer: phoenix_graph::GraphLayer::Asserted,
                 };
                 graph
                     .outgoing
@@ -793,6 +859,99 @@ fn load_subgraph(
     }
 
     Ok(graph)
+}
+
+fn load_subgraph_from_graph(
+    graph: &GraptorGraph,
+    seed_vertex_ids: &[String],
+    max_hops: usize,
+) -> GraptorGraph {
+    if seed_vertex_ids.is_empty() {
+        return GraptorGraph::default();
+    }
+    build_bounded_subgraph(graph, seed_vertex_ids, max_hops)
+}
+
+fn build_bounded_subgraph(
+    full_graph: &GraptorGraph,
+    seed_vertex_ids: &[String],
+    max_hops: usize,
+) -> GraptorGraph {
+    let max_hops = max_hops.max(1);
+    let mut touched = HashSet::<String>::new();
+    let mut queue = VecDeque::<(String, usize)>::new();
+
+    for seed in seed_vertex_ids {
+        if touched.insert(seed.clone()) {
+            queue.push_back((seed.clone(), 0));
+        }
+    }
+
+    while let Some((vertex_id, depth)) = queue.pop_front() {
+        if depth >= max_hops {
+            continue;
+        }
+        for edge in full_graph
+            .outgoing_any(&vertex_id)
+            .chain(full_graph.incoming_any(&vertex_id))
+        {
+            let neighbor_id = if edge.source_id == vertex_id {
+                edge.target_id.as_str()
+            } else {
+                edge.source_id.as_str()
+            };
+            if touched.insert(neighbor_id.to_owned()) {
+                queue.push_back((neighbor_id.to_owned(), depth + 1));
+            }
+        }
+    }
+
+    let mut graph = GraptorGraph::default();
+    for vertex_id in &touched {
+        if let Some(vertex) = full_graph.vertices.get(vertex_id) {
+            graph.vertices.insert(vertex_id.clone(), vertex.clone());
+            if let (Some(document_id), Some(chapter_id), Some(_)) = (
+                vertex.document_id.clone(),
+                vertex.chapter_id,
+                vertex.search_chunk_id.clone(),
+            ) {
+                graph
+                    .chapter_leaves
+                    .entry((document_id, chapter_id))
+                    .or_default()
+                    .push(vertex_id.clone());
+            }
+        }
+    }
+
+    let mut seen_edges = HashSet::<(String, String, String)>::new();
+    for source_id in &touched {
+        for edge in full_graph.outgoing_any(source_id) {
+            if !touched.contains(&edge.target_id) {
+                continue;
+            }
+            let key = (
+                edge.source_id.clone(),
+                edge.target_id.clone(),
+                edge.edge_type.clone(),
+            );
+            if !seen_edges.insert(key) {
+                continue;
+            }
+            graph
+                .outgoing
+                .entry(edge.source_id.clone())
+                .or_default()
+                .push(edge.clone());
+            graph
+                .incoming
+                .entry(edge.target_id.clone())
+                .or_default()
+                .push(edge.clone());
+        }
+    }
+
+    graph
 }
 
 #[cfg(test)]
@@ -985,6 +1144,7 @@ mod tests {
                     limit: Some(5),
                     temporal: None,
                     semantic_query_vector: None,
+                    include_candidate_graph: false,
                 },
             )
             .expect("gldr query");
@@ -1119,6 +1279,7 @@ mod tests {
                     limit: Some(5),
                     temporal: None,
                     semantic_query_vector: None,
+                    include_candidate_graph: false,
                 },
             )
             .expect("gldr query");
@@ -1136,6 +1297,238 @@ mod tests {
                 .iter()
                 .any(|hit| hit.entity_id == Some(EntityId("len".to_owned()))),
             "PPR should surface the cooccurring entity node as well",
+        );
+    }
+
+    #[test]
+    fn gldr_candidate_graph_overlay_is_opt_in() {
+        let store = PhoenixCozoStore::new().expect("store");
+        seed_note(&store, "doc-1", "Candidate One", "Ryan watched the harbor.");
+        seed_note(
+            &store,
+            "doc-2",
+            "Candidate Two",
+            "Rian catalogued the harbor ledgers.",
+        );
+
+        for (chunk_id, key, document_id, text, entity_id, label) in [
+            (
+                3501_i64,
+                "doc-1:1:0:0-24",
+                "doc-1",
+                "Ryan watched the harbor.",
+                "entity::ryan",
+                "Ryan",
+            ),
+            (
+                3502_i64,
+                "doc-2:1:0:0-36",
+                "doc-2",
+                "Rian catalogued the harbor ledgers.",
+                "entity::rian",
+                "Rian",
+            ),
+        ] {
+            store
+                .put_row(
+                    "chunks",
+                    json!({
+                        "chunk_id": chunk_id,
+                        "doc_id": document_id,
+                        "level": 0,
+                        "start": 0,
+                        "end": text.len() as i64,
+                        "text": text,
+                        "parent_id": null,
+                        "scope_narrative": null,
+                        "scope_folder": null,
+                        "created_at": 1
+                    }),
+                )
+                .expect("chunk");
+            store
+                .put_row(
+                    "chunkid_map",
+                    json!({
+                        "id": chunk_id,
+                        "chunk_key": key,
+                        "doc_id": document_id,
+                        "created_at": 1
+                    }),
+                )
+                .expect("chunk id");
+            store
+                .put_row(
+                    "graph_vertices",
+                    json!({
+                        "id": format!("leaf::{key}"),
+                        "value": { "kind": "leaf", "searchChunkId": key },
+                        "weight": 1,
+                        "attributes": { "documentId": document_id, "chapterId": 1 }
+                    }),
+                )
+                .expect("leaf vertex");
+            store
+                .put_row(
+                    "graph_vertices",
+                    json!({
+                        "id": entity_id,
+                        "value": { "kind": "entity", "entityId": entity_id.trim_start_matches("entity::"), "label": label, "entityKind": "Character" },
+                        "weight": 1,
+                        "attributes": { "documentId": document_id, "chapters": [1] }
+                    }),
+                )
+                .expect("entity vertex");
+            store
+                .put_row(
+                    "graph_edges",
+                    json!({
+                        "source_id": format!("leaf::{key}"),
+                        "target_id": entity_id,
+                        "weight": 100,
+                        "attributes": { "confidence": 1.0 },
+                        "data": null,
+                        "edge_type": "mentions"
+                    }),
+                )
+                .expect("mentions");
+        }
+
+        store
+            .put_row(
+                "graph_candidate_edges",
+                json!({
+                    "source_id": "entity::ryan",
+                    "target_id": "entity::rian",
+                    "edge_type": "candidate_corefers_with",
+                    "document_id": "doc-1",
+                    "narrative_id": null,
+                    "valid_from_doc": "doc-1",
+                    "valid_from_boundary": null,
+                    "valid_to_doc": null,
+                    "valid_to_boundary": null,
+                    "assertion_kind": "candidate",
+                    "weight": 900,
+                    "attributes": {
+                        "graph": {
+                            "layer": "candidate",
+                            "status": "candidate",
+                            "resolver": "test",
+                            "confidence": 0.9,
+                            "evidence_refs": []
+                        }
+                    },
+                    "data": { "score": 0.9, "threshold": 0.78 }
+                }),
+            )
+            .expect("candidate edge");
+
+        let lex = LexIndex::from_store(&store, LexConfig::default()).expect("lex");
+        let without_candidate = PhoenixGldr::default()
+            .query(
+                &store,
+                &lex,
+                &QueryRequest {
+                    session_id: None,
+                    query: "Ryan".to_owned(),
+                    scope: test_scope(),
+                    targets: vec![phoenix_types::QueryTarget::Graph],
+                    limit: Some(5),
+                    temporal: None,
+                    semantic_query_vector: None,
+                    include_candidate_graph: false,
+                },
+            )
+            .expect("asserted-only query");
+        let with_candidate = PhoenixGldr::default()
+            .query(
+                &store,
+                &lex,
+                &QueryRequest {
+                    session_id: None,
+                    query: "Ryan".to_owned(),
+                    scope: test_scope(),
+                    targets: vec![phoenix_types::QueryTarget::Graph],
+                    limit: Some(5),
+                    temporal: None,
+                    semantic_query_vector: None,
+                    include_candidate_graph: true,
+                },
+            )
+            .expect("candidate query");
+
+        assert!(
+            !without_candidate
+                .chunk_hits
+                .iter()
+                .any(|hit| hit.chunk_id == "doc-2:1:0:0-36"),
+            "asserted-only traversal should not cross the candidate overlay",
+        );
+        assert!(
+            with_candidate
+                .chunk_hits
+                .iter()
+                .any(|hit| hit.chunk_id == "doc-2:1:0:0-36"),
+            "opting into candidate graph traversal should surface the second chunk",
+        );
+        assert!(with_candidate
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code == "PX_GLDR_CANDIDATE_GRAPH"));
+
+        store
+            .put_row(
+                "graph_candidate_edges",
+                json!({
+                    "source_id": "entity::ryan",
+                    "target_id": "entity::rian",
+                    "edge_type": "candidate_corefers_with",
+                    "document_id": "doc-1",
+                    "narrative_id": null,
+                    "valid_from_doc": "doc-1",
+                    "valid_from_boundary": null,
+                    "valid_to_doc": null,
+                    "valid_to_boundary": null,
+                    "assertion_kind": "candidate",
+                    "weight": 0,
+                    "attributes": {
+                        "graph": {
+                            "layer": "candidate",
+                            "status": "candidate_rejected",
+                            "resolver": "test",
+                            "confidence": 0.2,
+                            "evidence_refs": []
+                        }
+                    },
+                    "data": {
+                        "base": { "score": 0.9, "threshold": 0.78 },
+                        "nli": { "accepted": false }
+                    }
+                }),
+            )
+            .expect("rejected candidate edge");
+        let with_rejected_candidate = PhoenixGldr::default()
+            .query(
+                &store,
+                &lex,
+                &QueryRequest {
+                    session_id: None,
+                    query: "Ryan".to_owned(),
+                    scope: test_scope(),
+                    targets: vec![phoenix_types::QueryTarget::Graph],
+                    limit: Some(5),
+                    temporal: None,
+                    semantic_query_vector: None,
+                    include_candidate_graph: true,
+                },
+            )
+            .expect("rejected candidate query");
+        assert!(
+            !with_rejected_candidate
+                .chunk_hits
+                .iter()
+                .any(|hit| hit.chunk_id == "doc-2:1:0:0-36"),
+            "candidate_rejected rows must stay stored for audit but never participate in traversal",
         );
     }
 
@@ -1325,6 +1718,7 @@ mod tests {
                     values: &doc1_vector,
                     model_id: phoenix_store_cozo::SEMANTIC_MODEL_ID,
                     leaf_count: 1,
+                    evidence_refs: &[],
                     updated_at: 10,
                 },
                 phoenix_store_cozo::SemanticDocumentVectorRow {
@@ -1332,6 +1726,7 @@ mod tests {
                     values: &doc2_vector,
                     model_id: phoenix_store_cozo::SEMANTIC_MODEL_ID,
                     leaf_count: 1,
+                    evidence_refs: &[],
                     updated_at: 10,
                 },
             ])
@@ -1357,6 +1752,7 @@ mod tests {
                     semantic_query_vector: Some(SemanticQueryVector {
                         values: doc2_vector.clone(),
                     }),
+                    include_candidate_graph: false,
                 },
             )
             .expect("semantic query");
@@ -1457,6 +1853,7 @@ mod tests {
                     semantic_query_vector: Some(SemanticQueryVector {
                         values: vector.clone(),
                     }),
+                    include_candidate_graph: false,
                 },
             )
             .expect("fallback semantic query");
@@ -1581,6 +1978,7 @@ mod tests {
                         ..Default::default()
                     }),
                     semantic_query_vector: None,
+                    include_candidate_graph: false,
                 },
             )
             .expect("temporal query");

@@ -1,10 +1,18 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
+use std::collections::VecDeque;
 
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 use phoenix_alex::{normalize_raw, split_sentence_ranges};
+use phoenix_graph::{
+    GraphCounts, GraphEdgeRecord, GraphLayer, GraphMutationBatch, GraphMutationScope,
+    GraphVertexRecord,
+};
+pub use phoenix_graph::{GraptorEdge, GraptorGraph, GraptorVertex};
 use phoenix_scanner::PhoenixScanner;
-use phoenix_store_cozo::{CompactRelationBuffer, CompactRowView, PhoenixCozoStore, StoreError};
+use phoenix_store_cozo::{
+    CompactRelationBuffer, CompactRow, CompactRowView, PhoenixCozoStore, StoreError,
+};
 use phoenix_structure::PhoenixStructure;
 use phoenix_types::{
     BoundaryDetectionStrategy, BoundaryKind, ChunkStats, Diagnostic, DiscoverySummary, DocumentId,
@@ -118,84 +126,8 @@ impl<'a> From<&'a IngestDocument> for BorrowedIngestDocument<'a> {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct GraptorVertex {
-    pub id: String,
-    pub kind: String,
-    pub weight: i64,
-    pub value: Value,
-    pub attributes: Value,
-    pub entity_id: Option<String>,
-    pub search_chunk_id: Option<String>,
-    pub document_id: Option<String>,
-    pub chapter_id: Option<u32>,
-    pub chapters: Vec<u32>,
-    pub boundary_id: Option<u32>,
-    pub boundary_ordinal: Option<u32>,
-    pub boundary_kind: Option<BoundaryKind>,
-    pub boundary_ordinals: Vec<u32>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GraptorEdge {
-    pub source_id: String,
-    pub target_id: String,
-    pub edge_type: String,
-    pub weight: i64,
-    pub attributes: Value,
-    pub data: Option<Value>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct GraptorGraph {
-    pub vertices: FxHashMap<String, GraptorVertex>,
-    pub outgoing: FxHashMap<String, Vec<GraptorEdge>>,
-    pub incoming: FxHashMap<String, Vec<GraptorEdge>>,
-    pub chapter_leaves: FxHashMap<(String, u32), Vec<String>>,
-}
-
-impl GraptorGraph {
-    pub fn outgoing_matching<'a>(
-        &'a self,
-        vertex_id: &str,
-        edge_type: &'a str,
-    ) -> impl Iterator<Item = &'a GraptorEdge> {
-        self.outgoing_any(vertex_id)
-            .filter(move |edge| edge.edge_type == edge_type)
-    }
-
-    pub fn incoming_matching<'a>(
-        &'a self,
-        vertex_id: &str,
-        edge_type: &'a str,
-    ) -> impl Iterator<Item = &'a GraptorEdge> {
-        self.incoming_any(vertex_id)
-            .filter(move |edge| edge.edge_type == edge_type)
-    }
-
-    pub fn outgoing_any<'a>(&'a self, vertex_id: &str) -> impl Iterator<Item = &'a GraptorEdge> {
-        self.outgoing
-            .get(vertex_id)
-            .into_iter()
-            .flat_map(|edges| edges.iter())
-    }
-
-    pub fn incoming_any<'a>(&'a self, vertex_id: &str) -> impl Iterator<Item = &'a GraptorEdge> {
-        self.incoming
-            .get(vertex_id)
-            .into_iter()
-            .flat_map(|edges| edges.iter())
-    }
-
-    pub fn chapter_leaves(
-        &self,
-        document_id: &str,
-        chapter_id: u32,
-    ) -> impl Iterator<Item = &String> {
-        self.chapter_leaves
-            .get(&(document_id.to_owned(), chapter_id))
-            .into_iter()
-            .flat_map(|leaves| leaves.iter())
-    }
+pub struct NativeIngestArtifacts {
+    pub graph_batches: Vec<GraphMutationBatch>,
 }
 
 impl PhoenixGraptor {
@@ -257,11 +189,35 @@ impl PhoenixGraptor {
         structure: &PhoenixStructure,
         request: &BorrowedIngestRequest<'_>,
     ) -> Result<IngestResult, StoreError> {
+        Ok(self
+            .ingest_view_internal(store, scanner, structure, request, true)?
+            .0)
+    }
+
+    pub fn ingest_native_view(
+        &self,
+        store: &PhoenixCozoStore,
+        scanner: &PhoenixScanner,
+        structure: &PhoenixStructure,
+        request: &BorrowedIngestRequest<'_>,
+    ) -> Result<(IngestResult, NativeIngestArtifacts), StoreError> {
+        self.ingest_view_internal(store, scanner, structure, request, false)
+    }
+
+    fn ingest_view_internal(
+        &self,
+        store: &PhoenixCozoStore,
+        scanner: &PhoenixScanner,
+        structure: &PhoenixStructure,
+        request: &BorrowedIngestRequest<'_>,
+        persist_graph_relations: bool,
+    ) -> Result<(IngestResult, NativeIngestArtifacts), StoreError> {
         let now = now_ms();
         let mut registry = EntityRegistry::from_store(store)?;
         let mut diagnostics = Vec::new();
         let mut total_warning_count = 0usize;
         let mut documents = Vec::new();
+        let mut graph_batches = Vec::new();
         let mut total_chapters = 0usize;
         let mut total_boundaries = 0usize;
         let mut total_parents = 0usize;
@@ -279,6 +235,7 @@ impl PhoenixGraptor {
                 scanner,
                 structure,
                 &mut registry,
+                persist_graph_relations,
             )?;
             total_chapters += processed.summary.chapter_count;
             total_boundaries += processed.summary.boundary_count;
@@ -291,6 +248,9 @@ impl PhoenixGraptor {
             total_discovery_candidates += processed.persist_state.discovery_count;
             total_warning_count += processed.warning_count;
             diagnostics.extend(processed.diagnostics);
+            if let Some(graph_batch) = processed.graph_batch {
+                graph_batches.push(graph_batch);
+            }
             documents.push(processed.summary);
         }
         let result = IngestResult {
@@ -343,7 +303,7 @@ impl PhoenixGraptor {
             self.persist_session_manifests(store, session_id, &result, now)?;
         }
 
-        Ok(result)
+        Ok((result, NativeIngestArtifacts { graph_batches }))
     }
 
     pub fn ingest_message_thread_view(
@@ -537,6 +497,7 @@ impl PhoenixGraptor {
             &registry,
             &persist_state,
             now,
+            None,
         )?;
         let (warning_count, diagnostics) = diagnostics.finish();
         Ok(IngestResult {
@@ -622,6 +583,7 @@ impl PhoenixGraptor {
         scanner: &PhoenixScanner,
         structure: &PhoenixStructure,
         registry: &mut EntityRegistry,
+        persist_graph_relations: bool,
     ) -> Result<ProcessedDocument, StoreError> {
         let note_id = document
             .note_id
@@ -650,7 +612,7 @@ impl PhoenixGraptor {
                 leaves.len()
             ),
         });
-        let mut buffers = BufferSet::new();
+        let mut buffers = BufferSet::with_graph_persistence(persist_graph_relations);
         let mut persist_state = DocumentPersistState::default();
         let mut chapter_links = FxHashMap::<(u32, u32), FxHashSet<String>>::default();
         let mut resolver_scratch = ResolverSeedScratch::default();
@@ -747,6 +709,12 @@ impl PhoenixGraptor {
             &mut diagnostics,
         )?;
 
+        let graph_batch = if persist_graph_relations {
+            None
+        } else {
+            buffers.asserted_graph_batch_for_document(&document.document_id.0)?
+        };
+
         buffers.flush_all(store)?;
 
         let summary = IngestDocumentSummary {
@@ -779,6 +747,7 @@ impl PhoenixGraptor {
             registry,
             &persist_state,
             now,
+            graph_batch.as_ref(),
         )?;
 
         let (warning_count, diagnostics) = diagnostics.finish();
@@ -787,6 +756,7 @@ impl PhoenixGraptor {
             persist_state,
             warning_count,
             diagnostics,
+            graph_batch,
         })
     }
 
@@ -913,6 +883,13 @@ impl PhoenixGraptor {
 }
 
 pub fn load_graph_snapshot(store: &PhoenixCozoStore) -> Result<GraptorGraph, StoreError> {
+    load_graph_snapshot_with_candidate_graph(store, false)
+}
+
+pub fn load_graph_snapshot_with_candidate_graph(
+    store: &PhoenixCozoStore,
+    include_candidate_graph: bool,
+) -> Result<GraptorGraph, StoreError> {
     const VERTEX_COLUMNS: &[&str] = &[
         "id",
         "document_id",
@@ -959,12 +936,21 @@ pub fn load_graph_snapshot(store: &PhoenixCozoStore) -> Result<GraptorGraph, Sto
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        let document_id = row.get_str("document_id").map(str::to_owned).or_else(|| {
-            attributes
-                .get("documentId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+        let document_id = row
+            .get_str("document_id")
+            .map(str::to_owned)
+            .or_else(|| {
+                attributes
+                    .get("documentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                value
+                    .get("documentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
         let chapter_id = attributes
             .get("chapterId")
             .and_then(Value::as_u64)
@@ -1030,36 +1016,68 @@ pub fn load_graph_snapshot(store: &PhoenixCozoStore) -> Result<GraptorGraph, Sto
                 .push(id.to_owned());
         }
     }
-    for row in store.fetch_compact_rows_with_columns("graph_edges", EDGE_COLUMNS)? {
-        let row = CompactRowView::new(EDGE_COLUMNS, &row);
+    append_graph_edges(
+        &mut graph,
+        &store.fetch_compact_rows_with_columns("graph_edges", EDGE_COLUMNS)?,
+        EDGE_COLUMNS,
+        false,
+    );
+    if include_candidate_graph {
+        append_graph_edges(
+            &mut graph,
+            &store.fetch_compact_rows_with_columns("graph_candidate_edges", EDGE_COLUMNS)?,
+            EDGE_COLUMNS,
+            true,
+        );
+    }
+    Ok(graph)
+}
+
+fn append_graph_edges(
+    graph: &mut GraptorGraph,
+    rows: &[CompactRow],
+    columns: &[&str],
+    candidate_only_active: bool,
+) {
+    for row in rows {
+        let row = CompactRowView::new(columns, row);
         let Some(source_id) = row.get_str("source_id") else {
             continue;
         };
         let Some(target_id) = row.get_str("target_id") else {
             continue;
         };
+        let attributes = {
+            let mut attributes = row.get_json("attributes").unwrap_or(Value::Null);
+            if candidate_only_active && !candidate_edge_is_active(&attributes) {
+                continue;
+            }
+            if let Some(object) = attributes.as_object_mut() {
+                if !object.contains_key("documentId") {
+                    if let Some(document_id) = row.get_str("document_id") {
+                        object.insert("documentId".to_owned(), json!(document_id));
+                    }
+                }
+                if !object.contains_key("narrativeId") {
+                    if let Some(narrative_id) = row.get_str("narrative_id") {
+                        object.insert("narrativeId".to_owned(), json!(narrative_id));
+                    }
+                }
+            }
+            attributes
+        };
         let edge = GraptorEdge {
             source_id: source_id.to_owned(),
             target_id: target_id.to_owned(),
             edge_type: row.get_str("edge_type").unwrap_or("edge").to_owned(),
             weight: row.get_i64("weight").unwrap_or(1),
-            attributes: {
-                let mut attributes = row.get_json("attributes").unwrap_or(Value::Null);
-                if let Some(object) = attributes.as_object_mut() {
-                    if !object.contains_key("documentId") {
-                        if let Some(document_id) = row.get_str("document_id") {
-                            object.insert("documentId".to_owned(), json!(document_id));
-                        }
-                    }
-                    if !object.contains_key("narrativeId") {
-                        if let Some(narrative_id) = row.get_str("narrative_id") {
-                            object.insert("narrativeId".to_owned(), json!(narrative_id));
-                        }
-                    }
-                }
-                attributes
-            },
+            attributes,
             data: row.get_json("data").filter(|value| !value.is_null()),
+            layer: if candidate_only_active {
+                GraphLayer::Candidate
+            } else {
+                GraphLayer::Asserted
+            },
         };
         graph
             .outgoing
@@ -1072,7 +1090,17 @@ pub fn load_graph_snapshot(store: &PhoenixCozoStore) -> Result<GraptorGraph, Sto
             .or_default()
             .push(edge);
     }
-    Ok(graph)
+}
+
+fn candidate_edge_is_active(attributes: &Value) -> bool {
+    !matches!(
+        attributes
+            .get("graph")
+            .and_then(Value::as_object)
+            .and_then(|graph| graph.get("status"))
+            .and_then(Value::as_str),
+        Some("candidate_rejected")
+    )
 }
 
 pub fn load_session_state(
@@ -1238,7 +1266,27 @@ pub fn load_session_stats(
             .map(|count| count.rows)
             .unwrap_or_default()
     };
-    Ok(SessionStats {
+    Ok(build_session_stats_from_counts(
+        &state,
+        session_id,
+        &GraphCounts {
+            vertex_count: count_for("graph_vertices"),
+            asserted_edge_count: count_for("graph_edges"),
+            candidate_edge_count: count_for("graph_candidate_edges"),
+        },
+        count_for("discovery_candidates"),
+        count_for("spans"),
+    ))
+}
+
+pub fn build_session_stats_from_counts(
+    state: &SessionState,
+    session_id: &SessionId,
+    graph_counts: &GraphCounts,
+    discovery_candidate_count: usize,
+    span_count: usize,
+) -> SessionStats {
+    SessionStats {
         session_id: session_id.clone(),
         document_count: state.documents.len(),
         chapter_count: state
@@ -1266,20 +1314,28 @@ pub fn load_session_stats(
             .iter()
             .map(|document| document.entity_count)
             .sum(),
-        discovery_candidate_count: count_for("discovery_candidates"),
-        graph_vertex_count: count_for("graph_vertices"),
-        graph_edge_count: count_for("graph_edges"),
-        span_count: count_for("spans"),
+        discovery_candidate_count,
+        graph_vertex_count: graph_counts.vertex_count,
+        graph_edge_count: graph_counts.asserted_edge_count,
+        span_count,
         updated_at: now_ms(),
-    })
+    }
 }
 
 pub fn build_graph_delta(
     store: &PhoenixCozoStore,
     request: &GraphDeltaRequest,
 ) -> Result<GraphDeltaResult, StoreError> {
-    let graph = load_graph_snapshot(store)?;
+    let graph = load_graph_snapshot_with_candidate_graph(store, request.include_candidate_graph)?;
     let state = load_session_state(store, &request.session_id)?;
+    Ok(build_graph_delta_from_snapshot(&graph, &state, request))
+}
+
+pub fn build_graph_delta_from_snapshot(
+    graph: &GraptorGraph,
+    state: &SessionState,
+    request: &GraphDeltaRequest,
+) -> GraphDeltaResult {
     let mut allowed_documents = state
         .documents
         .iter()
@@ -1302,6 +1358,14 @@ pub fn build_graph_delta(
                 "Graph delta is snapshot-based in v1; sinceCommit {} was treated as a hint only.",
                 since_commit.0
             ),
+        });
+    }
+    if request.include_candidate_graph {
+        diagnostics.push(Diagnostic {
+            code: "PX_GRAPH_DELTA_CANDIDATE".to_owned(),
+            message:
+                "Graph delta included candidate embedding edges in addition to asserted graph structure."
+                    .to_owned(),
         });
     }
 
@@ -1345,6 +1409,49 @@ pub fn build_graph_delta(
                     included_nodes.insert(vertex.id.clone());
                 }
             }
+        }
+    }
+
+    let mut traversal_depths = FxHashMap::<String, usize>::default();
+    let mut traversal_frontier = VecDeque::new();
+    for document_id in &allowed_documents {
+        let vertex_id = document_vertex_id(&DocumentId(document_id.clone()));
+        if graph.vertices.contains_key(&vertex_id) {
+            traversal_depths.insert(vertex_id.clone(), 0);
+            traversal_frontier.push_back(vertex_id.clone());
+            included_nodes.insert(vertex_id);
+        }
+    }
+    while let Some(vertex_id) = traversal_frontier.pop_front() {
+        let depth = *traversal_depths.get(&vertex_id).unwrap_or(&0);
+        if depth >= 2 {
+            continue;
+        }
+        for edge in graph
+            .outgoing_any(&vertex_id)
+            .chain(graph.incoming_any(&vertex_id))
+        {
+            let neighbor_id = if edge.source_id == vertex_id {
+                edge.target_id.as_str()
+            } else {
+                edge.source_id.as_str()
+            };
+            let Some(vertex) = graph.vertices.get(neighbor_id) else {
+                continue;
+            };
+            if !graph_delta_vertex_allowed(vertex, &allowed_documents, &chunk_id_set) {
+                continue;
+            }
+            let next_depth = depth + 1;
+            let should_visit = traversal_depths
+                .get(neighbor_id)
+                .map(|current| next_depth < *current)
+                .unwrap_or(true);
+            if should_visit {
+                traversal_depths.insert(neighbor_id.to_owned(), next_depth);
+                traversal_frontier.push_back(neighbor_id.to_owned());
+            }
+            included_nodes.insert(neighbor_id.to_owned());
         }
     }
 
@@ -1447,13 +1554,30 @@ pub fn build_graph_delta(
         ))
     });
 
-    Ok(GraphDeltaResult {
+    GraphDeltaResult {
         session_id: request.session_id.clone(),
         chunks,
         nodes,
         edges,
         diagnostics,
-    })
+    }
+}
+
+fn graph_delta_vertex_allowed(
+    vertex: &GraptorVertex,
+    allowed_documents: &FxHashSet<String>,
+    chunk_id_set: &FxHashSet<String>,
+) -> bool {
+    match vertex.kind.as_str() {
+        "leaf" => chunk_id_set.contains(&vertex.id),
+        "document" | "thread_document" | "chapter" | "parent" | "event" => vertex
+            .document_id
+            .as_ref()
+            .map(|document_id| allowed_documents.contains(document_id))
+            .unwrap_or(false),
+        "entity" | "turn" | "agent" | "task" | "state" | "time_window" => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1624,9 +1748,11 @@ struct ProcessedDocument {
     persist_state: DocumentPersistState,
     warning_count: usize,
     diagnostics: Vec<Diagnostic>,
+    graph_batch: Option<GraphMutationBatch>,
 }
 
 struct BufferSet {
+    persist_graph_relations: bool,
     chunk_rows: CompactRelationBuffer,
     chunkid_rows: CompactRelationBuffer,
     document_boundary_rows: CompactRelationBuffer,
@@ -1643,7 +1769,12 @@ struct BufferSet {
 
 impl BufferSet {
     fn new() -> Self {
+        Self::with_graph_persistence(true)
+    }
+
+    fn with_graph_persistence(persist_graph_relations: bool) -> Self {
         Self {
+            persist_graph_relations,
             chunk_rows: CompactRelationBuffer::new("chunks").expect("chunks relation"),
             chunkid_rows: CompactRelationBuffer::new("chunkid_map").expect("chunkid_map relation"),
             document_boundary_rows: CompactRelationBuffer::new("document_boundaries")
@@ -1675,16 +1806,20 @@ impl BufferSet {
         flush_relation_if_needed(store, &mut self.span_rows, policy.text_heavy_limit)?;
         flush_relation_if_needed(store, &mut self.evidence_rows, policy.text_heavy_limit)?;
         flush_relation_if_needed(store, &mut self.document_boundary_rows, policy.medium_limit)?;
-        flush_relation_if_needed(store, &mut self.graph_vertex_rows, policy.text_heavy_limit)?;
-        flush_relation_if_needed(store, &mut self.graph_edge_rows, policy.text_heavy_limit)?;
-        flush_relation_if_needed(
-            store,
-            &mut self.graph_property_rows,
-            policy.text_heavy_limit,
-        )?;
+        if self.persist_graph_relations {
+            flush_relation_if_needed(store, &mut self.graph_vertex_rows, policy.text_heavy_limit)?;
+            flush_relation_if_needed(store, &mut self.graph_edge_rows, policy.text_heavy_limit)?;
+            flush_relation_if_needed(
+                store,
+                &mut self.graph_property_rows,
+                policy.text_heavy_limit,
+            )?;
+        }
         flush_relation_if_needed(store, &mut self.discovery_rows, policy.medium_limit)?;
         flush_relation_if_needed(store, &mut self.edge_rows, policy.medium_limit)?;
-        flush_relation_if_needed(store, &mut self.graph_label_rows, policy.medium_limit)?;
+        if self.persist_graph_relations {
+            flush_relation_if_needed(store, &mut self.graph_label_rows, policy.medium_limit)?;
+        }
         flush_relation_if_needed(store, &mut self.span_mention_rows, policy.medium_limit)?;
         flush_relation_if_needed(store, &mut self.chunkid_rows, policy.lightweight_limit)?;
         Ok(())
@@ -1699,11 +1834,44 @@ impl BufferSet {
         flush_relation_all(store, &mut self.evidence_rows)?;
         flush_relation_all(store, &mut self.discovery_rows)?;
         flush_relation_all(store, &mut self.edge_rows)?;
-        flush_relation_all(store, &mut self.graph_vertex_rows)?;
-        flush_relation_all(store, &mut self.graph_label_rows)?;
-        flush_relation_all(store, &mut self.graph_edge_rows)?;
-        flush_relation_all(store, &mut self.graph_property_rows)?;
+        if self.persist_graph_relations {
+            flush_relation_all(store, &mut self.graph_vertex_rows)?;
+            flush_relation_all(store, &mut self.graph_label_rows)?;
+            flush_relation_all(store, &mut self.graph_edge_rows)?;
+            flush_relation_all(store, &mut self.graph_property_rows)?;
+        }
         Ok(())
+    }
+
+    fn asserted_graph_batch_for_document(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<GraphMutationBatch>, StoreError> {
+        let vertices = self
+            .graph_vertex_rows
+            .json_rows()?
+            .into_iter()
+            .filter_map(|row| graph_vertex_record_from_row(&row))
+            .filter(|row| row.document_id.as_deref() == Some(document_id))
+            .collect::<Vec<_>>();
+        let edges = self
+            .graph_edge_rows
+            .json_rows()?
+            .into_iter()
+            .filter_map(|row| graph_edge_record_from_row(&row, GraphLayer::Asserted))
+            .filter(|row| row.document_id.as_deref() == Some(document_id))
+            .collect::<Vec<_>>();
+        if vertices.is_empty() && edges.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(GraphMutationBatch {
+            layer: GraphLayer::Asserted,
+            scope: GraphMutationScope::Document {
+                document_id: document_id.to_owned(),
+            },
+            vertices,
+            edges,
+        }))
     }
 }
 
@@ -2814,6 +2982,7 @@ fn build_document_manifest(
     chapters: &[ChapterSpec],
     discovery_count: usize,
     now: i64,
+    asserted_graph_batch: Option<&GraphMutationBatch>,
 ) -> Value {
     json!({
         "documentId": document.document_id.0,
@@ -2847,6 +3016,7 @@ fn build_document_manifest(
                 "parentIds": chapter.parents.iter().map(|parent| parent.chunk_id).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
+        "assertedGraphBatch": asserted_graph_batch,
         "updatedAt": now,
     })
 }
@@ -2949,6 +3119,258 @@ fn record_graph_json_properties(
     record_graph_property(rows, owner_id, owner_type, prefix, value.clone(), now);
 }
 
+fn graph_metadata_json(
+    layer: &str,
+    resolver: &str,
+    confidence: f64,
+    evidence_refs: Vec<String>,
+) -> Value {
+    json!({
+        "layer": layer,
+        "status": "asserted",
+        "resolver": resolver,
+        "confidence": confidence,
+        "evidence_refs": evidence_refs,
+    })
+}
+
+fn ensure_graph_metadata(
+    attributes: &mut Map<String, Value>,
+    layer: &str,
+    resolver: &str,
+    confidence: f64,
+    evidence_refs: Vec<String>,
+) {
+    if !attributes.contains_key("graph") {
+        attributes.insert(
+            "graph".to_owned(),
+            graph_metadata_json(layer, resolver, confidence, evidence_refs),
+        );
+    }
+}
+
+fn row_document_id(row: &Map<String, Value>) -> Option<String> {
+    row.get("document_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            row.get("attributes")
+                .and_then(Value::as_object)
+                .and_then(|attributes| attributes.get("documentId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            row.get("value")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("documentId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+fn row_boundary_ref(row: &Map<String, Value>, document_id: Option<&str>) -> Option<String> {
+    let attributes = row.get("attributes").and_then(Value::as_object)?;
+    let boundary_id = attributes.get("boundaryId").and_then(Value::as_u64)?;
+    let boundary_doc = attributes
+        .get("documentId")
+        .and_then(Value::as_str)
+        .or(document_id)
+        .unwrap_or_default();
+    Some(format!("boundary:{boundary_doc}:{boundary_id}"))
+}
+
+fn collect_vertex_evidence_refs(row: &Map<String, Value>) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(vertex_id) = row.get("id").and_then(Value::as_str) {
+        refs.push(format!("graph_vertex:{vertex_id}"));
+    }
+    let document_id = row_document_id(row);
+    if let Some(document_id) = document_id.as_deref() {
+        refs.push(format!("document:{document_id}"));
+    }
+    if let Some(boundary_ref) = row_boundary_ref(row, document_id.as_deref()) {
+        refs.push(boundary_ref);
+    }
+    if let Some(search_chunk_id) = row
+        .get("value")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("searchChunkId"))
+        .and_then(Value::as_str)
+    {
+        refs.push(format!("leaf:{search_chunk_id}"));
+    }
+    if let Some(entity_id) = row
+        .get("value")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("entityId"))
+        .and_then(Value::as_str)
+    {
+        refs.push(format!("entity:{entity_id}"));
+    }
+    refs
+}
+
+fn collect_edge_evidence_refs(row: &Map<String, Value>) -> Vec<String> {
+    let mut refs = Vec::new();
+    let source_id = row
+        .get("source_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let target_id = row
+        .get("target_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let edge_type = row
+        .get("edge_type")
+        .and_then(Value::as_str)
+        .unwrap_or("edge");
+    refs.push(format!("graph_edge:{source_id}->{target_id}::{edge_type}"));
+    if !source_id.is_empty() {
+        refs.push(format!("graph_vertex:{source_id}"));
+    }
+    if !target_id.is_empty() {
+        refs.push(format!("graph_vertex:{target_id}"));
+    }
+    let document_id = row_document_id(row);
+    if let Some(document_id) = document_id.as_deref() {
+        refs.push(format!("document:{document_id}"));
+    }
+    if let Some(boundary_ref) = row_boundary_ref(row, document_id.as_deref()) {
+        refs.push(boundary_ref);
+    }
+    refs
+}
+
+fn row_confidence(row: &Map<String, Value>) -> f64 {
+    row.get("attributes")
+        .and_then(Value::as_object)
+        .and_then(|attributes| attributes.get("confidence"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            row.get("data")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("confidence"))
+                .and_then(Value::as_f64)
+        })
+        .unwrap_or(1.0)
+}
+
+fn graph_vertex_record_from_row(row: &Value) -> Option<GraphVertexRecord> {
+    let object = row.as_object()?;
+    let id = object.get("id")?.as_str()?.to_owned();
+    let value = object.get("value").cloned().unwrap_or(Value::Null);
+    let attributes = object.get("attributes").cloned().unwrap_or(Value::Null);
+    let document_id = row_document_id(object);
+    let chapters = attributes
+        .get("chapters")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|value| value as u32)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let boundary_ordinals = attributes
+        .get("boundaryOrdinals")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|value| value as u32)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(GraphVertexRecord {
+        id,
+        kind: value
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        weight: object.get("weight").and_then(Value::as_i64).unwrap_or(1),
+        value: value.clone(),
+        attributes: attributes.clone(),
+        entity_id: value
+            .get("entityId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        search_chunk_id: value
+            .get("searchChunkId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                attributes
+                    .get("searchChunkId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        document_id,
+        chapter_id: attributes
+            .get("chapterId")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        chapters,
+        boundary_id: attributes
+            .get("boundaryId")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        boundary_ordinal: attributes
+            .get("boundaryOrdinal")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        boundary_kind: attributes
+            .get("boundaryKind")
+            .and_then(Value::as_str)
+            .map(boundary_kind_from_str),
+        boundary_ordinals,
+    })
+}
+
+fn graph_edge_record_from_row(row: &Value, layer: GraphLayer) -> Option<GraphEdgeRecord> {
+    let object = row.as_object()?;
+    Some(GraphEdgeRecord {
+        source_id: object.get("source_id")?.as_str()?.to_owned(),
+        target_id: object.get("target_id")?.as_str()?.to_owned(),
+        edge_type: object
+            .get("edge_type")
+            .and_then(Value::as_str)
+            .unwrap_or("edge")
+            .to_owned(),
+        weight: object.get("weight").and_then(Value::as_i64).unwrap_or(1),
+        attributes: object.get("attributes").cloned().unwrap_or(Value::Null),
+        data: object.get("data").cloned().filter(|value| !value.is_null()),
+        document_id: object
+            .get("document_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                object
+                    .get("attributes")
+                    .and_then(Value::as_object)
+                    .and_then(|attributes| attributes.get("documentId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        narrative_id: object
+            .get("narrative_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                object
+                    .get("attributes")
+                    .and_then(Value::as_object)
+                    .and_then(|attributes| attributes.get("narrativeId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }),
+        layer,
+    })
+}
+
 fn graph_row_boundary_ordinal(row: &Value) -> Option<i64> {
     row.get("attributes")
         .and_then(Value::as_object)
@@ -3033,6 +3455,13 @@ fn insert_graph_vertex(buffers: &mut BufferSet, row: Value) {
                 .and_then(Value::as_object)
                 .and_then(|attributes| attributes.get("documentId"))
                 .cloned()
+                .or_else(|| {
+                    object
+                        .get("value")
+                        .and_then(Value::as_object)
+                        .and_then(|value| value.get("documentId"))
+                        .cloned()
+                })
             {
                 object.insert("document_id".to_owned(), document_id);
             }
@@ -3056,6 +3485,20 @@ fn insert_graph_vertex(buffers: &mut BufferSet, row: Value) {
                 object.insert("narrative_id".to_owned(), narrative_id);
             }
         }
+        let confidence = row_confidence(object);
+        let evidence_refs = collect_vertex_evidence_refs(object);
+        let attributes = object
+            .entry("attributes".to_owned())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("graph vertex attributes object");
+        ensure_graph_metadata(
+            attributes,
+            "asserted",
+            "phoenix-graptor",
+            confidence,
+            evidence_refs,
+        );
     }
     let now = now_ms();
     let valid_from = graph_row_boundary_ordinal(&row).unwrap_or(now);
@@ -3124,6 +3567,20 @@ fn insert_graph_edge(
                 object.insert("narrative_id".to_owned(), narrative_id);
             }
         }
+        let confidence = row_confidence(object);
+        let evidence_refs = collect_edge_evidence_refs(object);
+        let attributes = object
+            .entry("attributes".to_owned())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("graph edge attributes object");
+        ensure_graph_metadata(
+            attributes,
+            "asserted",
+            "phoenix-graptor",
+            confidence,
+            evidence_refs,
+        );
     }
     let now = now_ms();
     let valid_from = graph_row_boundary_ordinal(&row).unwrap_or(now);
@@ -3287,6 +3744,7 @@ fn persist_entity_rows(
     registry: &EntityRegistry,
     persist_state: &DocumentPersistState,
     now: i64,
+    asserted_graph_batch: Option<&GraphMutationBatch>,
 ) -> Result<(), StoreError> {
     let entity_rows = persist_state
         .entity_ids
@@ -3309,6 +3767,7 @@ fn persist_entity_rows(
         chapters,
         persist_state.discovery_count,
         now,
+        asserted_graph_batch,
     );
     store.put_rows(
         "scoped_documents",

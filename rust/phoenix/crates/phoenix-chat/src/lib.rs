@@ -154,8 +154,7 @@ impl PhoenixChat {
             })?;
             delete_rows_with_filter(store, "workspace_artifacts", |row| {
                 row.get("thread_id").and_then(Value::as_str) == Some(run_id.as_str())
-                    && row.get("produced_by").and_then(Value::as_str)
-                        == Some("phoenix-chat-rlm")
+                    && row.get("produced_by").and_then(Value::as_str) == Some("phoenix-chat-rlm")
             })?;
         }
         delete_rows_with_filter(store, "chat_runs", |row| {
@@ -669,13 +668,21 @@ impl PhoenixChat {
                 call.latency_ms = Some(now.saturating_sub(started_at));
             }
 
-            if let Some(error) = result.error.as_ref().filter(|value| !value.trim().is_empty()) {
+            if let Some(error) = result
+                .error
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
                 let payload = serde_json::to_string(&json!({ "error": error }))
                     .map_err(|err| StoreError::Query(err.to_string()))?;
                 call.status = "failed".to_owned();
                 call.error = Some(error.clone());
                 call.result_json = Some(payload.clone());
-                messages.push(tool_message(&call.tool_name, &call.tool_call_id, payload.clone()));
+                messages.push(tool_message(
+                    &call.tool_name,
+                    &call.tool_call_id,
+                    payload.clone(),
+                ));
                 self.persist_event(
                     store,
                     &ChatRunEvent {
@@ -739,7 +746,11 @@ impl PhoenixChat {
                 let payload = normalize_json_payload(result.result_json.as_deref());
                 call.status = "completed".to_owned();
                 call.result_json = Some(payload.clone());
-                messages.push(tool_message(&call.tool_name, &call.tool_call_id, payload.clone()));
+                messages.push(tool_message(
+                    &call.tool_name,
+                    &call.tool_call_id,
+                    payload.clone(),
+                ));
                 evidence.push(make_tool_evidence(&run.id, &call.tool_name, &payload));
                 self.persist_event(
                     store,
@@ -799,27 +810,29 @@ impl PhoenixChat {
             return Err(StoreError::Query(format!("run not found: {run_id}")));
         };
         let Some(mut approval) = self.get_approval(store, run_id, approval_id)? else {
-            return Err(StoreError::Query(format!("approval not found: {approval_id}")));
+            return Err(StoreError::Query(format!(
+                "approval not found: {approval_id}"
+            )));
         };
 
         let now = now_ms();
         let status = if approved { "approved" } else { "rejected" };
-        let decision_json = normalize_json_payload(
-            decision_json.or_else(|| {
-                if approved {
-                    Some(r#"{"approved":true}"#)
-                } else {
-                    Some(r#"{"approved":false}"#)
-                }
-            }),
-        );
+        let decision_json = normalize_json_payload(decision_json.or_else(|| {
+            if approved {
+                Some(r#"{"approved":true}"#)
+            } else {
+                Some(r#"{"approved":false}"#)
+            }
+        }));
 
         approval.status = status.to_owned();
         approval.decision_json = Some(decision_json.clone());
         approval.updated_at = now;
         self.persist_approval(store, &approval)?;
 
-        if let Some(mut call) = self.find_tool_call_by_tool_call_id(store, run_id, &approval.tool_call_id)? {
+        if let Some(mut call) =
+            self.find_tool_call_by_tool_call_id(store, run_id, &approval.tool_call_id)?
+        {
             call.status = status.to_owned();
             call.result_json = Some(decision_json.clone());
             call.completed_at = Some(now);
@@ -839,7 +852,11 @@ impl PhoenixChat {
         }
         let mut evidence = self.parse_evidence(&run);
         if approved {
-            evidence.push(make_tool_evidence(&run.id, &approval.tool_name, &decision_json));
+            evidence.push(make_tool_evidence(
+                &run.id,
+                &approval.tool_name,
+                &decision_json,
+            ));
         }
 
         let has_pending_approvals = self
@@ -1186,7 +1203,11 @@ impl PhoenixChat {
         run_id: &str,
         result: &ToolResultSubmission,
     ) -> Result<Option<ChatToolCall>, StoreError> {
-        if let Some(call_id) = result.call_id.as_deref().filter(|value| !value.trim().is_empty()) {
+        if let Some(call_id) = result
+            .call_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
             return self.get_tool_call(store, call_id);
         }
         if let Some(tool_call_id) = result

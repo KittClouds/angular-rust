@@ -987,6 +987,7 @@ fn tool_search_lexical(
         limit: Some(limit),
         temporal: None,
         semantic_query_vector: None,
+        include_candidate_graph: false,
     })?;
     let document_ids = unique_document_ids(
         result
@@ -1046,6 +1047,7 @@ fn tool_search_graph(
         limit: Some(limit),
         temporal: None,
         semantic_query_vector: None,
+        include_candidate_graph: false,
     })?;
     let wanted = result
         .node_hits

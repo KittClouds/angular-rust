@@ -13,7 +13,7 @@ use schema::{
     CONTENT_SNAPSHOT_RELATIONS, DERIVED_SNAPSHOT_RELATIONS,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use smallvec::SmallVec;
 
 pub mod schema;
@@ -323,6 +323,20 @@ pub struct SemanticDocumentVectorRow<'a> {
     pub values: &'a [f32],
     pub model_id: &'a str,
     pub leaf_count: usize,
+    pub evidence_refs: &'a [String],
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticNodeVectorRow<'a> {
+    pub node_id: &'a str,
+    pub node_kind: &'a str,
+    pub document_id: Option<&'a str>,
+    pub narrative_id: Option<&'a str>,
+    pub folder_id: Option<&'a str>,
+    pub values: &'a [f32],
+    pub model_id: &'a str,
+    pub evidence_refs: &'a [String],
     pub updated_at: i64,
 }
 
@@ -347,6 +361,18 @@ pub struct SemanticDocumentNeighbor {
     pub document_id: String,
     pub distance: f64,
     pub leaf_count: usize,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SemanticNodeNeighbor {
+    pub node_id: String,
+    pub node_kind: String,
+    pub distance: f64,
+    pub document_id: Option<String>,
+    pub narrative_id: Option<String>,
+    pub folder_id: Option<String>,
+    pub evidence_refs: Vec<String>,
 }
 
 impl PhoenixCozoStore {
@@ -405,7 +431,8 @@ impl PhoenixCozoStore {
 
     pub fn ensure_semantic_relations(&self) -> Result<(), StoreError> {
         self.ensure_semantic_index("semantic_vectors", "vec_idx")?;
-        self.ensure_semantic_index("semantic_documents", "doc_idx")
+        self.ensure_semantic_index("semantic_documents", "doc_idx")?;
+        self.ensure_semantic_index("semantic_node_prototypes", "node_idx")
     }
 
     fn ensure_semantic_index(&self, relation: &str, index_name: &str) -> Result<(), StoreError> {
@@ -523,6 +550,7 @@ rows[span_id, raw_vec, model_id, updated_at] <- $rows
                     ),
                     cozo::DataValue::Str(row.model_id.to_owned().into()),
                     cozo::DataValue::from(row.leaf_count as i64),
+                    json_to_datavalue(&json!(row.evidence_refs)),
                     cozo::DataValue::from(row.updated_at),
                 ]))
             })
@@ -533,10 +561,80 @@ rows[span_id, raw_vec, model_id, updated_at] <- $rows
         self.db
             .run_script(
                 r#"
-rows[document_id, raw_vec, model_id, leaf_count, updated_at] <- $rows
-?[document_id, vec, model_id, leaf_count, updated_at] := rows[document_id, raw_vec, model_id, leaf_count, updated_at],
+rows[document_id, raw_vec, model_id, leaf_count, evidence_refs, updated_at] <- $rows
+?[document_id, vec, model_id, leaf_count, evidence_refs, updated_at] := rows[document_id, raw_vec, model_id, leaf_count, evidence_refs, updated_at],
     vec = vec(raw_vec, "F32")
-:put semantic_documents { document_id => vec, model_id, leaf_count, updated_at }
+:put semantic_documents { document_id => vec, model_id, leaf_count, evidence_refs, updated_at }
+"#,
+                params,
+                cozo::ScriptMutability::Mutable,
+            )
+            .map_err(|error| StoreError::Query(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn upsert_semantic_node_vectors(
+        &self,
+        rows: &[SemanticNodeVectorRow<'_>],
+    ) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let data = rows
+            .iter()
+            .map(|row| {
+                if row.values.len() != SEMANTIC_VECTOR_DIM {
+                    return Err(StoreError::Query(format!(
+                        "semantic node vector dimension mismatch for {}: expected {}, got {}",
+                        row.node_id,
+                        SEMANTIC_VECTOR_DIM,
+                        row.values.len()
+                    )));
+                }
+                if row.model_id != SEMANTIC_MODEL_ID {
+                    return Err(StoreError::Query(format!(
+                        "semantic node model mismatch for {}: expected {}, got {}",
+                        row.node_id, SEMANTIC_MODEL_ID, row.model_id
+                    )));
+                }
+                Ok(cozo::DataValue::List(vec![
+                    cozo::DataValue::Str(row.node_id.to_owned().into()),
+                    cozo::DataValue::Str(row.node_kind.to_owned().into()),
+                    nullable_str_to_datavalue(row.document_id),
+                    nullable_str_to_datavalue(row.narrative_id),
+                    nullable_str_to_datavalue(row.folder_id),
+                    cozo::DataValue::List(
+                        row.values
+                            .iter()
+                            .map(|value| cozo::DataValue::from(*value as f64))
+                            .collect(),
+                    ),
+                    cozo::DataValue::Str(row.model_id.to_owned().into()),
+                    json_to_datavalue(&json!(row.evidence_refs)),
+                    cozo::DataValue::from(row.updated_at),
+                ]))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let params = [("rows".to_owned(), cozo::DataValue::List(data))]
+            .into_iter()
+            .collect();
+        self.db
+            .run_script(
+                r#"
+rows[node_id, node_kind, document_id, narrative_id, folder_id, raw_vec, model_id, evidence_refs, updated_at] <- $rows
+?[node_id, node_kind, document_id, narrative_id, folder_id, vec, model_id, evidence_refs, updated_at] :=
+    rows[node_id, node_kind, document_id, narrative_id, folder_id, raw_vec, model_id, evidence_refs, updated_at],
+    vec = vec(raw_vec, "F32")
+:put semantic_node_prototypes {
+    node_id => node_kind,
+    document_id,
+    narrative_id,
+    folder_id,
+    vec,
+    model_id,
+    evidence_refs,
+    updated_at
+}
 "#,
                 params,
                 cozo::ScriptMutability::Mutable,
@@ -706,12 +804,13 @@ doc_scope[document_id, narrative_id, folder_id] := *chunks{
     scope_folder: folder_id
 },
     level = 0
-?[document_id, dist, leaf_count, narrative_id, folder_id] := q_vec[q],
+?[document_id, dist, leaf_count, evidence_refs, narrative_id, folder_id] := q_vec[q],
     ~semantic_documents:doc_idx{
         document_id,
         vec,
         model_id,
         leaf_count,
+        evidence_refs,
         updated_at |
         query: q,
         k: $k,
@@ -733,8 +832,8 @@ doc_scope[document_id, narrative_id, folder_id] := *chunks{
             };
             if !matches_scope(
                 scope,
-                row.get(3).and_then(datavalue_as_str),
                 row.get(4).and_then(datavalue_as_str),
+                row.get(5).and_then(datavalue_as_str),
             ) {
                 continue;
             }
@@ -750,6 +849,108 @@ doc_scope[document_id, narrative_id, folder_id] := *chunks{
                 document_id: document_id.to_owned(),
                 distance,
                 leaf_count,
+                evidence_refs: row
+                    .get(3)
+                    .map(datavalue_to_json_ref)
+                    .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                    .unwrap_or_default(),
+            });
+            if filtered.len() >= limit {
+                break;
+            }
+        }
+        Ok(filtered)
+    }
+
+    pub fn query_semantic_node_neighbors(
+        &self,
+        query_vector: &[f32],
+        scope: &ScopeKey,
+        kind: &str,
+        exclude_node_id: Option<&str>,
+        limit: usize,
+        oversample: usize,
+    ) -> Result<Vec<SemanticNodeNeighbor>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if query_vector.len() != SEMANTIC_VECTOR_DIM {
+            return Err(StoreError::Query(format!(
+                "semantic node query vector dimension mismatch: expected {}, got {}",
+                SEMANTIC_VECTOR_DIM,
+                query_vector.len()
+            )));
+        }
+        let mut params = build_semantic_query_params(query_vector, oversample.max(limit));
+        params.insert(
+            "kind".to_owned(),
+            cozo::DataValue::Str(kind.to_owned().into()),
+        );
+        params.insert(
+            "exclude_node_id".to_owned(),
+            nullable_str_to_datavalue(exclude_node_id),
+        );
+        let rows = self
+            .db
+            .run_script(
+                r#"
+q_vec[v] := v = vec($query, "F32")
+?[node_id, dist, node_kind, document_id, narrative_id, folder_id, evidence_refs] := q_vec[q],
+    ~semantic_node_prototypes:node_idx{
+        node_id,
+        node_kind,
+        document_id,
+        narrative_id,
+        folder_id,
+        vec,
+        model_id,
+        evidence_refs,
+        updated_at |
+        query: q,
+        k: $k,
+        ef: $ef,
+        bind_distance: dist,
+        filter: model_id == $model_id
+    },
+    node_kind == $kind,
+    (is_null($exclude_node_id) || node_id != $exclude_node_id)
+:order dist
+"#,
+                params,
+                cozo::ScriptMutability::Immutable,
+            )
+            .map_err(|error| StoreError::Query(error.to_string()))?;
+        let mut filtered = Vec::with_capacity(limit);
+        for row in rows.rows {
+            let Some(node_id) = row.first().and_then(datavalue_as_str) else {
+                continue;
+            };
+            if !matches_scope(
+                scope,
+                row.get(4).and_then(datavalue_as_str),
+                row.get(5).and_then(datavalue_as_str),
+            ) {
+                continue;
+            }
+            let Some(distance) = row.get(1).and_then(datavalue_to_f64) else {
+                continue;
+            };
+            filtered.push(SemanticNodeNeighbor {
+                node_id: node_id.to_owned(),
+                node_kind: row
+                    .get(2)
+                    .and_then(datavalue_as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                distance,
+                document_id: row.get(3).and_then(datavalue_as_str).map(str::to_owned),
+                narrative_id: row.get(4).and_then(datavalue_as_str).map(str::to_owned),
+                folder_id: row.get(5).and_then(datavalue_as_str).map(str::to_owned),
+                evidence_refs: row
+                    .get(6)
+                    .map(datavalue_to_json_ref)
+                    .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                    .unwrap_or_default(),
             });
             if filtered.len() >= limit {
                 break;
@@ -2182,6 +2383,18 @@ fn relation_already_exists(message: &str) -> bool {
         || message.contains("conflicts with an existing one")
 }
 
+fn nullable_str_to_datavalue(value: Option<&str>) -> cozo::DataValue {
+    value
+        .map(|value| cozo::DataValue::Str(value.to_owned().into()))
+        .unwrap_or(cozo::DataValue::Null)
+}
+
+fn json_to_datavalue(value: &Value) -> cozo::DataValue {
+    serde_json::from_value(value.clone())
+        .map(cozo::DataValue::Json)
+        .unwrap_or(cozo::DataValue::Null)
+}
+
 fn build_semantic_query_params(
     query_vector: &[f32],
     candidate_count: usize,
@@ -2540,6 +2753,7 @@ mod tests {
                     values: &vector_a,
                     model_id: SEMANTIC_MODEL_ID,
                     leaf_count: 1,
+                    evidence_refs: &[],
                     updated_at: 10,
                 },
                 SemanticDocumentVectorRow {
@@ -2547,6 +2761,7 @@ mod tests {
                     values: &vector_b,
                     model_id: SEMANTIC_MODEL_ID,
                     leaf_count: 2,
+                    evidence_refs: &[],
                     updated_at: 10,
                 },
             ])
@@ -2573,6 +2788,7 @@ mod tests {
                 values: &vector_b,
                 model_id: SEMANTIC_MODEL_ID,
                 leaf_count: 3,
+                evidence_refs: &[],
                 updated_at: 11,
             }])
             .expect("replace doc");
@@ -2590,6 +2806,62 @@ mod tests {
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].document_id, "doc-a");
         assert_eq!(replaced[0].leaf_count, 3);
+    }
+
+    #[test]
+    fn semantic_node_prototypes_upsert_and_query_round_trip_evidence() {
+        let store = PhoenixCozoStore::new().expect("mem store");
+        let vector_a = semantic_test_vector(0);
+        let vector_b = semantic_test_vector(1);
+        let refs_a = vec!["graph_vertex:entity::ryan".to_owned()];
+        let refs_b = vec!["graph_vertex:entity::len".to_owned()];
+
+        store
+            .upsert_semantic_node_vectors(&[
+                SemanticNodeVectorRow {
+                    node_id: "entity::ryan",
+                    node_kind: "entity",
+                    document_id: Some("doc-a"),
+                    narrative_id: Some("nar-a"),
+                    folder_id: Some("folder-a"),
+                    values: &vector_a,
+                    model_id: SEMANTIC_MODEL_ID,
+                    evidence_refs: &refs_a,
+                    updated_at: 10,
+                },
+                SemanticNodeVectorRow {
+                    node_id: "entity::len",
+                    node_kind: "entity",
+                    document_id: Some("doc-b"),
+                    narrative_id: Some("nar-a"),
+                    folder_id: Some("folder-a"),
+                    values: &vector_b,
+                    model_id: SEMANTIC_MODEL_ID,
+                    evidence_refs: &refs_b,
+                    updated_at: 10,
+                },
+            ])
+            .expect("upsert node prototypes");
+
+        let neighbors = store
+            .query_semantic_node_neighbors(
+                &vector_a,
+                &ScopeKey {
+                    narrative_id: Some("nar-a".to_owned()),
+                    folder_id: Some("folder-a".to_owned()),
+                    ..ScopeKey::default()
+                },
+                "entity",
+                Some("entity::ryan"),
+                4,
+                8,
+            )
+            .expect("query node neighbors");
+
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].node_id, "entity::len");
+        assert_eq!(neighbors[0].node_kind, "entity");
+        assert_eq!(neighbors[0].evidence_refs, refs_b);
     }
 
     #[test]

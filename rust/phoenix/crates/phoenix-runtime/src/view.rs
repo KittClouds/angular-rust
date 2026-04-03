@@ -111,6 +111,7 @@ pub struct QueryRequestView<'a> {
     pub limit: Option<usize>,
     pub temporal: Option<&'a TemporalMarker>,
     pub semantic_query_vector: Option<&'a [f32]>,
+    pub include_candidate_graph: bool,
 }
 
 impl<'a> QueryRequestView<'a> {
@@ -127,6 +128,7 @@ impl<'a> QueryRequestView<'a> {
                     values: values.to_vec(),
                 }
             }),
+            include_candidate_graph: self.include_candidate_graph,
         }
     }
 }
@@ -144,6 +146,7 @@ impl<'a> From<&'a QueryRequest> for QueryRequestView<'a> {
                 .semantic_query_vector
                 .as_ref()
                 .map(|vector| vector.values.as_slice()),
+            include_candidate_graph: value.include_candidate_graph,
         }
     }
 }

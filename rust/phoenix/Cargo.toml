@@ -4,6 +4,8 @@ members = [
     "crates/phoenix-analytics",
     "crates/phoenix-chat",
     "crates/phoenix-chunker",
+    "crates/phoenix-graph",
+    "crates/phoenix-graph-native",
     "crates/phoenix-gldr",
     "crates/phoenix-graptor",
     "crates/phoenix-lex",
@@ -15,7 +17,9 @@ members = [
     "crates/phoenix-runtime",
     "crates/phoenix-scanner",
     "crates/phoenix-store-cozo",
+    "crates/phoenix-store-kyu",
     "crates/phoenix-structure",
+    "crates/phoenix-triverse",
     "crates/phoenix-types",
     "crates/phoenix-wasm",
 ]
@@ -50,3 +54,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[patch.crates-io]
+graph_builder = { path = "vendor/graph_builder" }
+kyu-copy = { path = "vendor/kyu-copy" }
+arrow-arith = { path = "vendor/arrow-arith" }

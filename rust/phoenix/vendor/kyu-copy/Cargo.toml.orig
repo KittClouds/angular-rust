@@ -1,0 +1,17 @@
+[package]
+name = "kyu-copy"
+version = "0.1.0"
+edition = "2024"
+description = "Bulk data import for KyuGraph: CSV, Parquet, Arrow IPC, and Kafka readers"
+license = "MIT"
+repository = "https://github.com/offbit-ai/kyugraph"
+
+[dependencies]
+kyu-common = { workspace = true }
+kyu-types  = { workspace = true }
+csv        = { workspace = true }
+arrow      = { workspace = true }
+parquet    = { workspace = true }
+smol_str   = { workspace = true }
+rdkafka    = { workspace = true }
+simd-json  = { workspace = true }

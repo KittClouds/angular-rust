@@ -1,6 +1,5 @@
 /// Sentence splitter using memchr3 for high-speed punctuation scanning.
 /// Identical algorithm to phoenix-alex::sentence::split_sentence_ranges.
-
 use memchr::memchr3_iter;
 
 use crate::{is_sentence_guard, normalize_raw};

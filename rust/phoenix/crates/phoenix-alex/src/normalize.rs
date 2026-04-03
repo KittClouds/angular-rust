@@ -16,20 +16,8 @@ const LEGACY_STOP_WORDS: &[&str] = &[
 ];
 
 const DISCOVERY_NOISE_WORDS: &[&str] = &[
-    "chapter",
-    "gesture",
-    "image",
-    "images",
-    "note",
-    "notes",
-    "profile",
-    "profiles",
-    "scene",
-    "scenes",
-    "section",
-    "summary",
-    "visual",
-    "visuals",
+    "chapter", "gesture", "image", "images", "note", "notes", "profile", "profiles", "scene",
+    "scenes", "section", "summary", "visual", "visuals",
 ];
 
 const SENTENCE_GUARDS: &[&str] = &[
@@ -275,7 +263,10 @@ fn normalize_stopword_profile(profile: &str) -> StopwordProfile {
 fn default_stop_words() -> &'static HashSet<&'static str> {
     static STOP_WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     STOP_WORDS.get_or_init(|| {
-        let mut words = get(LANGUAGE::English).iter().copied().collect::<HashSet<_>>();
+        let mut words = get(LANGUAGE::English)
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
         words.extend(LEGACY_STOP_WORDS.iter().copied());
         words.extend(DISCOVERY_NOISE_WORDS.iter().copied());
         words

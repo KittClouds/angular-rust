@@ -125,6 +125,8 @@ struct BorrowedQueryRequest<'a> {
     targets: Vec<QueryTarget>,
     limit: Option<usize>,
     temporal: Option<TemporalMarker>,
+    #[serde(default)]
+    include_candidate_graph: bool,
 }
 
 #[derive(Debug)]
@@ -305,6 +307,7 @@ fn with_query_json_request<T>(
         limit: request.limit,
         temporal: request.temporal.as_ref(),
         semantic_query_vector: None,
+        include_candidate_graph: request.include_candidate_graph,
     };
     op(view)
 }
@@ -396,6 +399,7 @@ fn with_query_binary_request<T>(
         limit,
         temporal: temporal.as_ref(),
         semantic_query_vector,
+        include_candidate_graph: flags & phoenix_types::REQUEST_FLAG_INCLUDE_CANDIDATE_GRAPH != 0,
     };
     op(view)
 }
@@ -1464,6 +1468,7 @@ mod tests {
             limit: Some(3),
             temporal: None,
             semantic_query_vector: None,
+            include_candidate_graph: false,
         })
         .expect("query payload");
         let mut query_packet = packet(PacketKind::QueryRequest, 4, &query_payload);
@@ -1654,6 +1659,7 @@ mod tests {
             changed_documents: vec![DocumentId("graph-doc".to_owned())],
             limit: Some(8),
             since_commit: None,
+            include_candidate_graph: false,
         })
         .expect("graph delta payload");
         let mut graph_packet = packet(PacketKind::GraphDeltaRequest, 14, &graph_delta_payload);

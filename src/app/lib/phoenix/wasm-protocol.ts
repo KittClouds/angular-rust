@@ -80,6 +80,7 @@ export const REQUEST_FLAG_TARGET_CHUNKS = 1 << 8;
 export const REQUEST_FLAG_TARGET_NODES = 1 << 9;
 export const REQUEST_FLAG_TARGET_GRAPH = 1 << 10;
 export const REQUEST_FLAG_TARGET_SEMANTIC = 1 << 11;
+export const REQUEST_FLAG_INCLUDE_CANDIDATE_GRAPH = 1 << 12;
 export const PHOENIX_WASM_CANDIDATE_URLS = ['/assets/phoenix_wasm.wasm', '/assets/wasm/phoenix_wasm.wasm'];
 
 export type PacketHeader = {

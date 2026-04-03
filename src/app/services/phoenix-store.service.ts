@@ -23,7 +23,8 @@ import {
     isPhoenixWasmMismatchError,
     normalizePhoenixRuntimeCompatibilityError,
 } from '../lib/phoenix/phoenix-runtime-compat';
-import { PhoenixSnapshotPartition, PhoenixWasmService } from './phoenix-wasm.service';
+import { PhoenixBackendService } from './phoenix-backend.service';
+import { PhoenixSnapshotPartition } from './phoenix-wasm.service';
 
 export interface StoreNote {
     id: string;
@@ -257,7 +258,7 @@ type DerivedLoadState = 'cold' | 'loading' | 'ready';
 
 @Injectable({ providedIn: 'root' })
 export class PhoenixStoreService {
-    private readonly phoenix = inject(PhoenixWasmService);
+    private readonly phoenix = inject(PhoenixBackendService);
     private readonly persistence = inject(SqlitePersistenceService);
 
     private initialized = false;

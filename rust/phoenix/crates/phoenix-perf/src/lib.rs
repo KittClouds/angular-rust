@@ -502,6 +502,7 @@ fn run_corpus_suite(corpus: &CorpusDocument) -> Result<CorpusPerfReport, String>
                 changed_documents: vec![doc_id.clone()],
                 limit: None,
                 since_commit: Some(commit.commit_id.clone()),
+                include_candidate_graph: false,
             })
             .map_err(|error| error.to_string())
     })?;
@@ -561,6 +562,7 @@ fn run_corpus_suite(corpus: &CorpusDocument) -> Result<CorpusPerfReport, String>
                 limit: Some(5),
                 temporal: None::<TemporalMarker>,
                 semantic_query_vector: None,
+                include_candidate_graph: false,
             })
             .map_err(|error| error.to_string())
     })?;
@@ -834,6 +836,7 @@ fn run_query_batch(
                     limit: Some(8),
                     temporal: None,
                     semantic_query_vector: None,
+                    include_candidate_graph: false,
                 })
                 .map_err(|error| error.to_string())?;
             runs.push(QueryRunReport {
