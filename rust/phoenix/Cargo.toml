@@ -8,6 +8,7 @@ members = [
     "crates/phoenix-graph-native",
     "crates/phoenix-gldr",
     "crates/phoenix-graptor",
+    "crates/phoenix-invarant",
     "crates/phoenix-lex",
     "crates/phoenix-native",
     "crates/phoenix-om",

@@ -1,6 +1,12 @@
 use std::collections::{hash_map::Entry, VecDeque};
 
 use phoenix_graptor::{GraptorEdge, GraptorGraph, GraptorVertex};
+use phoenix_invarant::{
+    CanonicalEntity, Claim, CoreferenceChainArtifact, Event, EvidenceAnchor,
+    INVARANT_SEMANTIC_CLAIM_NAMESPACE, INVARANT_SEMANTIC_COREFERENCE_NAMESPACE,
+    INVARANT_SEMANTIC_DOCUMENT_NAMESPACE, INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+    INVARANT_SEMANTIC_EVENT_NAMESPACE, INVARANT_SEMANTIC_EVIDENCE_NAMESPACE,
+};
 use phoenix_lex::LexIndex;
 use phoenix_store_cozo::{PhoenixCozoStore, SemanticNeighbor, StoreError};
 use phoenix_types::{
@@ -21,6 +27,8 @@ use scirs2_graph::{
     personalized_pagerank as scirs2_personalized_pagerank, CsrGraph, DiGraph, Graph as SciRsGraph,
     PageRankConfig,
 };
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub struct TriverseConfig {
@@ -78,7 +86,18 @@ struct TriverseSeedSet {
     seed_scores: FxHashMap<String, f64>,
     seed_vertex_ids: Vec<String>,
     semantic_resolution: SemanticResolution,
+    invarant_resolution: InvarantSemanticResolution,
     context_seed_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InvarantSemanticResolution {
+    shortlisted_documents: usize,
+    entity_matches: usize,
+    claim_matches: usize,
+    event_matches: usize,
+    coreference_matches: usize,
+    evidence_chunk_seeds: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -243,6 +262,24 @@ impl PhoenixTriverse {
                 ),
             });
         }
+        if seed_set.invarant_resolution.entity_matches > 0
+            || seed_set.invarant_resolution.claim_matches > 0
+            || seed_set.invarant_resolution.event_matches > 0
+            || seed_set.invarant_resolution.coreference_matches > 0
+        {
+            diagnostics.push(Diagnostic {
+                code: "PX_TRIVERSE_INVARANT".to_owned(),
+                message: format!(
+                    "Triverse fused {} scoped canonical entities, {} claims, {} events, and {} coreference chains from Invarant semantic planes into {} evidence-backed chunk seeds across {} semantic documents.",
+                    seed_set.invarant_resolution.entity_matches,
+                    seed_set.invarant_resolution.claim_matches,
+                    seed_set.invarant_resolution.event_matches,
+                    seed_set.invarant_resolution.coreference_matches,
+                    seed_set.invarant_resolution.evidence_chunk_seeds,
+                    seed_set.invarant_resolution.shortlisted_documents,
+                ),
+            });
+        }
         if request.include_candidate_graph {
             diagnostics.push(Diagnostic {
                 code: "PX_TRIVERSE_CANDIDATE_GRAPH".to_owned(),
@@ -353,6 +390,14 @@ impl PhoenixTriverse {
             }
         }
 
+        let invarant_resolution = self.collect_invarant_seeds(
+            store,
+            request,
+            full_graph,
+            &mut seed_scores,
+            &mut seed_vertex_ids,
+        )?;
+
         let context_vertex_ids = session_context_vertex_ids(
             full_graph,
             request.session_id.as_ref(),
@@ -371,6 +416,7 @@ impl PhoenixTriverse {
             seed_scores,
             seed_vertex_ids,
             semantic_resolution,
+            invarant_resolution,
             context_seed_count: context_vertex_ids.len(),
         })
     }
@@ -491,6 +537,194 @@ impl PhoenixTriverse {
             hits,
             used_global_fallback: false,
         })
+    }
+
+    fn collect_invarant_seeds(
+        &self,
+        store: &PhoenixCozoStore,
+        request: &QueryRequest,
+        full_graph: &GraptorGraph,
+        seed_scores: &mut FxHashMap<String, f64>,
+        seed_vertex_ids: &mut Vec<String>,
+    ) -> Result<InvarantSemanticResolution, StoreError> {
+        let query_terms = normalized_terms(&request.query);
+        if query_terms.is_empty() {
+            return Ok(InvarantSemanticResolution::default());
+        }
+
+        let scoped_documents = load_invarant_document_keys(store, request)?;
+        let restrict_documents = !scoped_documents.is_empty();
+        let scoped_definitions = store.fetch_rows("scoped_definitions")?;
+
+        let mut evidence_by_id = FxHashMap::<String, EvidenceAnchor>::default();
+        for row in &scoped_definitions {
+            if let Some(anchor) = deserialize_scoped_payload::<EvidenceAnchor>(
+                row,
+                INVARANT_SEMANTIC_EVIDENCE_NAMESPACE,
+            ) {
+                if !restrict_documents || scoped_documents.contains(&anchor.document_id) {
+                    evidence_by_id.insert(anchor.evidence_id.0.clone(), anchor);
+                }
+            }
+        }
+
+        let mut resolution = InvarantSemanticResolution {
+            shortlisted_documents: scoped_documents.len(),
+            ..InvarantSemanticResolution::default()
+        };
+
+        for row in &scoped_definitions {
+            if let Some(entity) = deserialize_scoped_payload::<CanonicalEntity>(
+                row,
+                INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+            ) {
+                if !scope_matches(&request.scope, &entity.scope) {
+                    continue;
+                }
+                let entity_match = semantic_text_match(
+                    &query_terms,
+                    std::iter::once(entity.label.as_str())
+                        .chain(entity.aliases.iter().map(String::as_str)),
+                );
+                if entity_match <= 0.0 {
+                    continue;
+                }
+                let vertex_id = format!("entity::{}", entity.entity_id.0);
+                if full_graph.vertices.contains_key(&vertex_id) {
+                    push_seed(
+                        seed_scores,
+                        seed_vertex_ids,
+                        vertex_id,
+                        0.2 + entity_match * 0.5,
+                    );
+                    resolution.entity_matches += 1;
+                }
+            }
+        }
+
+        for row in &scoped_definitions {
+            if let Some(claim) =
+                deserialize_scoped_payload::<Claim>(row, INVARANT_SEMANTIC_CLAIM_NAMESPACE)
+            {
+                let claim_match = semantic_text_match(
+                    &query_terms,
+                    [
+                        Some(claim.relation_type.as_str()),
+                        Some(claim.event_class.as_str()),
+                        claim.subject_text.as_deref(),
+                        claim.object_text.as_deref(),
+                        claim.recipient_text.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+                if claim_match <= 0.0 {
+                    continue;
+                }
+                resolution.claim_matches += 1;
+                resolution.evidence_chunk_seeds += seed_claim_artifacts(
+                    full_graph,
+                    &claim.evidence_chunk_ids,
+                    &claim.evidence_ids,
+                    &evidence_by_id,
+                    seed_scores,
+                    seed_vertex_ids,
+                    0.15 + claim_match * 0.35,
+                );
+                for entity_id in [
+                    claim.subject_entity_id.as_ref(),
+                    claim.object_entity_id.as_ref(),
+                    claim.recipient_entity_id.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let vertex_id = format!("entity::{}", entity_id.0);
+                    if full_graph.vertices.contains_key(&vertex_id) {
+                        push_seed(
+                            seed_scores,
+                            seed_vertex_ids,
+                            vertex_id,
+                            0.1 + claim_match * 0.2,
+                        );
+                    }
+                }
+            }
+        }
+
+        for row in &scoped_definitions {
+            if let Some(event) =
+                deserialize_scoped_payload::<Event>(row, INVARANT_SEMANTIC_EVENT_NAMESPACE)
+            {
+                let event_match = semantic_text_match(
+                    &query_terms,
+                    [event.label.as_str(), event.event_class.as_str()].into_iter(),
+                );
+                if event_match <= 0.0 {
+                    continue;
+                }
+                resolution.event_matches += 1;
+                resolution.evidence_chunk_seeds += seed_evidence_chunks(
+                    full_graph,
+                    &event.evidence_ids,
+                    &evidence_by_id,
+                    seed_scores,
+                    seed_vertex_ids,
+                    0.12 + event_match * 0.25,
+                );
+                for entity_id in &event.participant_entity_ids {
+                    let vertex_id = format!("entity::{}", entity_id.0);
+                    if full_graph.vertices.contains_key(&vertex_id) {
+                        push_seed(
+                            seed_scores,
+                            seed_vertex_ids,
+                            vertex_id,
+                            0.08 + event_match * 0.18,
+                        );
+                    }
+                }
+            }
+        }
+
+        for row in &scoped_definitions {
+            if let Some(chain) = deserialize_scoped_payload::<CoreferenceChainArtifact>(
+                row,
+                INVARANT_SEMANTIC_COREFERENCE_NAMESPACE,
+            ) {
+                let coref_match = semantic_text_match(
+                    &query_terms,
+                    std::iter::once(chain.canonical.as_str()).chain(
+                        chain.mentions.iter().map(|mention| mention.surface.as_str()),
+                    ),
+                );
+                if coref_match <= 0.0 {
+                    continue;
+                }
+                resolution.coreference_matches += 1;
+                for chunk_id in &chain.chunk_ids {
+                    let vertex_id = leaf_vertex_id(&chunk_id.0);
+                    if full_graph.vertices.contains_key(&vertex_id) {
+                        push_seed(
+                            seed_scores,
+                            seed_vertex_ids,
+                            vertex_id,
+                            0.1 + coref_match * 0.2,
+                        );
+                        resolution.evidence_chunk_seeds += 1;
+                    }
+                }
+                resolution.evidence_chunk_seeds += seed_evidence_chunks(
+                    full_graph,
+                    &chain.evidence_ids,
+                    &evidence_by_id,
+                    seed_scores,
+                    seed_vertex_ids,
+                    0.1 + coref_match * 0.2,
+                );
+            }
+        }
+
+        Ok(resolution)
     }
 
     fn personalized_pagerank(
@@ -1068,6 +1302,191 @@ fn accumulate_score(scores: &mut FxHashMap<String, f64>, key: &str, score: f64) 
         .entry(key.to_owned())
         .and_modify(|value| *value += score)
         .or_insert(score);
+}
+
+fn load_invarant_document_keys(
+    store: &PhoenixCozoStore,
+    request: &QueryRequest,
+) -> Result<FxHashSet<String>, StoreError> {
+    Ok(store
+        .fetch_rows("scoped_documents")?
+        .into_iter()
+        .filter(|row| {
+            row.get("namespace").and_then(Value::as_str)
+                == Some(INVARANT_SEMANTIC_DOCUMENT_NAMESPACE)
+        })
+        .filter(|row| scoped_document_matches_request(row, request))
+        .filter_map(|row| {
+            row.get("payload")
+                .and_then(|payload| payload.get("documentId"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect())
+}
+
+fn scoped_document_matches_request(row: &Value, request: &QueryRequest) -> bool {
+    let Some(payload) = row.get("payload") else {
+        return false;
+    };
+    if let Some(session_id) = request.session_id.as_ref() {
+        if payload.get("sessionId").and_then(Value::as_str) != Some(session_id.0.as_str()) {
+            return false;
+        }
+    }
+    let Some(scope_value) = payload.get("scope").cloned() else {
+        return false;
+    };
+    let Ok(scope) = serde_json::from_value::<phoenix_types::ScopeKey>(scope_value) else {
+        return false;
+    };
+    scope_matches(&request.scope, &scope)
+}
+
+fn scope_matches(
+    query_scope: &phoenix_types::ScopeKey,
+    candidate_scope: &phoenix_types::ScopeKey,
+) -> bool {
+    query_scope
+        .world_id
+        .as_ref()
+        .map(|value| candidate_scope.world_id.as_ref() == Some(value))
+        .unwrap_or(true)
+        && query_scope
+            .narrative_id
+            .as_ref()
+            .map(|value| candidate_scope.narrative_id.as_ref() == Some(value))
+            .unwrap_or(true)
+        && query_scope
+            .folder_id
+            .as_ref()
+            .map(|value| candidate_scope.folder_id.as_ref() == Some(value))
+            .unwrap_or(true)
+        && query_scope
+            .folder_path
+            .as_ref()
+            .map(|value| candidate_scope.folder_path.as_ref() == Some(value))
+            .unwrap_or(true)
+}
+
+fn deserialize_scoped_payload<T>(row: &Value, namespace: &str) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    (row.get("namespace").and_then(Value::as_str) == Some(namespace))
+        .then(|| row.get("payload").cloned())
+        .flatten()
+        .and_then(|payload| serde_json::from_value(payload).ok())
+}
+
+fn normalized_terms(text: &str) -> Vec<String> {
+    let normalized = normalize_text(text);
+    normalized
+        .split_whitespace()
+        .filter(|part| part.len() >= 2)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn semantic_text_match<'a>(
+    query_terms: &[String],
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> f64 {
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let surfaces = candidates
+        .into_iter()
+        .map(normalize_text)
+        .filter(|surface| !surface.trim().is_empty())
+        .collect::<Vec<_>>();
+    if surfaces.is_empty() {
+        return 0.0;
+    }
+
+    let mut best = 0.0_f64;
+    for surface in &surfaces {
+        let matched = query_terms
+            .iter()
+            .filter(|term| surface.contains(term.as_str()))
+            .count();
+        if matched == 0 {
+            continue;
+        }
+        let ratio = matched as f64 / query_terms.len() as f64;
+        let exact = surface.contains(&query_terms.join(" ")) as u8 as f64 * 0.25;
+        best = best.max((ratio + exact).min(1.0));
+    }
+    best
+}
+
+fn seed_claim_artifacts(
+    full_graph: &GraptorGraph,
+    evidence_chunk_ids: &[phoenix_invarant::ChunkId],
+    evidence_ids: &[phoenix_invarant::EvidenceId],
+    evidence_by_id: &FxHashMap<String, EvidenceAnchor>,
+    seed_scores: &mut FxHashMap<String, f64>,
+    seed_vertex_ids: &mut Vec<String>,
+    score: f64,
+) -> usize {
+    let mut chunk_ids = evidence_chunk_ids
+        .iter()
+        .map(|chunk_id| chunk_id.0.clone())
+        .collect::<FxHashSet<_>>();
+    for evidence_id in evidence_ids {
+        if let Some(anchor) = evidence_by_id.get(&evidence_id.0) {
+            if let Some(chunk_id) = anchor.chunk_id.as_ref() {
+                chunk_ids.insert(chunk_id.0.clone());
+            }
+        }
+    }
+    seed_chunk_ids(full_graph, &chunk_ids, seed_scores, seed_vertex_ids, score)
+}
+
+fn seed_evidence_chunks(
+    full_graph: &GraptorGraph,
+    evidence_ids: &[phoenix_invarant::EvidenceId],
+    evidence_by_id: &FxHashMap<String, EvidenceAnchor>,
+    seed_scores: &mut FxHashMap<String, f64>,
+    seed_vertex_ids: &mut Vec<String>,
+    score: f64,
+) -> usize {
+    let chunk_ids = evidence_ids
+        .iter()
+        .filter_map(|evidence_id| evidence_by_id.get(&evidence_id.0))
+        .filter_map(|anchor| anchor.chunk_id.as_ref().map(|chunk_id| chunk_id.0.clone()))
+        .collect::<FxHashSet<_>>();
+    seed_chunk_ids(full_graph, &chunk_ids, seed_scores, seed_vertex_ids, score)
+}
+
+fn seed_chunk_ids(
+    full_graph: &GraptorGraph,
+    chunk_ids: &FxHashSet<String>,
+    seed_scores: &mut FxHashMap<String, f64>,
+    seed_vertex_ids: &mut Vec<String>,
+    score: f64,
+) -> usize {
+    let mut seeded = 0usize;
+    for chunk_id in chunk_ids {
+        let vertex_id = leaf_vertex_id(chunk_id);
+        if full_graph.vertices.contains_key(&vertex_id) {
+            push_seed(seed_scores, seed_vertex_ids, vertex_id, score);
+            seeded += 1;
+        }
+    }
+    seeded
 }
 
 fn add_transition(neighbors: &mut FxHashMap<usize, f64>, target_index: usize, weight: f64) {
@@ -1658,6 +2077,158 @@ mod tests {
             .expect("boundary");
     }
 
+    fn seed_invarant_semantic_rows(store: &PhoenixCozoStore, document_id: &str, chunk_key: &str) {
+        store
+            .put_row(
+                "scoped_documents",
+                json!({
+                    "id": format!("semantic-doc::{document_id}"),
+                    "scope_folder_id": "__root__",
+                    "narrative_id": "__global__",
+                    "namespace": INVARANT_SEMANTIC_DOCUMENT_NAMESPACE,
+                    "document_key": document_id,
+                    "payload": {
+                        "documentId": document_id,
+                        "documentVersionId": format!("version::{document_id}"),
+                        "sessionId": null,
+                        "scope": scope(),
+                        "summary": {
+                            "documentId": document_id,
+                            "noteId": null,
+                            "title": "Harbor ledger",
+                            "chunkCount": 1,
+                            "chapterCount": 1,
+                            "boundaryCount": 1,
+                            "parentCount": 0,
+                            "leafCount": 1,
+                            "entityCount": 1,
+                            "mentionCount": 1,
+                            "edgeCount": 1,
+                            "crossChapterLinks": 0,
+                            "discoveryCount": 0
+                        }
+                    },
+                    "seeded_from_scope_folder_id": null,
+                    "created_at": 1,
+                    "updated_at": 1
+                }),
+            )
+            .expect("semantic doc row");
+        store
+            .put_row(
+                "scoped_definitions",
+                json!({
+                    "id": "semantic-entity-row",
+                    "narrative_id": "__global__",
+                    "namespace": INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+                    "definition_key": "entity:harbor_authority",
+                    "payload": {
+                        "entityId": "harbor_authority",
+                        "label": "Harbor Authority",
+                        "aliases": ["Port Authority"],
+                        "kind": "Organization",
+                        "scope": scope(),
+                        "status": "resolved",
+                        "mentionIds": ["mention::1"],
+                        "evidenceIds": ["evidence::harbor"],
+                        "confidence": 0.92
+                    },
+                    "created_at": 1,
+                    "updated_at": 1
+                }),
+            )
+            .expect("semantic entity row");
+        store
+            .put_row(
+                "scoped_definitions",
+                json!({
+                    "id": "semantic-claim-row",
+                    "narrative_id": "__global__",
+                    "namespace": INVARANT_SEMANTIC_CLAIM_NAMESPACE,
+                    "definition_key": "claim:harbor-control",
+                    "payload": {
+                        "claimId": "claim::harbor-control",
+                        "relationType": "controls",
+                        "eventClass": "governance",
+                        "subjectEntityId": "harbor_authority",
+                        "objectEntityId": null,
+                        "recipientEntityId": null,
+                        "subjectText": "Harbor Authority",
+                        "objectText": "harbor traffic",
+                        "recipientText": null,
+                        "evidenceIds": ["evidence::harbor"],
+                        "evidenceChunkIds": [chunk_key],
+                        "confidence": 0.88
+                    },
+                    "created_at": 1,
+                    "updated_at": 1
+                }),
+            )
+            .expect("semantic claim row");
+        store
+            .put_row(
+                "scoped_definitions",
+                json!({
+                    "id": "semantic-evidence-row",
+                    "narrative_id": "__global__",
+                    "namespace": INVARANT_SEMANTIC_EVIDENCE_NAMESPACE,
+                    "definition_key": "evidence:evidence::harbor",
+                    "payload": {
+                        "evidenceId": "evidence::harbor",
+                        "documentId": document_id,
+                        "chunkId": chunk_key,
+                        "spanPath": { "value": "root/0/sentence:0" },
+                        "range": { "start": 0, "end": 34 },
+                        "sentenceIndex": 0,
+                        "label": "Harbor Authority controls harbor traffic.",
+                        "kind": "claim"
+                    },
+                    "created_at": 1,
+                    "updated_at": 1
+                }),
+            )
+            .expect("semantic evidence row");
+        store
+            .put_row(
+                "scoped_definitions",
+                json!({
+                    "id": "semantic-coref-row",
+                    "narrative_id": "__global__",
+                    "namespace": INVARANT_SEMANTIC_COREFERENCE_NAMESPACE,
+                    "definition_key": "coref:harbor-authority",
+                    "payload": {
+                        "chainId": "coref::harbor-authority",
+                        "canonical": "Harbor Authority",
+                        "mentions": [
+                            {
+                                "mentionId": "mention::1",
+                                "surface": "Harbor Authority",
+                                "canonicalSurface": "Harbor Authority",
+                                "range": { "start": 0, "end": 16 },
+                                "sentenceIndex": 0
+                            },
+                            {
+                                "mentionId": "mention::2",
+                                "surface": "they",
+                                "canonicalSurface": "Harbor Authority",
+                                "range": { "start": 24, "end": 28 },
+                                "sentenceIndex": 0
+                            }
+                        ],
+                        "evidenceIds": ["evidence::harbor"],
+                        "chunkIds": [chunk_key],
+                        "confidence": 0.74,
+                        "provider": "scirs2-text-coref",
+                        "providerVersion": "0.4.1",
+                        "configHash": "cfg"
+                    },
+                    "created_at": 1,
+                    "updated_at": 1
+                }),
+            )
+            .expect("semantic coreference row");
+    }
+
     fn semantic_vector(primary_index: usize) -> Vec<f32> {
         let mut values = vec![0.0; SEMANTIC_VECTOR_DIM];
         if primary_index < values.len() {
@@ -2040,6 +2611,82 @@ mod tests {
                 .iter()
                 .any(|diag| diag.code == "PX_TRIVERSE_SEMANTIC"),
             "semantic path should report Triverse semantic fusion"
+        );
+    }
+
+    #[test]
+    fn triverse_uses_invarant_entities_and_claims_as_native_seeds() {
+        let store = PhoenixCozoStore::new().expect("store");
+        seed_note(
+            &store,
+            "doc-semantic",
+            "Harbor ledger",
+            "Harbor Authority controls harbor traffic.",
+        );
+        seed_chunk(
+            &store,
+            4001,
+            "doc-semantic:1:0:0-41",
+            "doc-semantic",
+            "Harbor Authority controls harbor traffic.",
+            1,
+        );
+        seed_invarant_semantic_rows(&store, "doc-semantic", "doc-semantic:1:0:0-41");
+
+        let lex = LexIndex::build(&[], phoenix_lex::LexConfig::default());
+        let mut graph = GraptorGraph::default();
+        add_vertex(
+            &mut graph,
+            leaf_vertex("doc-semantic:1:0:0-41", "doc-semantic", 1),
+        );
+        add_vertex(
+            &mut graph,
+            entity_vertex("harbor_authority", "Harbor Authority", vec![1]),
+        );
+        add_edge(
+            &mut graph,
+            "leaf::doc-semantic:1:0:0-41",
+            "entity::harbor_authority",
+            "mentions",
+            4,
+        );
+
+        let result = PhoenixTriverse::default()
+            .query(
+                &store,
+                &lex,
+                &QueryRequest {
+                    session_id: None,
+                    query: "port authority controls harbor".to_owned(),
+                    scope: scope(),
+                    targets: vec![QueryTarget::Graph],
+                    limit: Some(4),
+                    temporal: None,
+                    semantic_query_vector: None,
+                    include_candidate_graph: false,
+                },
+                &graph,
+            )
+            .expect("invarant semantic query");
+
+        assert_eq!(
+            result.chunk_hits.first().map(|hit| hit.chunk_id.as_str()),
+            Some("doc-semantic:1:0:0-41")
+        );
+        assert!(
+            result
+                .node_hits
+                .iter()
+                .any(|hit| hit.entity_id.as_ref().map(|id| id.0.as_str())
+                    == Some("harbor_authority")),
+            "entity-backed seeds should project canonical entity hits"
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diag| diag.code == "PX_TRIVERSE_INVARANT"),
+            "native semantic rows should surface an Invarant diagnostic"
         );
     }
 

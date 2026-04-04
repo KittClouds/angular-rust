@@ -12,6 +12,7 @@ phoenix-graph = { path = "../phoenix-graph" }
 phoenix-graph-native = { path = "../phoenix-graph-native" }
 phoenix-gldr = { path = "../phoenix-gldr" }
 phoenix-graptor = { path = "../phoenix-graptor" }
+phoenix-invarant = { path = "../phoenix-invarant" }
 phoenix-lex = { path = "../phoenix-lex" }
 phoenix-om = { path = "../phoenix-om" }
 phoenix-om-graptor = { path = "../phoenix-om-graptor" }

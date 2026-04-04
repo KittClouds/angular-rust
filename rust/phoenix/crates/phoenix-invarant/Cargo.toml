@@ -1,17 +1,21 @@
 [package]
-name = "phoenix-triverse"
+name = "phoenix-invarant"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
+phoenix-alex = { path = "../phoenix-alex" }
+phoenix-chunker = { path = "../phoenix-chunker" }
+phoenix-graph = { path = "../phoenix-graph" }
 phoenix-graptor = { path = "../phoenix-graptor" }
-phoenix-invarant = { path = "../phoenix-invarant" }
-phoenix-lex = { path = "../phoenix-lex" }
+phoenix-scanner = { path = "../phoenix-scanner" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-structure = { path = "../phoenix-structure" }
 phoenix-types = { path = "../phoenix-types" }
+scirs2-text = "0.4.1"
 rustc-hash.workspace = true
-scirs2-graph = "0.4.1"
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true

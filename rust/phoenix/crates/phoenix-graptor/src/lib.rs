@@ -36,6 +36,16 @@ const DEFAULT_CHAPTER_KEYWORDS: &[&str] = &[
     "appendix",
     "#",
 ];
+const LEGACY_DOCUMENT_NAMESPACE: &str = "graptor.documents";
+const INVARANT_DOCUMENT_NAMESPACE: &str = "invarant.documents";
+const LEGACY_MANIFEST_NAMESPACE: &str = "graptor.manifest";
+const INVARANT_MANIFEST_NAMESPACE: &str = "invarant.manifest";
+const LEGACY_SESSION_NAMESPACE: &str = "graptor.session";
+const INVARANT_SESSION_NAMESPACE: &str = "invarant.session";
+const LEGACY_SESSION_STATE_KIND: &str = "graptor_session_state";
+const LEGACY_SESSION_STATS_KIND: &str = "graptor_session_stats";
+const INVARANT_SESSION_STATE_KIND: &str = "invarant_session_state";
+const INVARANT_SESSION_STATS_KIND: &str = "invarant_session_stats";
 
 #[derive(Clone, Debug)]
 pub struct GraptorConfig {
@@ -300,7 +310,13 @@ impl PhoenixGraptor {
         };
 
         if let Some(session_id) = request.session_id.as_ref() {
-            self.persist_session_manifests(store, session_id, &result, now)?;
+            self.persist_session_manifests(
+                store,
+                session_id,
+                &result,
+                now,
+                !persist_graph_relations,
+            )?;
         }
 
         Ok((result, NativeIngestArtifacts { graph_batches }))
@@ -840,6 +856,7 @@ impl PhoenixGraptor {
         session_id: &SessionId,
         _result: &IngestResult,
         now: i64,
+        native_pipeline: bool,
     ) -> Result<(), StoreError> {
         let state = load_session_state(store, session_id)?;
         let stats = load_session_stats(store, session_id)?;
@@ -847,21 +864,43 @@ impl PhoenixGraptor {
         persist_session_workspace_artifact(
             store,
             session_id,
-            "graptor_session_state",
+            LEGACY_SESSION_STATE_KIND,
             &serde_json::to_value(&state).expect("session state json"),
             narrative_id.as_deref(),
             None,
             now,
         )?;
+        if native_pipeline {
+            persist_session_workspace_artifact(
+                store,
+                session_id,
+                INVARANT_SESSION_STATE_KIND,
+                &serde_json::to_value(&state).expect("session state json"),
+                narrative_id.as_deref(),
+                None,
+                now,
+            )?;
+        }
         persist_session_workspace_artifact(
             store,
             session_id,
-            "graptor_session_stats",
+            LEGACY_SESSION_STATS_KIND,
             &serde_json::to_value(&stats).expect("session stats json"),
             narrative_id.as_deref(),
             None,
             now,
         )?;
+        if native_pipeline {
+            persist_session_workspace_artifact(
+                store,
+                session_id,
+                INVARANT_SESSION_STATS_KIND,
+                &serde_json::to_value(&stats).expect("session stats json"),
+                narrative_id.as_deref(),
+                None,
+                now,
+            )?;
+        }
         persist_session_definition(
             store,
             session_id,
@@ -869,6 +908,7 @@ impl PhoenixGraptor {
             &serde_json::to_value(&state).expect("session state json"),
             narrative_id.as_deref(),
             now,
+            native_pipeline,
         )?;
         persist_session_definition(
             store,
@@ -877,6 +917,7 @@ impl PhoenixGraptor {
             &serde_json::to_value(&stats).expect("session stats json"),
             narrative_id.as_deref(),
             now,
+            native_pipeline,
         )?;
         Ok(())
     }
@@ -1116,7 +1157,10 @@ pub fn load_session_state(
         .find(|row| {
             let row = CompactRowView::new(ARTIFACT_COLUMNS, row);
             row.get_str("thread_id") == Some(session_id.0.as_str())
-                && row.get_str("kind") == Some("graptor_session_state")
+                && matches!(
+                    row.get_str("kind"),
+                    Some(LEGACY_SESSION_STATE_KIND | INVARANT_SESSION_STATE_KIND)
+                )
         });
     if let Some(payload) =
         artifact.and_then(|row| CompactRowView::new(ARTIFACT_COLUMNS, &row).get_json("payload"))
@@ -1130,8 +1174,10 @@ pub fn load_session_state(
         .fetch_compact_rows_with_columns("scoped_documents", SCOPED_DOCUMENT_COLUMNS)?
         .into_iter()
         .filter(|row| {
-            CompactRowView::new(SCOPED_DOCUMENT_COLUMNS, row).get_str("namespace")
-                == Some("graptor.documents")
+            matches!(
+                CompactRowView::new(SCOPED_DOCUMENT_COLUMNS, row).get_str("namespace"),
+                Some(LEGACY_DOCUMENT_NAMESPACE | INVARANT_DOCUMENT_NAMESPACE)
+            )
         })
         .filter(|row| {
             CompactRowView::new(SCOPED_DOCUMENT_COLUMNS, row)
@@ -1228,9 +1274,12 @@ pub fn load_session_state(
         session_id: session_id.clone(),
         documents,
         manifest_namespaces: vec![
-            "graptor.documents".to_owned(),
-            "graptor.manifest".to_owned(),
-            "graptor.session".to_owned(),
+            INVARANT_DOCUMENT_NAMESPACE.to_owned(),
+            INVARANT_MANIFEST_NAMESPACE.to_owned(),
+            INVARANT_SESSION_NAMESPACE.to_owned(),
+            LEGACY_DOCUMENT_NAMESPACE.to_owned(),
+            LEGACY_MANIFEST_NAMESPACE.to_owned(),
+            LEGACY_SESSION_NAMESPACE.to_owned(),
         ],
         updated_at: now_ms(),
     })
@@ -1247,7 +1296,10 @@ pub fn load_session_stats(
         .find(|row| {
             let row = CompactRowView::new(ARTIFACT_COLUMNS, row);
             row.get_str("thread_id") == Some(session_id.0.as_str())
-                && row.get_str("kind") == Some("graptor_session_stats")
+                && matches!(
+                    row.get_str("kind"),
+                    Some(LEGACY_SESSION_STATS_KIND | INVARANT_SESSION_STATS_KIND)
+                )
         });
     if let Some(payload) =
         artifact.and_then(|row| CompactRowView::new(ARTIFACT_COLUMNS, &row).get_json("payload"))
@@ -3021,12 +3073,17 @@ fn build_document_manifest(
     })
 }
 
-fn scoped_document_row(document: &BorrowedIngestDocument<'_>, payload: &Value, now: i64) -> Value {
+fn scoped_document_row(
+    document: &BorrowedIngestDocument<'_>,
+    payload: &Value,
+    now: i64,
+    native_pipeline: bool,
+) -> Value {
     json!({
         "id": stable_hex("scoped_document", &[document.document_id.0.as_str()]),
         "scope_folder_id": document.scope.folder_id.clone().unwrap_or_else(|| "__root__".to_owned()),
         "narrative_id": document.scope.narrative_id.clone().unwrap_or_else(|| "__global__".to_owned()),
-        "namespace": "graptor.documents",
+        "namespace": if native_pipeline { INVARANT_DOCUMENT_NAMESPACE } else { LEGACY_DOCUMENT_NAMESPACE },
         "document_key": document.document_id.0,
         "payload": payload,
         "seeded_from_scope_folder_id": document.scope.folder_id,
@@ -3039,11 +3096,12 @@ fn scoped_document_definition_row(
     document: &BorrowedIngestDocument<'_>,
     payload: &Value,
     now: i64,
+    native_pipeline: bool,
 ) -> Value {
     json!({
         "id": stable_hex("scoped_definition", &[document.document_id.0.as_str(), "manifest"]),
         "narrative_id": document.scope.narrative_id.clone().unwrap_or_else(|| "__global__".to_owned()),
-        "namespace": "graptor.manifest",
+        "namespace": if native_pipeline { INVARANT_MANIFEST_NAMESPACE } else { LEGACY_MANIFEST_NAMESPACE },
         "definition_key": format!("document:{}", document.document_id.0),
         "payload": payload,
         "created_at": now,
@@ -3651,17 +3709,22 @@ fn persist_session_workspace_artifact(
     folder_id: Option<&str>,
     now: i64,
 ) -> Result<(), StoreError> {
+    let producer = if kind.starts_with("invarant_") {
+        "invarant"
+    } else {
+        "graptor"
+    };
     store.put_row(
         "workspace_artifacts",
         json!({
-            "key": format!("graptor:{}:{}", session_id.0, kind),
+            "key": format!("{producer}:{}:{}", session_id.0, kind),
             "thread_id": session_id.0,
             "narrative_id": narrative_id.unwrap_or("__global__"),
             "folder_id": folder_id.unwrap_or("__root__"),
             "kind": kind,
             "payload": payload,
             "pinned": false,
-            "produced_by": "graptor",
+            "produced_by": producer,
             "created_at": now,
             "updated_at": now,
         }),
@@ -3675,13 +3738,14 @@ fn persist_session_definition(
     payload: &Value,
     narrative_id: Option<&str>,
     now: i64,
+    native_pipeline: bool,
 ) -> Result<(), StoreError> {
     store.put_row(
         "scoped_definitions",
         json!({
             "id": stable_hex("session_definition", &[session_id.0.as_str(), kind]),
             "narrative_id": narrative_id.unwrap_or("__global__"),
-            "namespace": "graptor.session",
+            "namespace": if native_pipeline { INVARANT_SESSION_NAMESPACE } else { LEGACY_SESSION_NAMESPACE },
             "definition_key": format!("{}:{}", kind, session_id.0),
             "payload": payload,
             "created_at": now,
@@ -3769,9 +3833,15 @@ fn persist_entity_rows(
         now,
         asserted_graph_batch,
     );
+    let native_pipeline = asserted_graph_batch.is_some();
     store.put_rows(
         "scoped_documents",
-        &[scoped_document_row(document, &document_manifest, now)],
+        &[scoped_document_row(
+            document,
+            &document_manifest,
+            now,
+            native_pipeline,
+        )],
     )?;
     store.put_rows(
         "scoped_definitions",
@@ -3779,6 +3849,7 @@ fn persist_entity_rows(
             document,
             &document_manifest,
             now,
+            native_pipeline,
         )],
     )?;
     let scoped_entity_rows = persist_state

@@ -17,9 +17,13 @@ use phoenix_graph::{
 };
 use phoenix_graph_native::NativePhoenixGraph;
 use phoenix_graptor::{
-    build_graph_delta_from_snapshot, build_session_stats_from_counts,
-    load_graph_snapshot_with_candidate_graph, load_session_state, BorrowedIngestDocument,
-    BorrowedIngestRequest, GraptorGraph, PhoenixGraptor,
+    build_graph_delta_from_snapshot, load_graph_snapshot_with_candidate_graph, load_session_state,
+    BorrowedIngestDocument, BorrowedIngestRequest, GraptorGraph, PhoenixGraptor,
+};
+use phoenix_invarant::{
+    build_session_stats as build_invarant_session_stats,
+    load_session_state as load_invarant_session_state, PhoenixInvarant,
+    INVARANT_DOCUMENTS_NAMESPACE, LEGACY_DOCUMENT_NAMESPACE,
 };
 use phoenix_lex::LexIndex;
 use phoenix_om::OmEngine;
@@ -61,6 +65,7 @@ pub struct PhoenixRuntime {
     pub scanner: PhoenixScanner,
     pub structure: PhoenixStructure,
     pub graptor: PhoenixGraptor,
+    pub invarant: PhoenixInvarant,
     pub om_engine: OmEngine,
     pub om_bridge: OmGraptorBridge,
     pub chat: PhoenixChat,
@@ -278,6 +283,7 @@ impl PhoenixRuntime {
             scanner: PhoenixScanner::default(),
             structure: PhoenixStructure::default(),
             graptor: PhoenixGraptor::default(),
+            invarant: PhoenixInvarant::default(),
             om_engine: OmEngine::default(),
             om_bridge: OmGraptorBridge::default(),
             chat: PhoenixChat::default(),
@@ -587,7 +593,10 @@ impl PhoenixRuntime {
             .fetch_compact_rows_with_columns("scoped_documents", SCOPED_DOCUMENT_COLUMNS)?
         {
             let row = CompactRowView::new(SCOPED_DOCUMENT_COLUMNS, &row);
-            if row.get_str("namespace") != Some("graptor.documents") {
+            if !matches!(
+                row.get_str("namespace"),
+                Some(LEGACY_DOCUMENT_NAMESPACE | INVARANT_DOCUMENTS_NAMESPACE)
+            ) {
                 continue;
             }
             document_count += 1;
@@ -647,7 +656,10 @@ impl PhoenixRuntime {
             .fetch_compact_rows_with_columns("scoped_documents", SCOPED_DOCUMENT_COLUMNS)?
         {
             let row = CompactRowView::new(SCOPED_DOCUMENT_COLUMNS, &row);
-            if row.get_str("namespace") != Some("graptor.documents") {
+            if !matches!(
+                row.get_str("namespace"),
+                Some(LEGACY_DOCUMENT_NAMESPACE | INVARANT_DOCUMENTS_NAMESPACE)
+            ) {
                 continue;
             }
             let Some(payload) = row.get_json("payload") else {
@@ -1020,12 +1032,18 @@ impl PhoenixRuntime {
             documents: &documents,
         };
         let mut ingest = if self.native_graph_enabled() {
-            let (ingest, artifacts) = self.graptor.ingest_native_view(
-                &self.store,
-                &self.scanner,
-                &self.structure,
-                &borrowed_request,
-            )?;
+            let (mut ingest, artifacts, profile) = self
+                .invarant
+                .ingest_native_view(&self.store, &borrowed_request)?;
+            ingest.diagnostics.push(Diagnostic {
+                code: "PX_INGEST_NATIVE_PROFILE".to_owned(),
+                message: format!(
+                    "Native ingest profiled {} documents in {}ms across {} staged checkpoints.",
+                    profile.document_count,
+                    profile.total_wall_ms,
+                    profile.stages.len()
+                ),
+            });
             if !artifacts.graph_batches.is_empty() {
                 let graph_batches = artifacts.graph_batches;
                 let apply_result = self.with_graph_backend_mut(|backend| {
@@ -1057,8 +1075,16 @@ impl PhoenixRuntime {
         };
         let mut diagnostics = ingest.diagnostics.clone();
         diagnostics.push(Diagnostic {
-            code: "PX_INGEST_GRAPTOR".to_owned(),
-            message: "Phoenix Graptor ingested canonical chunk and graph facts.".to_owned(),
+            code: if self.native_graph_enabled() {
+                "PX_INGEST_INVARANT".to_owned()
+            } else {
+                "PX_INGEST_GRAPTOR".to_owned()
+            },
+            message: if self.native_graph_enabled() {
+                "Phoenix Invarant ingested native evidence, artifacts, and graph facts.".to_owned()
+            } else {
+                "Phoenix Graptor ingested canonical chunk and graph facts.".to_owned()
+            },
         });
         if self.native_graph_enabled() {
             for relation in NATIVE_INGEST_SYNC_RELATIONS {
@@ -1098,6 +1124,27 @@ impl PhoenixRuntime {
             code: "PX_LEX_REBUILT".to_owned(),
             message: format!("Rebuilt lexical index from {span_count} canonical spans."),
         });
+        if self.native_graph_enabled() {
+            if let Some(session_id) = request.session_id.as_ref() {
+                let graph_counts = self.graph_counts()?;
+                let relation_counts = self.store.relation_counts()?;
+                let count_for = |name: &str| {
+                    relation_counts
+                        .iter()
+                        .find(|count| count.relation == name)
+                        .map(|count| count.rows)
+                        .unwrap_or_default()
+                };
+                self.invarant.persist_session_materializations(
+                    &self.store,
+                    session_id,
+                    graph_counts.vertex_count,
+                    graph_counts.asserted_edge_count + graph_counts.candidate_edge_count,
+                    count_for("discovery_candidates"),
+                    span_count,
+                )?;
+            }
+        }
         ingest.diagnostics = diagnostics;
         ingest.warning_count = ingest.diagnostics.len();
         ingest.relation_counts = self.store.relation_counts()?;
@@ -1109,7 +1156,11 @@ impl PhoenixRuntime {
         session_id: &SessionId,
     ) -> Result<NativeGraphEnrichmentStats, StoreError> {
         let session = self.load_session(session_id)?;
-        let session_state = load_session_state(&self.store, session_id)?;
+        let session_state = if self.native_graph_enabled() {
+            load_invarant_session_state(&self.store, session_id)?
+        } else {
+            load_session_state(&self.store, session_id)?
+        };
         let graph = self.graph_snapshot(false)?;
         let message_document_links = phase1_message_document_links(&session_state, &graph);
         let singleton_document_id = (session_state.documents.len() == 1)
@@ -2850,7 +2901,7 @@ impl PhoenixRuntime {
         if self.native_graph_enabled() {
             self.augment_graph_delta_request_from_journal(&mut request)?;
             let graph = self.graph_snapshot(request.include_candidate_graph)?;
-            let state = load_session_state(&self.store, &request.session_id)?;
+            let state = load_invarant_session_state(&self.store, &request.session_id)?;
             Ok(build_graph_delta_from_snapshot(&graph, &state, &request))
         } else {
             self.graptor.graph_delta(&self.store, &request)
@@ -2884,12 +2935,21 @@ impl PhoenixRuntime {
     }
 
     pub fn scan_text_view(&self, request: ScanRequestView<'_>) -> ScanArtifact {
-        self.scanner.scan_parts(
-            request.text,
-            &request.scope.to_owned(),
-            request.session_id.as_ref(),
-            request.resolver_seed,
-        )
+        if self.native_graph_enabled() {
+            self.invarant.scan_parts(
+                request.text,
+                &request.scope.to_owned(),
+                request.resolver_seed,
+                None,
+            )
+        } else {
+            self.scanner.scan_parts(
+                request.text,
+                &request.scope.to_owned(),
+                request.session_id.as_ref(),
+                request.resolver_seed,
+            )
+        }
     }
 
     pub fn build_structure(&self, request: StructureRequest) -> StructureArtifact {
@@ -2897,7 +2957,12 @@ impl PhoenixRuntime {
     }
 
     pub fn build_structure_view(&self, request: StructureRequestView<'_>) -> StructureArtifact {
-        self.structure.build_parts(request.text, request.scan)
+        if self.native_graph_enabled() {
+            self.invarant
+                .build_structure_parts(request.text, request.scan, None, None)
+        } else {
+            self.structure.build_parts(request.text, request.scan)
+        }
     }
 
     pub fn analyze_text(&self, text: &str) -> TextAnalytics {
@@ -2952,12 +3017,16 @@ impl PhoenixRuntime {
     }
 
     pub fn session_state(&self, session_id: &SessionId) -> Result<SessionState, StoreError> {
-        self.graptor.session_state(&self.store, session_id)
+        if self.native_graph_enabled() {
+            load_invarant_session_state(&self.store, session_id)
+        } else {
+            load_session_state(&self.store, session_id)
+        }
     }
 
     pub fn session_stats(&self, session_id: &SessionId) -> Result<SessionStats, StoreError> {
         if self.native_graph_enabled() {
-            let state = load_session_state(&self.store, session_id)?;
+            let state = load_invarant_session_state(&self.store, session_id)?;
             let graph_counts = self.graph_counts()?;
             let relation_counts = self.store.relation_counts()?;
             let count_for = |name: &str| {
@@ -2967,10 +3036,10 @@ impl PhoenixRuntime {
                     .map(|count| count.rows)
                     .unwrap_or_default()
             };
-            Ok(build_session_stats_from_counts(
+            Ok(build_invarant_session_stats(
                 &state,
-                session_id,
-                &graph_counts,
+                graph_counts.vertex_count,
+                graph_counts.asserted_edge_count + graph_counts.candidate_edge_count,
                 count_for("discovery_candidates"),
                 count_for("spans"),
             ))
@@ -7074,7 +7143,7 @@ mod tests {
             .expect("scoped documents")
             .into_iter()
             .find(|row| {
-                row.get("namespace").and_then(Value::as_str) == Some("graptor.documents")
+                row.get("namespace").and_then(Value::as_str) == Some(INVARANT_DOCUMENTS_NAMESPACE)
                     && row
                         .get("payload")
                         .and_then(Value::as_object)
@@ -7088,6 +7157,16 @@ mod tests {
             .and_then(Value::as_object)
             .and_then(|payload| payload.get("assertedGraphBatch"))
             .is_some_and(|batch| !batch.is_null()));
+        assert!(runtime
+            .store
+            .fetch_rows("scoped_definitions")
+            .expect("scoped definitions")
+            .into_iter()
+            .any(|row| {
+                row.get("namespace").and_then(Value::as_str) == Some("invarant.artifacts")
+                    && row.get("definition_key").and_then(Value::as_str)
+                        == Some("scan:doc-native-hot")
+            }));
     }
 
     #[test]
@@ -7956,6 +8035,32 @@ mod tests {
         });
         assert_eq!(structure.sentence_frames.len(), 1);
         assert_eq!(structure.sentence_frames[0].verb_frames.len(), 1);
+    }
+
+    #[test]
+    fn native_scan_uses_invarant_diagnostics_without_session_bleed() {
+        let runtime = native_runtime();
+        let session_id = SessionId("scan-native".to_owned());
+        let _ = runtime.scan_text(ScanRequest {
+            text: "Ryan waited at dawn.".to_owned(),
+            scope: ScopeKey::default(),
+            session_id: Some(session_id.clone()),
+            resolver_seed: vec![],
+        });
+        let scan = runtime.scan_text(ScanRequest {
+            text: "He waited alone.".to_owned(),
+            scope: ScopeKey::default(),
+            session_id: Some(session_id),
+            resolver_seed: vec![],
+        });
+        assert!(scan
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code == "PX_INVARANT_SCAN"));
+        assert!(!scan
+            .resolver_links
+            .iter()
+            .any(|link| link.target_entity.is_some()));
     }
 
     #[test]

@@ -1093,7 +1093,7 @@ fn tool_session_state(runtime: &PhoenixRuntime, run: &ChatRun) -> Result<Value, 
     let Some(session_id) = resolve_main_session_id(runtime, run) else {
         return Ok(json!({ "error": "No Phoenix UI main session is available." }));
     };
-    let state = runtime.graptor.session_state(&runtime.store, &session_id)?;
+    let state = runtime.session_state(&session_id)?;
     serde_json::to_value(state).map_err(|error| StoreError::Query(error.to_string()))
 }
 
@@ -1101,7 +1101,7 @@ fn tool_session_stats(runtime: &PhoenixRuntime, run: &ChatRun) -> Result<Value, 
     let Some(session_id) = resolve_main_session_id(runtime, run) else {
         return Ok(json!({ "error": "No Phoenix UI main session is available." }));
     };
-    let stats = runtime.graptor.session_stats(&runtime.store, &session_id)?;
+    let stats = runtime.session_stats(&session_id)?;
     serde_json::to_value(stats).map_err(|error| StoreError::Query(error.to_string()))
 }
 

@@ -1,4 +1,5 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -145,6 +146,57 @@ pub struct QueryBatchReport {
     pub runs: Vec<QueryRunReport>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkConfig {
+    pub iterations: usize,
+    pub warmup_iterations: usize,
+}
+
+impl Default for BenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 1,
+            warmup_iterations: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkSample {
+    pub wall_ms: u64,
+    pub heap_peak_delta_bytes: usize,
+    pub output_bytes: usize,
+    pub chunk_hits: usize,
+    pub node_hits: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkSummary {
+    pub iterations: usize,
+    pub warmup_iterations: usize,
+    pub min_wall_ms: u64,
+    pub p50_wall_ms: u64,
+    pub p95_wall_ms: u64,
+    pub max_wall_ms: u64,
+    pub mean_wall_ms: f64,
+    pub max_peak_delta_bytes: usize,
+    pub total_output_bytes: usize,
+    pub total_chunk_hits: usize,
+    pub total_node_hits: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteadyStateBenchmarkReport {
+    pub name: String,
+    pub summary: BenchmarkSummary,
+    pub samples: Vec<BenchmarkSample>,
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CorpusStatsSnapshot {
@@ -204,6 +256,7 @@ pub struct CorpusPerfReport {
     pub phases: Vec<PhaseReport>,
     pub lexical_query_batch: QueryBatchReport,
     pub graph_query_batch: QueryBatchReport,
+    pub steady_state: Vec<SteadyStateBenchmarkReport>,
     pub snapshot_bytes: usize,
     pub snapshot_relation_count: usize,
     pub budget: CorpusBudget,
@@ -214,6 +267,7 @@ pub struct CorpusPerfReport {
 #[serde(rename_all = "camelCase")]
 pub struct PerfSuiteReport {
     pub generated_at: i64,
+    pub benchmark_config: BenchmarkConfig,
     pub corpora: Vec<CorpusPerfReport>,
     pub total_failures: usize,
 }
@@ -244,6 +298,13 @@ pub fn run_perf_suite() -> Result<PerfSuiteReport, String> {
 }
 
 pub fn run_perf_suite_filtered(corpus_filter: Option<&str>) -> Result<PerfSuiteReport, String> {
+    run_perf_suite_filtered_with_config(corpus_filter, &BenchmarkConfig::default())
+}
+
+pub fn run_perf_suite_filtered_with_config(
+    corpus_filter: Option<&str>,
+    benchmark_config: &BenchmarkConfig,
+) -> Result<PerfSuiteReport, String> {
     let mut corpora = Vec::new();
     for corpus in load_standard_corpus()? {
         if let Some(filter) = corpus_filter {
@@ -251,7 +312,7 @@ pub fn run_perf_suite_filtered(corpus_filter: Option<&str>) -> Result<PerfSuiteR
                 continue;
             }
         }
-        corpora.push(run_corpus_suite(&corpus)?);
+        corpora.push(run_corpus_suite(&corpus, benchmark_config)?);
     }
     if corpora.is_empty() {
         return Err(match corpus_filter {
@@ -265,6 +326,7 @@ pub fn run_perf_suite_filtered(corpus_filter: Option<&str>) -> Result<PerfSuiteR
         .sum();
     Ok(PerfSuiteReport {
         generated_at: now_ms(),
+        benchmark_config: benchmark_config.clone(),
         corpora,
         total_failures,
     })
@@ -293,6 +355,10 @@ pub fn render_markdown(report: &PerfSuiteReport) -> String {
         "# Phoenix Native Performance Report".to_owned(),
         String::new(),
         format!("Generated at: `{}`", report.generated_at),
+        format!(
+            "Benchmark iterations: `{}` with `{}` warmup iteration(s)",
+            report.benchmark_config.iterations, report.benchmark_config.warmup_iterations
+        ),
         format!("Budget failures: `{}`", report.total_failures),
         String::new(),
     ];
@@ -338,6 +404,23 @@ pub fn render_markdown(report: &PerfSuiteReport) -> String {
             bytes_to_mib(corpus.graph_query_batch.phase.heap_peak_delta_bytes),
             corpus.graph_query_batch.phase.output_bytes
         ));
+        if !corpus.steady_state.is_empty() {
+            lines.push(String::new());
+            lines.push("| Benchmark | Iter | Min ms | P50 ms | P95 ms | Max ms | Peak delta MiB |".to_owned());
+            lines.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_owned());
+            for benchmark in &corpus.steady_state {
+                lines.push(format!(
+                    "| {} | {} | {} | {} | {} | {} | {:.2} |",
+                    benchmark.name,
+                    benchmark.summary.iterations,
+                    benchmark.summary.min_wall_ms,
+                    benchmark.summary.p50_wall_ms,
+                    benchmark.summary.p95_wall_ms,
+                    benchmark.summary.max_wall_ms,
+                    bytes_to_mib(benchmark.summary.max_peak_delta_bytes)
+                ));
+            }
+        }
         lines.push(String::new());
     }
 
@@ -357,7 +440,10 @@ pub fn strict_check(report: &PerfSuiteReport) -> Result<(), String> {
     Err(lines.join("\n"))
 }
 
-fn run_corpus_suite(corpus: &CorpusDocument) -> Result<CorpusPerfReport, String> {
+fn run_corpus_suite(
+    corpus: &CorpusDocument,
+    benchmark_config: &BenchmarkConfig,
+) -> Result<CorpusPerfReport, String> {
     let runtime =
         PhoenixRuntime::new(RuntimeConfig::default()).map_err(|error| error.to_string())?;
     let mut phases = Vec::new();
@@ -573,6 +659,18 @@ fn run_corpus_suite(corpus: &CorpusDocument) -> Result<CorpusPerfReport, String>
         ..restore_query_phase
     });
 
+    let steady_state = run_steady_state_benchmarks(
+        &runtime,
+        &restore_runtime,
+        benchmark_config,
+        &session.session_id,
+        &doc_id,
+        &commit.commit_id,
+        &excerpt,
+        &scan,
+        &selected_queries,
+    )?;
+
     let relation_counts = runtime
         .store
         .relation_counts()
@@ -612,11 +710,254 @@ fn run_corpus_suite(corpus: &CorpusDocument) -> Result<CorpusPerfReport, String>
         phases,
         lexical_query_batch,
         graph_query_batch,
+        steady_state,
         snapshot_bytes: snapshot_bytes.len(),
         snapshot_relation_count: runtime.store.relation_names().len(),
         budget,
         budget_check,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BenchmarkObservation {
+    output_bytes: usize,
+    chunk_hits: usize,
+    node_hits: usize,
+}
+
+fn run_steady_state_benchmarks(
+    runtime: &PhoenixRuntime,
+    restore_runtime: &PhoenixRuntime,
+    benchmark_config: &BenchmarkConfig,
+    session_id: &SessionId,
+    doc_id: &DocumentId,
+    commit_id: &phoenix_types::CommitId,
+    excerpt: &str,
+    scan: &phoenix_types::ScanArtifact,
+    selected_queries: &QuerySelection,
+) -> Result<Vec<SteadyStateBenchmarkReport>, String> {
+    let lexical_targets = vec![QueryTarget::Chunks];
+    let graph_targets = vec![QueryTarget::Graph, QueryTarget::Nodes];
+    let restore_query = selected_queries
+        .lexical
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Ryan".to_owned());
+
+    let mut benchmarks = Vec::new();
+
+    benchmarks.push(run_benchmark(
+        "scan_excerpt_steady",
+        benchmark_config,
+        || {
+            let result = runtime.scan_text(phoenix_types::ScanRequest {
+                text: excerpt.to_owned(),
+                scope: ScopeKey::default(),
+                session_id: Some(session_id.clone()),
+                resolver_seed: Vec::new(),
+            });
+            Ok(BenchmarkObservation {
+                output_bytes: serde_json::to_vec(&result)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                ..BenchmarkObservation::default()
+            })
+        },
+    )?);
+
+    benchmarks.push(run_benchmark(
+        "structure_excerpt_steady",
+        benchmark_config,
+        || {
+            let result = runtime.build_structure(phoenix_types::StructureRequest {
+                text: excerpt.to_owned(),
+                scan: scan.clone(),
+            });
+            Ok(BenchmarkObservation {
+                output_bytes: serde_json::to_vec(&result)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                ..BenchmarkObservation::default()
+            })
+        },
+    )?);
+
+    benchmarks.push(run_benchmark(
+        "session_stats_steady",
+        benchmark_config,
+        || {
+            let result = runtime
+                .session_stats(session_id)
+                .map_err(|error| error.to_string())?;
+            Ok(BenchmarkObservation {
+                output_bytes: serde_json::to_vec(&result)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                ..BenchmarkObservation::default()
+            })
+        },
+    )?);
+
+    benchmarks.push(run_benchmark(
+        "graph_delta_steady",
+        benchmark_config,
+        || {
+            let result = runtime
+                .graph_delta(GraphDeltaRequest {
+                    session_id: session_id.clone(),
+                    scope: ScopeKey::default(),
+                    changed_documents: vec![doc_id.clone()],
+                    limit: None,
+                    since_commit: Some(commit_id.clone()),
+                    include_candidate_graph: false,
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(BenchmarkObservation {
+                output_bytes: serde_json::to_vec(&result)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                chunk_hits: result.chunks.len(),
+                node_hits: result.nodes.len(),
+            })
+        },
+    )?);
+
+    benchmarks.push(run_benchmark(
+        "lexical_query_steady",
+        benchmark_config,
+        || run_query_workload(runtime, session_id, &selected_queries.lexical, &lexical_targets),
+    )?);
+
+    benchmarks.push(run_benchmark(
+        "graph_query_steady",
+        benchmark_config,
+        || run_query_workload(runtime, session_id, &selected_queries.graph, &graph_targets),
+    )?);
+
+    benchmarks.push(run_benchmark(
+        "restore_query_steady",
+        benchmark_config,
+        || {
+            let result = restore_runtime
+                .query(QueryRequest {
+                    session_id: Some(session_id.clone()),
+                    query: restore_query.clone(),
+                    scope: ScopeKey::default(),
+                    targets: lexical_targets.clone(),
+                    limit: Some(5),
+                    temporal: None,
+                    semantic_query_vector: None,
+                    include_candidate_graph: false,
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(BenchmarkObservation {
+                output_bytes: serde_json::to_vec(&result)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                chunk_hits: result.chunk_hits.len(),
+                node_hits: result.node_hits.len(),
+            })
+        },
+    )?);
+
+    Ok(benchmarks)
+}
+
+fn run_query_workload(
+    runtime: &PhoenixRuntime,
+    session_id: &SessionId,
+    queries: &[String],
+    targets: &[QueryTarget],
+) -> Result<BenchmarkObservation, String> {
+    let mut output_bytes = 0;
+    let mut chunk_hits = 0;
+    let mut node_hits = 0;
+    for query in queries {
+        let result = runtime
+            .query(QueryRequest {
+                session_id: Some(session_id.clone()),
+                query: query.clone(),
+                scope: ScopeKey::default(),
+                targets: targets.to_vec(),
+                limit: Some(8),
+                temporal: None,
+                semantic_query_vector: None,
+                include_candidate_graph: false,
+            })
+            .map_err(|error| error.to_string())?;
+        output_bytes += serde_json::to_vec(&result)
+            .map_err(|error| error.to_string())?
+            .len();
+        chunk_hits += result.chunk_hits.len();
+        node_hits += result.node_hits.len();
+    }
+    Ok(BenchmarkObservation {
+        output_bytes,
+        chunk_hits,
+        node_hits,
+    })
+}
+
+fn run_benchmark(
+    name: &str,
+    config: &BenchmarkConfig,
+    mut op: impl FnMut() -> Result<BenchmarkObservation, String>,
+) -> Result<SteadyStateBenchmarkReport, String> {
+    let iterations = config.iterations.max(1);
+    for _ in 0..config.warmup_iterations {
+        let _ = op()?;
+    }
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let (observation, phase) = measure_phase(name, &mut op)?;
+        samples.push(BenchmarkSample {
+            wall_ms: phase.wall_ms,
+            heap_peak_delta_bytes: phase.heap_peak_delta_bytes,
+            output_bytes: observation.output_bytes,
+            chunk_hits: observation.chunk_hits,
+            node_hits: observation.node_hits,
+        });
+    }
+    Ok(SteadyStateBenchmarkReport {
+        name: name.to_owned(),
+        summary: summarize_benchmark(config, &samples),
+        samples,
+        note: None,
+    })
+}
+
+fn summarize_benchmark(config: &BenchmarkConfig, samples: &[BenchmarkSample]) -> BenchmarkSummary {
+    if samples.is_empty() {
+        return BenchmarkSummary::default();
+    }
+    let mut walls = samples.iter().map(|sample| sample.wall_ms).collect::<Vec<_>>();
+    walls.sort_unstable();
+    let total_wall = walls.iter().copied().sum::<u64>();
+    BenchmarkSummary {
+        iterations: samples.len(),
+        warmup_iterations: config.warmup_iterations,
+        min_wall_ms: *walls.first().unwrap_or(&0),
+        p50_wall_ms: percentile(&walls, 0.50),
+        p95_wall_ms: percentile(&walls, 0.95),
+        max_wall_ms: *walls.last().unwrap_or(&0),
+        mean_wall_ms: total_wall as f64 / samples.len() as f64,
+        max_peak_delta_bytes: samples
+            .iter()
+            .map(|sample| sample.heap_peak_delta_bytes)
+            .max()
+            .unwrap_or_default(),
+        total_output_bytes: samples.iter().map(|sample| sample.output_bytes).sum(),
+        total_chunk_hits: samples.iter().map(|sample| sample.chunk_hits).sum(),
+        total_node_hits: samples.iter().map(|sample| sample.node_hits).sum(),
+    }
+}
+
+fn percentile(values: &[u64], percentile: f64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let rank = ((values.len() - 1) as f64 * percentile).round() as usize;
+    values[rank.min(values.len() - 1)]
 }
 
 fn default_budget_for(corpus: &CorpusDocument) -> CorpusBudget {
@@ -863,24 +1204,36 @@ fn measure_phase<T>(
     name: &str,
     op: impl FnOnce() -> Result<T, String>,
 ) -> Result<(T, PhaseReport), String> {
+    if perf_progress_enabled() {
+        eprintln!("[phoenix-perf] starting phase: {name}");
+    }
     let heap_before = reset_phase_peak();
     let started = Instant::now();
     let value = op()?;
     let wall_ms = started.elapsed().as_millis() as u64;
     let heap_after = current_bytes();
     let heap_peak = phase_peak_bytes();
+    let phase = PhaseReport {
+        name: name.to_owned(),
+        wall_ms,
+        heap_before_bytes: heap_before,
+        heap_after_bytes: heap_after,
+        heap_peak_bytes: heap_peak,
+        heap_peak_delta_bytes: heap_peak.saturating_sub(heap_before),
+        output_bytes: 0,
+        note: None,
+    };
+    if perf_progress_enabled() {
+        eprintln!(
+            "[phoenix-perf] finished phase: {} in {}ms (peak delta {:.2} MiB)",
+            phase.name,
+            phase.wall_ms,
+            bytes_to_mib(phase.heap_peak_delta_bytes)
+        );
+    }
     Ok((
         value,
-        PhaseReport {
-            name: name.to_owned(),
-            wall_ms,
-            heap_before_bytes: heap_before,
-            heap_after_bytes: heap_after,
-            heap_peak_bytes: heap_peak,
-            heap_peak_delta_bytes: heap_peak.saturating_sub(heap_before),
-            output_bytes: 0,
-            note: None,
-        },
+        phase,
     ))
 }
 
@@ -966,6 +1319,13 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
+fn perf_progress_enabled() -> bool {
+    matches!(
+        env::var("PHOENIX_PERF_PROGRESS").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1348,7 @@ mod tests {
     fn markdown_report_renders_sections() {
         let markdown = render_markdown(&PerfSuiteReport {
             generated_at: 1,
+            benchmark_config: BenchmarkConfig::default(),
             corpora: vec![CorpusPerfReport {
                 corpus_id: "shortrun".to_owned(),
                 title: "Shortrun".to_owned(),
@@ -1012,6 +1373,17 @@ mod tests {
                 }],
                 lexical_query_batch: QueryBatchReport::default(),
                 graph_query_batch: QueryBatchReport::default(),
+                steady_state: vec![SteadyStateBenchmarkReport {
+                    name: "graph_query_steady".to_owned(),
+                    summary: BenchmarkSummary {
+                        iterations: 5,
+                        warmup_iterations: 1,
+                        p50_wall_ms: 8,
+                        ..BenchmarkSummary::default()
+                    },
+                    samples: Vec::new(),
+                    note: None,
+                }],
                 snapshot_bytes: 10,
                 snapshot_relation_count: 1,
                 budget: CorpusBudget::default(),
@@ -1021,5 +1393,65 @@ mod tests {
         });
         assert!(markdown.contains("Phoenix Native Performance Report"));
         assert!(markdown.contains("Shortrun"));
+        assert!(markdown.contains("graph_query_steady"));
+        assert!(markdown.contains("Benchmark iterations"));
+    }
+
+    #[test]
+    fn benchmark_summary_reports_percentiles() {
+        let config = BenchmarkConfig {
+            iterations: 5,
+            warmup_iterations: 1,
+        };
+        let summary = summarize_benchmark(
+            &config,
+            &[
+                BenchmarkSample {
+                    wall_ms: 9,
+                    ..BenchmarkSample::default()
+                },
+                BenchmarkSample {
+                    wall_ms: 5,
+                    ..BenchmarkSample::default()
+                },
+                BenchmarkSample {
+                    wall_ms: 7,
+                    ..BenchmarkSample::default()
+                },
+                BenchmarkSample {
+                    wall_ms: 12,
+                    ..BenchmarkSample::default()
+                },
+                BenchmarkSample {
+                    wall_ms: 6,
+                    ..BenchmarkSample::default()
+                },
+            ],
+        );
+        assert_eq!(summary.iterations, 5);
+        assert_eq!(summary.warmup_iterations, 1);
+        assert_eq!(summary.min_wall_ms, 5);
+        assert_eq!(summary.p50_wall_ms, 7);
+        assert_eq!(summary.p95_wall_ms, 12);
+        assert_eq!(summary.max_wall_ms, 12);
+    }
+
+    #[test]
+    #[ignore = "native deterministic perf smoke benchmark over perfect_run.md"]
+    fn perfect_run_native_perf_smoke_benchmark() {
+        let config = BenchmarkConfig::default();
+        let report =
+            run_perf_suite_filtered_with_config(Some("perfect_run"), &config).expect("perf report");
+        let (json_path, md_path) =
+            write_suite_report(&report, default_out_dir()).expect("write perf report");
+        println!("{}", serde_json::to_string_pretty(&report).expect("json"));
+        println!("JSON report: {}", json_path.display());
+        println!("Markdown report: {}", md_path.display());
+        let corpus = report
+            .corpora
+            .iter()
+            .find(|corpus| corpus.corpus_id == "perfect_run")
+            .expect("perfect_run corpus");
+        assert!(corpus.budget_check.passed, "{:?}", corpus.budget_check.failures);
     }
 }
