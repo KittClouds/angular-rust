@@ -10,6 +10,7 @@ phoenix-graptor = { path = "../phoenix-graptor" }
 phoenix-invarant = { path = "../phoenix-invarant" }
 phoenix-lex = { path = "../phoenix-lex" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-store-native = { path = "../phoenix-store-native" }
 phoenix-types = { path = "../phoenix-types" }
 rustc-hash.workspace = true
 scirs2-graph = "0.4.1"

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-use phoenix_runtime::{
+use phoenix_runtime_wasm::{
     AnalyzeTextRequestView, IngestDocumentView, IngestRequestView, PhoenixRuntime,
     QueryRequestView, ScanRequestView, ScopeKeyView, SnapshotPartition, StructureRequestView,
 };

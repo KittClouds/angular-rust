@@ -1,0 +1,24 @@
+[package]
+name = "phoenix-runtime-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-analytics = { path = "../phoenix-analytics" }
+phoenix-causality = { path = "../phoenix-causality" }
+phoenix-ingest-native = { path = "../phoenix-ingest-native" }
+phoenix-kernel = { path = "../phoenix-kernel" }
+phoenix-machine = { path = "../phoenix-machine" }
+phoenix-mentions = { path = "../phoenix-mentions" }
+phoenix-proposition = { path = "../phoenix-proposition" }
+phoenix-query = { path = "../phoenix-query" }
+phoenix-semantics = { path = "../phoenix-semantics" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
+phoenix-store-native-core = { path = "../phoenix-store-native-core" }
+phoenix-time = { path = "../phoenix-time" }
+phoenix-types = { path = "../phoenix-types" }
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true

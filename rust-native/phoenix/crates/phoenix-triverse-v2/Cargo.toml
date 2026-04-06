@@ -1,0 +1,24 @@
+[package]
+name = "phoenix-triverse-v2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+lz4_flex.workspace = true
+phoenix-graph = { path = "../phoenix-graph" }
+phoenix-graph-kernel = { path = "../phoenix-graph-kernel" }
+phoenix-lex = { path = "../phoenix-lex" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
+phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-store-native = { path = "../phoenix-store-native" }
+phoenix-types = { path = "../phoenix-types" }
+rmp-serde.workspace = true
+serde.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+phoenix-invarant-v2 = { path = "../phoenix-invarant-v2" }
+phoenix-store-lmdb = { path = "../phoenix-store-lmdb" }
+serde_json.workspace = true

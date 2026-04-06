@@ -1,0 +1,11 @@
+[package]
+name = "phoenix-structure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-types = { path = "../phoenix-types" }
+serde.workspace = true
+thiserror.workspace = true

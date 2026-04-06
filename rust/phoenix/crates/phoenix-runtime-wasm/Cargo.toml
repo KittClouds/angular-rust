@@ -1,0 +1,9 @@
+[package]
+name = "phoenix-runtime-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-runtime = { path = "../phoenix-runtime" }

@@ -20,6 +20,8 @@ use phoenix_graptor::{
 };
 use phoenix_scanner::PhoenixScanner;
 use phoenix_store_cozo::{PhoenixCozoStore, StoreError};
+use phoenix_store_native::{PhoenixNativeRowStore, ScopedDefinitionFilter, ScopedDocumentFilter};
+use phoenix_store_ruvector::PhoenixRuVectorStore;
 use phoenix_structure::PhoenixStructure;
 use phoenix_types::{
     BoundaryKind, ChunkStats, Diagnostic, DiscoverySummary, DocumentId, EntityId, EntitySummary,
@@ -63,6 +65,107 @@ pub const INVARANT_SEMANTIC_COREFERENCE_NAMESPACE: &str = "invarant.semantic.cor
 pub const INVARANT_SEMANTIC_RESOLUTION_NAMESPACE: &str = "invarant.semantic.resolutions";
 pub const INVARANT_SESSION_STATE_KIND: &str = "invarant_session_state";
 pub const INVARANT_SESSION_STATS_KIND: &str = "invarant_session_stats";
+
+pub trait InvarantStore {
+    fn fetch_rows(&self, relation: &str) -> Result<Vec<Value>, StoreError>;
+    fn put_row(&self, relation: &str, row: Value) -> Result<(), StoreError>;
+    fn put_rows(&self, relation: &str, rows: &[Value]) -> Result<(), StoreError>;
+    fn as_legacy_cozo(&self) -> Option<&PhoenixCozoStore> {
+        None
+    }
+
+    fn fetch_scoped_documents(
+        &self,
+        filter: ScopedDocumentFilter<'_>,
+    ) -> Result<Vec<Value>, StoreError> {
+        let mut rows = self.fetch_rows("scoped_documents")?;
+        rows.retain(|row| phoenix_store_native::matches_scoped_document_filter(row, &filter));
+        Ok(rows)
+    }
+
+    fn fetch_scoped_definitions(
+        &self,
+        filter: ScopedDefinitionFilter<'_>,
+    ) -> Result<Vec<Value>, StoreError> {
+        let mut rows = self.fetch_rows("scoped_definitions")?;
+        rows.retain(|row| phoenix_store_native::matches_scoped_definition_filter(row, &filter));
+        Ok(rows)
+    }
+}
+
+impl InvarantStore for PhoenixCozoStore {
+    fn fetch_rows(&self, relation: &str) -> Result<Vec<Value>, StoreError> {
+        PhoenixCozoStore::fetch_rows(self, relation)
+    }
+
+    fn put_row(&self, relation: &str, row: Value) -> Result<(), StoreError> {
+        PhoenixCozoStore::put_row(self, relation, row)
+    }
+
+    fn put_rows(&self, relation: &str, rows: &[Value]) -> Result<(), StoreError> {
+        PhoenixCozoStore::put_rows(self, relation, rows)
+    }
+
+    fn as_legacy_cozo(&self) -> Option<&PhoenixCozoStore> {
+        Some(self)
+    }
+}
+
+impl InvarantStore for PhoenixRuVectorStore {
+    fn fetch_rows(&self, relation: &str) -> Result<Vec<Value>, StoreError> {
+        PhoenixNativeRowStore::fetch_rows(self, relation)
+    }
+
+    fn put_row(&self, relation: &str, row: Value) -> Result<(), StoreError> {
+        PhoenixNativeRowStore::put_row(self, relation, row)
+    }
+
+    fn put_rows(&self, relation: &str, rows: &[Value]) -> Result<(), StoreError> {
+        PhoenixNativeRowStore::put_rows(self, relation, rows)
+    }
+
+    fn fetch_scoped_documents(
+        &self,
+        filter: ScopedDocumentFilter<'_>,
+    ) -> Result<Vec<Value>, StoreError> {
+        PhoenixNativeRowStore::fetch_scoped_documents(self, filter)
+    }
+
+    fn fetch_scoped_definitions(
+        &self,
+        filter: ScopedDefinitionFilter<'_>,
+    ) -> Result<Vec<Value>, StoreError> {
+        PhoenixNativeRowStore::fetch_scoped_definitions(self, filter)
+    }
+}
+
+impl InvarantStore for dyn PhoenixNativeRowStore + '_ {
+    fn fetch_rows(&self, relation: &str) -> Result<Vec<Value>, StoreError> {
+        PhoenixNativeRowStore::fetch_rows(self, relation)
+    }
+
+    fn put_row(&self, relation: &str, row: Value) -> Result<(), StoreError> {
+        PhoenixNativeRowStore::put_row(self, relation, row)
+    }
+
+    fn put_rows(&self, relation: &str, rows: &[Value]) -> Result<(), StoreError> {
+        PhoenixNativeRowStore::put_rows(self, relation, rows)
+    }
+
+    fn fetch_scoped_documents(
+        &self,
+        filter: ScopedDocumentFilter<'_>,
+    ) -> Result<Vec<Value>, StoreError> {
+        PhoenixNativeRowStore::fetch_scoped_documents(self, filter)
+    }
+
+    fn fetch_scoped_definitions(
+        &self,
+        filter: ScopedDefinitionFilter<'_>,
+    ) -> Result<Vec<Value>, StoreError> {
+        PhoenixNativeRowStore::fetch_scoped_definitions(self, filter)
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,7 +387,7 @@ impl PhoenixInvarant {
 
     pub fn ingest_native_view(
         &self,
-        store: &PhoenixCozoStore,
+        store: &dyn InvarantStore,
         request: &BorrowedIngestRequest<'_>,
     ) -> Result<
         (
@@ -296,11 +399,9 @@ impl PhoenixInvarant {
     > {
         let ingest_started = Instant::now();
         if legacy_native_ingest_enabled() {
-            let scanner = PhoenixScanner::default();
-            let structure = PhoenixStructure::default();
-            let _ = self
-                .graptor
-                .ingest_native_view(store, &scanner, &structure, request)?;
+            emit_ingest_progress(
+                "legacy_native_ingest_requested_but_disabled_for_non_cozo_native_store".to_owned(),
+            );
         }
         let (mut ingest, artifacts, mut profile) = self.project_native_ingest(store, request)?;
         profile.total_wall_ms = ingest_started.elapsed().as_millis() as u64;
@@ -333,7 +434,7 @@ impl PhoenixInvarant {
 
     fn project_native_ingest(
         &self,
-        store: &PhoenixCozoStore,
+        store: &dyn InvarantStore,
         request: &BorrowedIngestRequest<'_>,
     ) -> Result<(IngestResult, NativeIngestArtifacts, NativeIngestProfile), StoreError> {
         let started = Instant::now();
@@ -614,14 +715,24 @@ impl PhoenixInvarant {
 
     pub fn persist_session_materializations(
         &self,
-        store: &PhoenixCozoStore,
+        store: &dyn InvarantStore,
         session_id: &SessionId,
         graph_vertex_count: usize,
         graph_edge_count: usize,
         discovery_candidate_count: usize,
         span_count: usize,
     ) -> Result<(), StoreError> {
+        if ingest_progress_enabled() {
+            eprintln!("[invarant-session] phase=load_state session_id={}", session_id.0);
+        }
         let state = load_session_state(store, session_id)?;
+        if ingest_progress_enabled() {
+            eprintln!(
+                "[invarant-session] phase=build_stats session_id={} document_count={}",
+                session_id.0,
+                state.documents.len()
+            );
+        }
         let stats = build_session_stats(
             &state,
             graph_vertex_count,
@@ -630,6 +741,9 @@ impl PhoenixInvarant {
             span_count,
         );
         let now = now_ms();
+        if ingest_progress_enabled() {
+            eprintln!("[invarant-session] phase=write_state session_id={}", session_id.0);
+        }
         store.put_row(
             "scoped_definitions",
             session_definition_row(
@@ -640,6 +754,9 @@ impl PhoenixInvarant {
                 now,
             ),
         )?;
+        if ingest_progress_enabled() {
+            eprintln!("[invarant-session] phase=write_stats session_id={}", session_id.0);
+        }
         store.put_row(
             "scoped_definitions",
             session_definition_row(
@@ -896,16 +1013,18 @@ fn semantic_object_rows(
     bundle: &DocumentSemanticBundle,
     now: i64,
 ) -> Vec<Value> {
-    let mut rows = Vec::with_capacity(bundle.resolution.canonical_entities.len() + 8);
-    rows.extend(bundle.resolution.canonical_entities.iter().map(|entity| {
-        semantic_definition_row(
-            document,
-            INVARANT_SEMANTIC_ENTITY_NAMESPACE,
-            &format!("entity:{}", entity.entity_id.0),
-            &serde_json::to_value(entity).unwrap_or(Value::Null),
-            now,
-        )
-    }));
+    let mut rows = Vec::with_capacity(8);
+    rows.push(semantic_definition_row(
+        document,
+        INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+        &format!("entity-bundle:{}", bundle.document_version_id.0),
+        &json!({
+            "documentId": document.document_id.0,
+            "documentVersionId": bundle.document_version_id.0,
+            "entities": &bundle.resolution.canonical_entities,
+        }),
+        now,
+    ));
     rows.push(semantic_definition_row(
         document,
         INVARANT_SEMANTIC_ANNOTATION_NAMESPACE,
@@ -1031,14 +1150,19 @@ fn session_definition_row(session_id: &SessionId, kind: &str, payload: &Value, n
 }
 
 pub fn load_session_state(
-    store: &PhoenixCozoStore,
+    store: &dyn InvarantStore,
     session_id: &SessionId,
 ) -> Result<SessionState, StoreError> {
-    let rows = store.fetch_rows("scoped_definitions")?;
+    let state_key = format!("state:{}", session_id.0);
+    let rows = store.fetch_scoped_definitions(ScopedDefinitionFilter {
+        namespace: Some(INVARANT_SESSION_NAMESPACE),
+        definition_key: Some(state_key.as_str()),
+        ..ScopedDefinitionFilter::default()
+    })?;
     if let Some(payload) = rows.iter().find_map(|row| {
         (row.get("namespace").and_then(Value::as_str) == Some(INVARANT_SESSION_NAMESPACE)
             && row.get("definition_key").and_then(Value::as_str)
-                == Some(format!("state:{}", session_id.0).as_str()))
+                == Some(state_key.as_str()))
         .then(|| row.get("payload").cloned())
         .flatten()
     }) {
@@ -1048,12 +1172,11 @@ pub fn load_session_state(
     }
 
     let documents = store
-        .fetch_rows("scoped_documents")?
+        .fetch_scoped_documents(ScopedDocumentFilter {
+            namespace: Some(INVARANT_SEMANTIC_DOCUMENT_NAMESPACE),
+            ..ScopedDocumentFilter::default()
+        })?
         .into_iter()
-        .filter(|row| {
-            row.get("namespace").and_then(Value::as_str)
-                == Some(INVARANT_SEMANTIC_DOCUMENT_NAMESPACE)
-        })
         .filter_map(|row| row.get("payload").cloned())
         .filter(|payload| {
             payload.get("sessionId").and_then(Value::as_str) == Some(session_id.0.as_str())
@@ -1067,7 +1190,19 @@ pub fn load_session_state(
         .collect::<Vec<_>>();
 
     if documents.is_empty() {
-        return load_legacy_session_state(store, session_id);
+        if let Some(store) = store.as_legacy_cozo() {
+            return load_legacy_session_state(store, session_id);
+        }
+        return Ok(SessionState {
+            session_id: session_id.clone(),
+            documents: Vec::new(),
+            manifest_namespaces: vec![
+                INVARANT_SESSION_NAMESPACE.to_owned(),
+                INVARANT_SEMANTIC_DOCUMENT_NAMESPACE.to_owned(),
+                INVARANT_ARTIFACTS_NAMESPACE.to_owned(),
+            ],
+            updated_at: now_ms(),
+        });
     }
 
     Ok(SessionState {
@@ -1126,23 +1261,22 @@ pub fn build_session_stats(
 }
 
 fn collect_native_resolver_seeds(
-    store: &PhoenixCozoStore,
+    store: &dyn InvarantStore,
     scope: &ScopeKey,
 ) -> Result<Vec<ResolverEntitySeed>, StoreError> {
     let mut seeds = Vec::new();
-    for row in store.fetch_rows("scoped_definitions")? {
-        if row.get("namespace").and_then(Value::as_str) != Some(INVARANT_SEMANTIC_ENTITY_NAMESPACE)
-        {
-            continue;
-        }
-        let Some(payload) = row.get("payload").cloned() else {
-            continue;
-        };
-        let Ok(entity) = serde_json::from_value::<CanonicalEntity>(payload) else {
-            continue;
-        };
-        if scope_matches(&entity.scope, scope) {
-            seeds.push(resolver_seed_from_entity(&entity));
+    for row in store.fetch_scoped_definitions(ScopedDefinitionFilter {
+        namespace: Some(INVARANT_SEMANTIC_ENTITY_NAMESPACE),
+        ..ScopedDefinitionFilter::default()
+    })? {
+        for entity in deserialize_scoped_payloads::<CanonicalEntity>(
+            &row,
+            INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+            "entities",
+        ) {
+            if scope_matches(&entity.scope, scope) {
+                seeds.push(resolver_seed_from_entity(&entity));
+            }
         }
     }
     Ok(seeds)
@@ -1158,6 +1292,26 @@ fn resolver_seed_from_entity(entity: &CanonicalEntity) -> ResolverEntitySeed {
         number: None,
         scope: entity.scope.clone(),
     }
+}
+
+fn deserialize_scoped_payloads<T>(row: &Value, namespace: &str, array_field: &str) -> Vec<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if row.get("namespace").and_then(Value::as_str) != Some(namespace) {
+        return Vec::new();
+    }
+    let Some(payload) = row.get("payload").cloned() else {
+        return Vec::new();
+    };
+    if let Ok(item) = serde_json::from_value::<T>(payload.clone()) {
+        return vec![item];
+    }
+    payload
+        .get(array_field)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<T>>(value).ok())
+        .unwrap_or_default()
 }
 
 fn scope_matches(left: &ScopeKey, right: &ScopeKey) -> bool {

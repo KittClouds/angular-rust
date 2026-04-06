@@ -8,7 +8,6 @@ authors.workspace = true
 [dependencies]
 phoenix-analytics = { path = "../phoenix-analytics" }
 phoenix-graph = { path = "../phoenix-graph" }
-phoenix-graph-native = { path = "../phoenix-graph-native" }
 phoenix-runtime = { path = "../phoenix-runtime" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
 phoenix-types = { path = "../phoenix-types" }

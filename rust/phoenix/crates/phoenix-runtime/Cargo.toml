@@ -9,18 +9,22 @@ authors.workspace = true
 phoenix-analytics = { path = "../phoenix-analytics" }
 phoenix-chat = { path = "../phoenix-chat" }
 phoenix-graph = { path = "../phoenix-graph" }
-phoenix-graph-native = { path = "../phoenix-graph-native" }
 phoenix-gldr = { path = "../phoenix-gldr" }
 phoenix-graptor = { path = "../phoenix-graptor" }
-phoenix-invarant = { path = "../phoenix-invarant" }
+phoenix-hyperbolic = { path = "../phoenix-hyperbolic" }
+phoenix-invarant-v2 = { path = "../phoenix-invarant-v2" }
+phoenix-kernel = { path = "../phoenix-kernel" }
 phoenix-lex = { path = "../phoenix-lex" }
 phoenix-om = { path = "../phoenix-om" }
 phoenix-om-graptor = { path = "../phoenix-om-graptor" }
+phoenix-runtime-native = { path = "../phoenix-runtime-native" }
 phoenix-scanner = { path = "../phoenix-scanner" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
-phoenix-store-kyu = { path = "../phoenix-store-kyu" }
+phoenix-store-lmdb = { path = "../phoenix-store-lmdb" }
+phoenix-store-native = { path = "../phoenix-store-native" }
 phoenix-structure = { path = "../phoenix-structure" }
-phoenix-triverse = { path = "../phoenix-triverse" }
+phoenix-triverse-v2 = { path = "../phoenix-triverse-v2" }
 phoenix-types = { path = "../phoenix-types" }
 serde.workspace = true
 serde_json.workspace = true

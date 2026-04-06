@@ -2,26 +2,46 @@
 members = [
     "crates/phoenix-alex",
     "crates/phoenix-analytics",
+    "crates/phoenix-automata",
     "crates/phoenix-chat",
+    "crates/phoenix-causality",
     "crates/phoenix-chunker",
     "crates/phoenix-graph",
-    "crates/phoenix-graph-native",
+    "crates/phoenix-graph-kernel",
     "crates/phoenix-gldr",
     "crates/phoenix-graptor",
-    "crates/phoenix-invarant",
+    "crates/phoenix-hyperbolic",
+    "crates/phoenix-ingest-native",
+    "crates/phoenix-invarant-v2",
     "crates/phoenix-lex",
+    "crates/phoenix-machine",
+    "crates/phoenix-mentions",
     "crates/phoenix-native",
     "crates/phoenix-om",
     "crates/phoenix-om-graptor",
     "crates/phoenix-perf",
+    "crates/phoenix-proposition",
     "crates/phoenix-qgram",
+    "crates/phoenix-query",
+    "crates/phoenix-reference",
     "crates/phoenix-runtime",
+    "crates/phoenix-runtime-native",
+    "crates/phoenix-runtime-wasm",
     "crates/phoenix-scanner",
+    "crates/phoenix-semantics",
     "crates/phoenix-store-cozo",
-    "crates/phoenix-store-kyu",
+    "crates/phoenix-store-native",
+    "crates/phoenix-store-native-core",
+    "crates/phoenix-store-lmdb",
     "crates/phoenix-structure",
-    "crates/phoenix-triverse",
+    "crates/phoenix-semantic-v2",
+    "crates/phoenix-text",
+    "crates/phoenix-time",
+    "crates/phoenix-invarant-v3",
+    "crates/phoenix-triverse-v2",
     "crates/phoenix-types",
+    "crates/phoenix-index",
+    "crates/phoenix-kernel",
     "crates/phoenix-wasm",
 ]
 resolver = "2"
@@ -40,14 +60,24 @@ bincode = "1.3"
 rmp-serde = "1.3"
 fst = "0.4"
 roaring = "0.10"
+heed3 = "0.22"
 thiserror = "1.0"
 lz4_flex = "0.11"
-smallvec = "1.15"
+smallvec = { version = "1.15", features = ["serde"] }
 rustc-hash = "1.1"
 zerocopy = { version = "0.7", features = ["derive"] }
 memchr = "2.7"
 stop-words = "0.9"
 openrouter-rs = "0.4.7"
+compact_str = { version = "0.8", features = ["serde"] }
+slotmap = { version = "1.0", features = ["serde"] }
+hashbrown = "0.15"
+nohash-hasher = "0.2"
+rowan = "0.16"
+aho-corasick = "1.1"
+regex-automata = "0.4"
+bstr = "1.11"
+arc-swap = "1.7"
 
 [profile.release]
 opt-level = 3
@@ -58,5 +88,3 @@ strip = "symbols"
 
 [patch.crates-io]
 graph_builder = { path = "vendor/graph_builder" }
-kyu-copy = { path = "vendor/kyu-copy" }
-arrow-arith = { path = "vendor/arrow-arith" }

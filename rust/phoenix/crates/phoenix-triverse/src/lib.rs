@@ -9,6 +9,7 @@ use phoenix_invarant::{
 };
 use phoenix_lex::LexIndex;
 use phoenix_store_cozo::{PhoenixCozoStore, SemanticNeighbor, StoreError};
+use phoenix_store_native::{PhoenixNativeRowStore, ScopedDefinitionFilter, ScopedDocumentFilter};
 use phoenix_types::{
     ChunkHit, Diagnostic, EntityId, LexicalSearchResult, NodeHit, QueryRequest, QueryResult,
     SessionId, TemporalMarker,
@@ -168,6 +169,7 @@ impl PhoenixTriverse {
 
     pub fn query(
         &self,
+        native_store: Option<&dyn PhoenixNativeRowStore>,
         store: &PhoenixCozoStore,
         lex: &LexIndex,
         request: &QueryRequest,
@@ -184,6 +186,7 @@ impl PhoenixTriverse {
             limit.max(self.config.seed_limit) * 2,
         );
         let seed_set = self.collect_seeds(
+            native_store,
             store,
             request,
             full_graph,
@@ -350,6 +353,7 @@ impl PhoenixTriverse {
 
     fn collect_seeds(
         &self,
+        native_store: Option<&dyn PhoenixNativeRowStore>,
         store: &PhoenixCozoStore,
         request: &QueryRequest,
         full_graph: &GraptorGraph,
@@ -391,6 +395,7 @@ impl PhoenixTriverse {
         }
 
         let invarant_resolution = self.collect_invarant_seeds(
+            native_store,
             store,
             request,
             full_graph,
@@ -541,6 +546,7 @@ impl PhoenixTriverse {
 
     fn collect_invarant_seeds(
         &self,
+        native_store: Option<&dyn PhoenixNativeRowStore>,
         store: &PhoenixCozoStore,
         request: &QueryRequest,
         full_graph: &GraptorGraph,
@@ -552,15 +558,20 @@ impl PhoenixTriverse {
             return Ok(InvarantSemanticResolution::default());
         }
 
-        let scoped_documents = load_invarant_document_keys(store, request)?;
+        let scoped_documents = load_invarant_document_keys(native_store, store, request)?;
         let restrict_documents = !scoped_documents.is_empty();
-        let scoped_definitions = store.fetch_rows("scoped_definitions")?;
+        let evidence_rows = fetch_invarant_definition_rows(
+            native_store,
+            store,
+            INVARANT_SEMANTIC_EVIDENCE_NAMESPACE,
+        )?;
 
         let mut evidence_by_id = FxHashMap::<String, EvidenceAnchor>::default();
-        for row in &scoped_definitions {
-            if let Some(anchor) = deserialize_scoped_payload::<EvidenceAnchor>(
+        for row in &evidence_rows {
+            for anchor in deserialize_scoped_payloads::<EvidenceAnchor>(
                 row,
                 INVARANT_SEMANTIC_EVIDENCE_NAMESPACE,
+                "evidenceAnchors",
             ) {
                 if !restrict_documents || scoped_documents.contains(&anchor.document_id) {
                     evidence_by_id.insert(anchor.evidence_id.0.clone(), anchor);
@@ -573,10 +584,15 @@ impl PhoenixTriverse {
             ..InvarantSemanticResolution::default()
         };
 
-        for row in &scoped_definitions {
-            if let Some(entity) = deserialize_scoped_payload::<CanonicalEntity>(
-                row,
+        for row in fetch_invarant_definition_rows(
+            native_store,
+            store,
+            INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+        )? {
+            for entity in deserialize_scoped_payloads::<CanonicalEntity>(
+                &row,
                 INVARANT_SEMANTIC_ENTITY_NAMESPACE,
+                "entities",
             ) {
                 if !scope_matches(&request.scope, &entity.scope) {
                     continue;
@@ -602,10 +618,16 @@ impl PhoenixTriverse {
             }
         }
 
-        for row in &scoped_definitions {
-            if let Some(claim) =
-                deserialize_scoped_payload::<Claim>(row, INVARANT_SEMANTIC_CLAIM_NAMESPACE)
-            {
+        for row in fetch_invarant_definition_rows(
+            native_store,
+            store,
+            INVARANT_SEMANTIC_CLAIM_NAMESPACE,
+        )? {
+            for claim in deserialize_scoped_payloads::<Claim>(
+                &row,
+                INVARANT_SEMANTIC_CLAIM_NAMESPACE,
+                "claims",
+            ) {
                 let claim_match = semantic_text_match(
                     &query_terms,
                     [
@@ -652,10 +674,16 @@ impl PhoenixTriverse {
             }
         }
 
-        for row in &scoped_definitions {
-            if let Some(event) =
-                deserialize_scoped_payload::<Event>(row, INVARANT_SEMANTIC_EVENT_NAMESPACE)
-            {
+        for row in fetch_invarant_definition_rows(
+            native_store,
+            store,
+            INVARANT_SEMANTIC_EVENT_NAMESPACE,
+        )? {
+            for event in deserialize_scoped_payloads::<Event>(
+                &row,
+                INVARANT_SEMANTIC_EVENT_NAMESPACE,
+                "events",
+            ) {
                 let event_match = semantic_text_match(
                     &query_terms,
                     [event.label.as_str(), event.event_class.as_str()].into_iter(),
@@ -686,10 +714,15 @@ impl PhoenixTriverse {
             }
         }
 
-        for row in &scoped_definitions {
-            if let Some(chain) = deserialize_scoped_payload::<CoreferenceChainArtifact>(
-                row,
+        for row in fetch_invarant_definition_rows(
+            native_store,
+            store,
+            INVARANT_SEMANTIC_COREFERENCE_NAMESPACE,
+        )? {
+            for chain in deserialize_scoped_payloads::<CoreferenceChainArtifact>(
+                &row,
                 INVARANT_SEMANTIC_COREFERENCE_NAMESPACE,
+                "chains",
             ) {
                 let coref_match = semantic_text_match(
                     &query_terms,
@@ -1305,16 +1338,12 @@ fn accumulate_score(scores: &mut FxHashMap<String, f64>, key: &str, score: f64) 
 }
 
 fn load_invarant_document_keys(
+    native_store: Option<&dyn PhoenixNativeRowStore>,
     store: &PhoenixCozoStore,
     request: &QueryRequest,
 ) -> Result<FxHashSet<String>, StoreError> {
-    Ok(store
-        .fetch_rows("scoped_documents")?
+    Ok(fetch_invarant_document_rows(native_store, store)?
         .into_iter()
-        .filter(|row| {
-            row.get("namespace").and_then(Value::as_str)
-                == Some(INVARANT_SEMANTIC_DOCUMENT_NAMESPACE)
-        })
         .filter(|row| scoped_document_matches_request(row, request))
         .filter_map(|row| {
             row.get("payload")
@@ -1323,6 +1352,46 @@ fn load_invarant_document_keys(
                 .map(ToOwned::to_owned)
         })
         .collect())
+}
+
+fn fetch_invarant_document_rows(
+    native_store: Option<&dyn PhoenixNativeRowStore>,
+    store: &PhoenixCozoStore,
+) -> Result<Vec<Value>, StoreError> {
+    if let Some(native_store) = native_store {
+        native_store.fetch_scoped_documents(ScopedDocumentFilter {
+            namespace: Some(INVARANT_SEMANTIC_DOCUMENT_NAMESPACE),
+            ..ScopedDocumentFilter::default()
+        })
+    } else {
+        store.fetch_rows("scoped_documents").map(|rows| {
+            rows.into_iter()
+                .filter(|row| {
+                    row.get("namespace").and_then(Value::as_str)
+                        == Some(INVARANT_SEMANTIC_DOCUMENT_NAMESPACE)
+                })
+                .collect()
+        })
+    }
+}
+
+fn fetch_invarant_definition_rows(
+    native_store: Option<&dyn PhoenixNativeRowStore>,
+    store: &PhoenixCozoStore,
+    namespace: &str,
+) -> Result<Vec<Value>, StoreError> {
+    if let Some(native_store) = native_store {
+        native_store.fetch_scoped_definitions(ScopedDefinitionFilter {
+            namespace: Some(namespace),
+            ..ScopedDefinitionFilter::default()
+        })
+    } else {
+        store.fetch_rows("scoped_definitions").map(|rows| {
+            rows.into_iter()
+                .filter(|row| row.get("namespace").and_then(Value::as_str) == Some(namespace))
+                .collect()
+        })
+    }
 }
 
 fn scoped_document_matches_request(row: &Value, request: &QueryRequest) -> bool {
@@ -1377,6 +1446,26 @@ where
         .then(|| row.get("payload").cloned())
         .flatten()
         .and_then(|payload| serde_json::from_value(payload).ok())
+}
+
+fn deserialize_scoped_payloads<T>(row: &Value, namespace: &str, array_field: &str) -> Vec<T>
+where
+    T: DeserializeOwned,
+{
+    if row.get("namespace").and_then(Value::as_str) != Some(namespace) {
+        return Vec::new();
+    }
+    let Some(payload) = row.get("payload").cloned() else {
+        return Vec::new();
+    };
+    if let Ok(item) = serde_json::from_value::<T>(payload.clone()) {
+        return vec![item];
+    }
+    payload
+        .get(array_field)
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<T>>(value).ok())
+        .unwrap_or_default()
 }
 
 fn normalized_terms(text: &str) -> Vec<String> {
@@ -2382,6 +2471,7 @@ mod tests {
 
         let result = PhoenixTriverse::default()
             .query(
+                None,
                 &store,
                 &lex,
                 &QueryRequest {
@@ -2473,6 +2563,7 @@ mod tests {
 
         let result = PhoenixTriverse::default()
             .query(
+                None,
                 &store,
                 &lex,
                 &QueryRequest {
@@ -2583,6 +2674,7 @@ mod tests {
 
         let result = PhoenixTriverse::default()
             .query(
+                None,
                 &store,
                 &lex,
                 &QueryRequest {
@@ -2653,6 +2745,7 @@ mod tests {
 
         let result = PhoenixTriverse::default()
             .query(
+                None,
                 &store,
                 &lex,
                 &QueryRequest {
@@ -2744,6 +2837,7 @@ mod tests {
 
         let result = PhoenixTriverse::default()
             .query(
+                None,
                 &store,
                 &lex,
                 &QueryRequest {

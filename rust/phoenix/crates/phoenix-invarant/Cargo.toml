@@ -12,6 +12,8 @@ phoenix-graph = { path = "../phoenix-graph" }
 phoenix-graptor = { path = "../phoenix-graptor" }
 phoenix-scanner = { path = "../phoenix-scanner" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-store-native = { path = "../phoenix-store-native" }
+phoenix-store-ruvector = { path = "../phoenix-store-ruvector" }
 phoenix-structure = { path = "../phoenix-structure" }
 phoenix-types = { path = "../phoenix-types" }
 scirs2-text = "0.4.1"

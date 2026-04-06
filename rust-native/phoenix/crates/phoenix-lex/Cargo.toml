@@ -1,0 +1,14 @@
+[package]
+name = "phoenix-lex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-alex = { path = "../phoenix-alex" }
+phoenix-qgram = { path = "../phoenix-qgram" }
+phoenix-store-cozo = { path = "../phoenix-store-cozo" }
+phoenix-types = { path = "../phoenix-types" }
+serde_json.workspace = true
+rustc-hash.workspace = true

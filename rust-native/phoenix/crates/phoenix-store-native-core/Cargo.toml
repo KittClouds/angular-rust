@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-store-native-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-graph = { path = "../phoenix-graph" }
+phoenix-graph-kernel = { path = "../phoenix-graph-kernel" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
+phoenix-types = { path = "../phoenix-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

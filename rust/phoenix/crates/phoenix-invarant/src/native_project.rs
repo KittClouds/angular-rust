@@ -6,7 +6,7 @@ use phoenix_graph::{
     GraphEdgeRecord, GraphLayer, GraphMutationBatch, GraphMutationScope, GraphVertexRecord,
 };
 use phoenix_graptor::BorrowedIngestDocument;
-use phoenix_store_cozo::{PhoenixCozoStore, StoreError};
+use phoenix_store_cozo::StoreError;
 use phoenix_types::{
     BoundaryKind, DocumentId, EntityId, EntityKind, IngestDocumentSummary, MentionSource, NoteId,
     RelationCount, ScopeKey, SessionId,
@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     completed_stage, semantic::MentionCandidate, AnalysisContext, CanonicalEntity,
-    DocumentAnalysisStage, DocumentSemanticBundle, NativeBoundary, NativeChapter,
+    DocumentAnalysisStage, DocumentSemanticBundle, InvarantStore, NativeBoundary, NativeChapter,
     NativeDocumentProjection, NativeLeaf, NativeRelationRows, ProposedEntityLink,
     ResolvedMention, ResolutionStatus, INVARANT_DOCUMENTS_NAMESPACE, INVARANT_MANIFEST_NAMESPACE,
 };
@@ -30,7 +30,7 @@ pub(crate) fn legacy_native_scanner_enabled() -> bool {
 }
 
 pub(crate) fn write_relation_rows(
-    store: &PhoenixCozoStore,
+    store: &dyn InvarantStore,
     relation: &str,
     rows: &[Value],
     stages: &mut Vec<DocumentAnalysisStage>,
@@ -128,7 +128,6 @@ pub(crate) fn project_native_document(
             .filter(|mention| matches!(mention.source, Some(MentionSource::Discovery)))
             .count(),
         now,
-        &graph_batch,
     );
 
     let mut rows = NativeRelationRows::default();
@@ -653,7 +652,6 @@ fn native_document_manifest(
     chapters: &[NativeChapter],
     discovery_count: usize,
     now: i64,
-    asserted_graph_batch: &GraphMutationBatch,
 ) -> Value {
     json!({
         "documentId": document.document_id.0,
@@ -687,7 +685,6 @@ fn native_document_manifest(
                 "parentIds": Vec::<i64>::new(),
             })
         }).collect::<Vec<_>>(),
-        "assertedGraphBatch": asserted_graph_batch,
         "updatedAt": now,
     })
 }

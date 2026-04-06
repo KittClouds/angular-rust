@@ -9,7 +9,7 @@ authors.workspace = true
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-phoenix-runtime = { path = "../phoenix-runtime" }
+phoenix-runtime-wasm = { path = "../phoenix-runtime-wasm" }
 phoenix-store-cozo = { path = "../phoenix-store-cozo" }
 phoenix-types = { path = "../phoenix-types" }
 serde.workspace = true

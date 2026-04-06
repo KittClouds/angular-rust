@@ -1,0 +1,12 @@
+[package]
+name = "phoenix-semantic-v2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+zerocopy.workspace = true
+phoenix-graph-kernel = { path = "../phoenix-graph-kernel" }
+phoenix-types = { path = "../phoenix-types" }

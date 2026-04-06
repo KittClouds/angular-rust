@@ -1,0 +1,15 @@
+[package]
+name = "phoenix-machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+compact_str.workspace = true
+memchr.workspace = true
+rustc-hash.workspace = true
+scirs2-text = "0.4.1"
+smallvec.workspace = true
+phoenix-types = { path = "../phoenix-types" }
+serde.workspace = true
