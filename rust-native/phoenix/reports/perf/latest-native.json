@@ -1,0 +1,774 @@
+{
+  "generatedAt": 1775520916692,
+  "benchmarkConfig": {
+    "iterations": 1,
+    "warmupIterations": 0
+  },
+  "corpora": [
+    {
+      "corpusId": "perfect_run",
+      "title": "Perfect Run",
+      "path": "\\\\?\\C:\\Users\\shuga\\1kittroot\\1code\\Angular-build\\docs\\perfect_run.md",
+      "inputBytes": 2859630,
+      "inputChars": 2759471,
+      "estimatedInputPages": 44,
+      "excerptBytes": 32768,
+      "selectedQueries": {
+        "lexical": [
+          "\"New Rome\"",
+          "Len",
+          "Ryan"
+        ],
+        "graph": [
+          "Ryan Ghoul",
+          "Ryan Len"
+        ]
+      },
+      "relationCounts": [
+        {
+          "relation": "phoenix_schema_state",
+          "rows": 1
+        },
+        {
+          "relation": "phoenix_sessions",
+          "rows": 1
+        },
+        {
+          "relation": "phoenix_commits",
+          "rows": 1
+        },
+        {
+          "relation": "phoenix_ingest_log",
+          "rows": 1
+        },
+        {
+          "relation": "phoenix_query_log",
+          "rows": 10
+        },
+        {
+          "relation": "notes",
+          "rows": 0
+        },
+        {
+          "relation": "entities",
+          "rows": 0
+        },
+        {
+          "relation": "edges",
+          "rows": 0
+        },
+        {
+          "relation": "folders",
+          "rows": 0
+        },
+        {
+          "relation": "docid_map",
+          "rows": 0
+        },
+        {
+          "relation": "chunkid_map",
+          "rows": 0
+        },
+        {
+          "relation": "chunks",
+          "rows": 0
+        },
+        {
+          "relation": "raptor_nodes",
+          "rows": 0
+        },
+        {
+          "relation": "raptor_edges",
+          "rows": 0
+        },
+        {
+          "relation": "episodes",
+          "rows": 0
+        },
+        {
+          "relation": "spans",
+          "rows": 0
+        },
+        {
+          "relation": "wormholes",
+          "rows": 0
+        },
+        {
+          "relation": "span_mentions",
+          "rows": 0
+        },
+        {
+          "relation": "discovery_candidates",
+          "rows": 0
+        },
+        {
+          "relation": "blocks",
+          "rows": 0
+        },
+        {
+          "relation": "document_boundaries",
+          "rows": 0
+        },
+        {
+          "relation": "entity_cards",
+          "rows": 0
+        },
+        {
+          "relation": "folder_schemas",
+          "rows": 0
+        },
+        {
+          "relation": "scoped_documents",
+          "rows": 0
+        },
+        {
+          "relation": "scoped_entity_fields",
+          "rows": 0
+        },
+        {
+          "relation": "scoped_definitions",
+          "rows": 0
+        },
+        {
+          "relation": "network_instance",
+          "rows": 0
+        },
+        {
+          "relation": "network_membership",
+          "rows": 0
+        },
+        {
+          "relation": "network_relationship",
+          "rows": 0
+        }
+      ],
+      "ingestSummary": {
+        "sessionId": "perf-perfect_run",
+        "documentCount": 1,
+        "warningCount": 9,
+        "documents": [
+          {
+            "documentId": "perf-doc-perfect_run",
+            "noteId": null,
+            "chapterCount": 130,
+            "boundaryCount": 130,
+            "parentCount": 130,
+            "leafCount": 6298,
+            "entityCount": 2692,
+            "edgeCount": 20387,
+            "hasFrontMatterChapter": false,
+            "hasFrontMatterBoundary": false
+          }
+        ],
+        "chunkStats": {
+          "documents": 1,
+          "totalChapters": 130,
+          "totalBoundaries": 130,
+          "totalParents": 130,
+          "totalLeaves": 6298
+        },
+        "graphSummary": {
+          "documents": 1,
+          "totalChapters": 130,
+          "totalBoundaries": 130,
+          "totalLeaves": 6298,
+          "totalEntities": 2692,
+          "totalMentions": 74070,
+          "totalEdges": 20387,
+          "crossChapterLinks": 0
+        },
+        "entitySummary": {
+          "totalEntities": 2692,
+          "totalAliases": 1,
+          "totalMentions": 74070,
+          "multiChapterEntities": 0
+        },
+        "discoverySummary": {
+          "candidateCount": 74070,
+          "mentionCount": 74070,
+          "persistedCount": 2692
+        },
+        "retrievalSummary": {
+          "qgramDocuments": 1,
+          "gldrChunks": 6298,
+          "gldrEntities": 2692,
+          "gldrEdges": 20387,
+          "raptorDocuments": 1,
+          "raptorLeaves": 6298,
+          "raptorEnabled": true
+        },
+        "relationCounts": [
+          {
+            "relation": "phoenix_schema_state",
+            "rows": 1
+          },
+          {
+            "relation": "phoenix_sessions",
+            "rows": 1
+          },
+          {
+            "relation": "phoenix_commits",
+            "rows": 0
+          },
+          {
+            "relation": "phoenix_ingest_log",
+            "rows": 1
+          },
+          {
+            "relation": "phoenix_query_log",
+            "rows": 0
+          },
+          {
+            "relation": "notes",
+            "rows": 0
+          },
+          {
+            "relation": "entities",
+            "rows": 0
+          },
+          {
+            "relation": "edges",
+            "rows": 0
+          },
+          {
+            "relation": "folders",
+            "rows": 0
+          },
+          {
+            "relation": "docid_map",
+            "rows": 0
+          },
+          {
+            "relation": "chunkid_map",
+            "rows": 0
+          },
+          {
+            "relation": "chunks",
+            "rows": 0
+          },
+          {
+            "relation": "raptor_nodes",
+            "rows": 0
+          },
+          {
+            "relation": "raptor_edges",
+            "rows": 0
+          },
+          {
+            "relation": "episodes",
+            "rows": 0
+          },
+          {
+            "relation": "spans",
+            "rows": 0
+          },
+          {
+            "relation": "wormholes",
+            "rows": 0
+          },
+          {
+            "relation": "span_mentions",
+            "rows": 0
+          },
+          {
+            "relation": "discovery_candidates",
+            "rows": 0
+          },
+          {
+            "relation": "blocks",
+            "rows": 0
+          },
+          {
+            "relation": "document_boundaries",
+            "rows": 0
+          },
+          {
+            "relation": "entity_cards",
+            "rows": 0
+          },
+          {
+            "relation": "folder_schemas",
+            "rows": 0
+          },
+          {
+            "relation": "scoped_documents",
+            "rows": 0
+          },
+          {
+            "relation": "scoped_entity_fields",
+            "rows": 0
+          },
+          {
+            "relation": "scoped_definitions",
+            "rows": 0
+          },
+          {
+            "relation": "network_instance",
+            "rows": 0
+          },
+          {
+            "relation": "network_membership",
+            "rows": 0
+          },
+          {
+            "relation": "network_relationship",
+            "rows": 0
+          }
+        ],
+        "diagnostics": [
+          {
+            "code": "PX_INGEST_INVARANT_V2",
+            "message": "Invarant V2 ingested 1 archives, 6298 chunks, 2692 entities, 8998 graph vertices, and 20387 graph edges."
+          },
+          {
+            "code": "PX_INGEST_INVARANT_V2_SEGMENTED",
+            "message": "Native V2 persisted 1 manifests, 1 prepared segment sets, and marked 1 scopes dirty without synchronous sidecar rebuilds."
+          },
+          {
+            "code": "er_pronoun_link_match",
+            "message": "Pronouns resolved from explicit resolver links. Count=39883."
+          },
+          {
+            "code": "er_alias_link_match",
+            "message": "Mentions resolved from alias-style or linked local evidence. Count=512."
+          },
+          {
+            "code": "er_collective_merge",
+            "message": "Mentions resolved after collective surface/link reinforcement. Count=28757."
+          },
+          {
+            "code": "er_ambiguous_resolution",
+            "message": "Mentions remained ambiguous after collective resolution. Count=4918."
+          },
+          {
+            "code": "er_alias_rejected_low_margin",
+            "message": "Alias confirmations were rejected because evidence or margin was too weak. Count=68652."
+          },
+          {
+            "code": "er_relation_skipped_unresolved_entity",
+            "message": "Skipped 19686 asserted relations because one or more arguments stayed unresolved."
+          },
+          {
+            "code": "PX_INGEST_INVARANT_V2",
+            "message": "Phoenix Invarant V2 ingested native bundles, semantic state, and kernel graph mutations."
+          }
+        ]
+      },
+      "sessionStats": {
+        "documentCount": 1,
+        "chapterCount": 130,
+        "parentCount": 130,
+        "leafCount": 6298,
+        "entityCount": 2692,
+        "discoveryCandidateCount": 74070,
+        "graphVertexCount": 8998,
+        "graphEdgeCount": 20387,
+        "spanCount": 6298
+      },
+      "phases": [
+        {
+          "name": "init_runtime",
+          "wallMs": 1,
+          "heapBeforeBytes": 2902275,
+          "heapAfterBytes": 2903799,
+          "heapPeakBytes": 2903843,
+          "heapPeakDeltaBytes": 1568,
+          "outputBytes": 0,
+          "note": null
+        },
+        {
+          "name": "create_session",
+          "wallMs": 1,
+          "heapBeforeBytes": 2902875,
+          "heapAfterBytes": 2902927,
+          "heapPeakBytes": 2904030,
+          "heapPeakDeltaBytes": 1155,
+          "outputBytes": 0,
+          "note": null
+        },
+        {
+          "name": "analyze_text",
+          "wallMs": 5265,
+          "heapBeforeBytes": 2935709,
+          "heapAfterBytes": 19879181,
+          "heapPeakBytes": 385823978,
+          "heapPeakDeltaBytes": 382888269,
+          "outputBytes": 10536371,
+          "note": null
+        },
+        {
+          "name": "excerpt_scan",
+          "wallMs": 142,
+          "heapBeforeBytes": 19879193,
+          "heapAfterBytes": 21017651,
+          "heapPeakBytes": 21371586,
+          "heapPeakDeltaBytes": 1492393,
+          "outputBytes": 1153104,
+          "note": null
+        },
+        {
+          "name": "excerpt_structure",
+          "wallMs": 3,
+          "heapBeforeBytes": 21017663,
+          "heapAfterBytes": 21709201,
+          "heapPeakBytes": 22381039,
+          "heapPeakDeltaBytes": 1363376,
+          "outputBytes": 762225,
+          "note": null
+        },
+        {
+          "name": "ingest_document",
+          "wallMs": 6414,
+          "heapBeforeBytes": 21709638,
+          "heapAfterBytes": 211930122,
+          "heapPeakBytes": 356834816,
+          "heapPeakDeltaBytes": 335125178,
+          "outputBytes": 3272,
+          "note": null
+        },
+        {
+          "name": "commit_session",
+          "wallMs": 625,
+          "heapBeforeBytes": 211930137,
+          "heapAfterBytes": 211930185,
+          "heapPeakBytes": 270300430,
+          "heapPeakDeltaBytes": 58370293,
+          "outputBytes": 149,
+          "note": null
+        },
+        {
+          "name": "rebuild_lex",
+          "wallMs": 509,
+          "heapBeforeBytes": 211930199,
+          "heapAfterBytes": 211930397,
+          "heapPeakBytes": 226124949,
+          "heapPeakDeltaBytes": 14194750,
+          "outputBytes": 175,
+          "note": null
+        },
+        {
+          "name": "session_state",
+          "wallMs": 0,
+          "heapBeforeBytes": 211930408,
+          "heapAfterBytes": 211944105,
+          "heapPeakBytes": 211945138,
+          "heapPeakDeltaBytes": 14730,
+          "outputBytes": 8407,
+          "note": null
+        },
+        {
+          "name": "session_stats",
+          "wallMs": 0,
+          "heapBeforeBytes": 211944886,
+          "heapAfterBytes": 211944902,
+          "heapPeakBytes": 211959616,
+          "heapPeakDeltaBytes": 14730,
+          "outputBytes": 265,
+          "note": null
+        },
+        {
+          "name": "graph_delta",
+          "wallMs": 3086,
+          "heapBeforeBytes": 211944915,
+          "heapAfterBytes": 214077147,
+          "heapPeakBytes": 338624044,
+          "heapPeakDeltaBytes": 126679129,
+          "outputBytes": 1542092,
+          "note": null
+        },
+        {
+          "name": "snapshot_export",
+          "wallMs": 3797,
+          "heapBeforeBytes": 229257866,
+          "heapAfterBytes": 254428867,
+          "heapPeakBytes": 363714120,
+          "heapPeakDeltaBytes": 134456254,
+          "outputBytes": 25171001,
+          "note": null
+        },
+        {
+          "name": "snapshot_import",
+          "wallMs": 8643,
+          "heapBeforeBytes": 254446500,
+          "heapAfterBytes": 508102011,
+          "heapPeakBytes": 566585446,
+          "heapPeakDeltaBytes": 312138946,
+          "outputBytes": 25171001,
+          "note": null
+        },
+        {
+          "name": "restore_query",
+          "wallMs": 35,
+          "heapBeforeBytes": 508102009,
+          "heapAfterBytes": 508103037,
+          "heapPeakBytes": 508156176,
+          "heapPeakDeltaBytes": 54167,
+          "outputBytes": 693,
+          "note": null
+        }
+      ],
+      "lexicalQueryBatch": {
+        "phase": {
+          "name": "lexical_query_batch",
+          "wallMs": 4204,
+          "heapBeforeBytes": 214077392,
+          "heapAfterBytes": 229257653,
+          "heapPeakBytes": 235870579,
+          "heapPeakDeltaBytes": 21793187,
+          "outputBytes": 140,
+          "note": null
+        },
+        "runs": [
+          {
+            "query": "\"New Rome\"",
+            "chunkHits": 8,
+            "nodeHits": 0
+          },
+          {
+            "query": "Len",
+            "chunkHits": 8,
+            "nodeHits": 0
+          },
+          {
+            "query": "Ryan",
+            "chunkHits": 8,
+            "nodeHits": 0
+          }
+        ]
+      },
+      "graphQueryBatch": {
+        "phase": {
+          "name": "graph_query_batch",
+          "wallMs": 2230,
+          "heapBeforeBytes": 229257673,
+          "heapAfterBytes": 229257851,
+          "heapPeakBytes": 251494626,
+          "heapPeakDeltaBytes": 22236953,
+          "outputBytes": 99,
+          "note": null
+        },
+        "runs": [
+          {
+            "query": "Ryan Ghoul",
+            "chunkHits": 8,
+            "nodeHits": 8
+          },
+          {
+            "query": "Ryan Len",
+            "chunkHits": 8,
+            "nodeHits": 8
+          }
+        ]
+      },
+      "steadyState": [
+        {
+          "name": "scan_excerpt_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 193,
+            "p50WallMs": 193,
+            "p95WallMs": 193,
+            "maxWallMs": 193,
+            "meanWallMs": 193.0,
+            "maxPeakDeltaBytes": 2468596,
+            "totalOutputBytes": 1153104,
+            "totalChunkHits": 0,
+            "totalNodeHits": 0
+          },
+          "samples": [
+            {
+              "wallMs": 193,
+              "heapPeakDeltaBytes": 2468596,
+              "outputBytes": 1153104,
+              "chunkHits": 0,
+              "nodeHits": 0
+            }
+          ],
+          "note": null
+        },
+        {
+          "name": "structure_excerpt_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 48,
+            "p50WallMs": 48,
+            "p95WallMs": 48,
+            "maxWallMs": 48,
+            "meanWallMs": 48.0,
+            "maxPeakDeltaBytes": 1740114,
+            "totalOutputBytes": 762225,
+            "totalChunkHits": 0,
+            "totalNodeHits": 0
+          },
+          "samples": [
+            {
+              "wallMs": 48,
+              "heapPeakDeltaBytes": 1740114,
+              "outputBytes": 762225,
+              "chunkHits": 0,
+              "nodeHits": 0
+            }
+          ],
+          "note": null
+        },
+        {
+          "name": "session_stats_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 0,
+            "p50WallMs": 0,
+            "p95WallMs": 0,
+            "maxWallMs": 0,
+            "meanWallMs": 0.0,
+            "maxPeakDeltaBytes": 14730,
+            "totalOutputBytes": 265,
+            "totalChunkHits": 0,
+            "totalNodeHits": 0
+          },
+          "samples": [
+            {
+              "wallMs": 0,
+              "heapPeakDeltaBytes": 14730,
+              "outputBytes": 265,
+              "chunkHits": 0,
+              "nodeHits": 0
+            }
+          ],
+          "note": null
+        },
+        {
+          "name": "graph_delta_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 1415,
+            "p50WallMs": 1415,
+            "p95WallMs": 1415,
+            "maxWallMs": 1415,
+            "meanWallMs": 1415.0,
+            "maxPeakDeltaBytes": 126679033,
+            "totalOutputBytes": 1542092,
+            "totalChunkHits": 0,
+            "totalNodeHits": 2693
+          },
+          "samples": [
+            {
+              "wallMs": 1415,
+              "heapPeakDeltaBytes": 126679033,
+              "outputBytes": 1542092,
+              "chunkHits": 0,
+              "nodeHits": 2693
+            }
+          ],
+          "note": null
+        },
+        {
+          "name": "lexical_query_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 361,
+            "p50WallMs": 361,
+            "p95WallMs": 361,
+            "maxWallMs": 361,
+            "meanWallMs": 361.0,
+            "maxPeakDeltaBytes": 88021,
+            "totalOutputBytes": 2720,
+            "totalChunkHits": 24,
+            "totalNodeHits": 0
+          },
+          "samples": [
+            {
+              "wallMs": 361,
+              "heapPeakDeltaBytes": 88021,
+              "outputBytes": 2720,
+              "chunkHits": 24,
+              "nodeHits": 0
+            }
+          ],
+          "note": null
+        },
+        {
+          "name": "graph_query_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 2215,
+            "p50WallMs": 2215,
+            "p95WallMs": 2215,
+            "maxWallMs": 2215,
+            "meanWallMs": 2215.0,
+            "maxPeakDeltaBytes": 22236789,
+            "totalOutputBytes": 3357,
+            "totalChunkHits": 16,
+            "totalNodeHits": 16
+          },
+          "samples": [
+            {
+              "wallMs": 2215,
+              "heapPeakDeltaBytes": 22236789,
+              "outputBytes": 3357,
+              "chunkHits": 16,
+              "nodeHits": 16
+            }
+          ],
+          "note": null
+        },
+        {
+          "name": "restore_query_steady",
+          "summary": {
+            "iterations": 1,
+            "warmupIterations": 0,
+            "minWallMs": 34,
+            "p50WallMs": 34,
+            "p95WallMs": 34,
+            "maxWallMs": 34,
+            "meanWallMs": 34.0,
+            "maxPeakDeltaBytes": 54167,
+            "totalOutputBytes": 693,
+            "totalChunkHits": 5,
+            "totalNodeHits": 0
+          },
+          "samples": [
+            {
+              "wallMs": 34,
+              "heapPeakDeltaBytes": 54167,
+              "outputBytes": 693,
+              "chunkHits": 5,
+              "nodeHits": 0
+            }
+          ],
+          "note": null
+        }
+      ],
+      "snapshotBytes": 25171001,
+      "snapshotRelationCount": 29,
+      "budget": {
+        "maxAnalyzeTextMs": 10000,
+        "maxExcerptScanMs": 3000,
+        "maxExcerptStructureMs": 3000,
+        "maxIngestMs": 180000,
+        "maxCommitMs": 3000,
+        "maxRebuildMs": 20000,
+        "maxGraphDeltaMs": 20000,
+        "maxLexicalQueryBatchMs": 6000,
+        "maxGraphQueryBatchMs": 20000,
+        "maxSnapshotExportMs": 20000,
+        "maxSnapshotImportMs": 40000,
+        "maxRestoreQueryMs": 4000,
+        "maxIngestPeakDeltaBytes": 1073741824,
+        "maxGraphDeltaPeakDeltaBytes": 268435456,
+        "maxSnapshotImportPeakDeltaBytes": 1073741824,
+        "maxSnapshotBytes": 268435456
+      },
+      "budgetCheck": {
+        "passed": true,
+        "failures": []
+      }
+    }
+  ],
+  "totalFailures": 0
+}

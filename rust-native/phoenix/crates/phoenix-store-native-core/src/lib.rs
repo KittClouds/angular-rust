@@ -3,8 +3,10 @@ use phoenix_graph_kernel::{
     KernelCheckpointData, KernelGraphSnapshot, KernelJournalEntry, KernelMutationBatch,
 };
 use phoenix_semantic_v2::{
-    AliasPosting, DirtyScopeRecord, DocumentArchive, DocumentManifest, DocumentOrdinalAssignment,
-    DocumentRevisionRef, PreparedDocument, ScopeLexSidecar, ScopeOrd, SessionArchive, SessionOrd,
+    AliasPosting, CausalScopeSidecar, DirtyScopeRecord, DocumentArchive, DocumentManifest,
+    DocumentOrdinalAssignment, DocumentRevisionRef, ErScopePatchSidecar, MemoryScopeSidecar,
+    PreparedDocument, RelationMentionSeedScopeSidecar, RelationScopePatchSidecar,
+    ScopeLexSidecar, ScopeOrd, SessionArchive, SessionOrd,
 };
 use phoenix_types::{IndexedSpan, IngestDocument, ScopeKey, SessionId};
 use serde::{Deserialize, Serialize};
@@ -265,7 +267,9 @@ pub enum AnnIndexFamily {
     NodePrototype,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct AnnGenerationId(pub u64);
 
@@ -469,6 +473,57 @@ pub trait PhoenixArchiveStoreV2 {
     fn list_dirty_scopes(&self) -> Result<Vec<DirtyScopeRecord>, StoreError>;
 }
 
+pub trait PhoenixErPatchStore {
+    fn init_er_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_er_patch_sidecar(&self, sidecar: &ErScopePatchSidecar) -> Result<(), StoreError>;
+    fn load_er_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<ErScopePatchSidecar>, StoreError>;
+}
+
+pub trait PhoenixRelationPatchStore {
+    fn init_relation_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_relation_patch_sidecar(
+        &self,
+        sidecar: &RelationScopePatchSidecar,
+    ) -> Result<(), StoreError>;
+    fn load_relation_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<RelationScopePatchSidecar>, StoreError>;
+}
+
+pub trait PhoenixMemoryPatchStore {
+    fn init_memory_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_memory_patch_sidecar(&self, sidecar: &MemoryScopeSidecar) -> Result<(), StoreError>;
+    fn load_memory_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<MemoryScopeSidecar>, StoreError>;
+}
+
+pub trait PhoenixCausalPatchStore {
+    fn init_causal_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_causal_patch_sidecar(&self, sidecar: &CausalScopeSidecar) -> Result<(), StoreError>;
+    fn load_causal_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<CausalScopeSidecar>, StoreError>;
+}
+
+pub trait PhoenixRelationMentionSeedStore {
+    fn init_relation_mention_seed_schema(&self) -> Result<(), StoreError>;
+    fn persist_relation_mention_seed_sidecar(
+        &self,
+        sidecar: &RelationMentionSeedScopeSidecar,
+    ) -> Result<(), StoreError>;
+    fn load_relation_mention_seed_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<RelationMentionSeedScopeSidecar>, StoreError>;
+}
+
 pub trait PhoenixSemanticIndexStore {
     fn semantic_model_id(&self) -> &'static str {
         SEMANTIC_MODEL_ID
@@ -558,7 +613,10 @@ pub trait PhoenixDirectGraphStoreV2 {
         commit_id: &str,
         created_at: i64,
     ) -> Result<(), StoreError>;
-    fn direct_graph_generation_for_commit(&self, commit_id: &str) -> Result<Option<u64>, StoreError>;
+    fn direct_graph_generation_for_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<Option<u64>, StoreError>;
     fn direct_graph_current_generation(&self) -> Result<u64, StoreError>;
     fn direct_graph_journal_len(&self) -> Result<usize, StoreError>;
 }

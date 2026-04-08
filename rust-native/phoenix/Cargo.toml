@@ -1,26 +1,32 @@
 [workspace]
 members = [
+    "crates/phoenix-api",
     "crates/phoenix-alex",
     "crates/phoenix-analytics",
     "crates/phoenix-automata",
     "crates/phoenix-chat",
     "crates/phoenix-causality",
+    "crates/phoenix-causal-post",
     "crates/phoenix-chunker",
+    "crates/phoenix-er-post",
     "crates/phoenix-graph",
     "crates/phoenix-graph-kernel",
     "crates/phoenix-gldr",
     "crates/phoenix-graptor",
     "crates/phoenix-hyperbolic",
+    "crates/phoenix-ingest-overgraph",
     "crates/phoenix-ingest-native",
     "crates/phoenix-invarant-v2",
     "crates/phoenix-lex",
     "crates/phoenix-machine",
+    "crates/phoenix-memory-post",
     "crates/phoenix-mentions",
     "crates/phoenix-om",
     "crates/phoenix-perf",
     "crates/phoenix-proposition",
     "crates/phoenix-qgram",
     "crates/phoenix-query",
+    "crates/phoenix-rel-post",
     "crates/phoenix-reference",
     "crates/phoenix-runtime",
     "crates/phoenix-runtime-native",
@@ -30,6 +36,7 @@ members = [
     "crates/phoenix-store-native",
     "crates/phoenix-store-native-core",
     "crates/phoenix-store-lmdb",
+    "crates/phoenix-store-overgraph",
     "crates/phoenix-structure",
     "crates/phoenix-semantic-v2",
     "crates/phoenix-text",
@@ -73,6 +80,7 @@ aho-corasick = "1.1"
 regex-automata = "0.4"
 bstr = "1.11"
 arc-swap = "1.7"
+overgraph = "0.4.1"
 
 [profile.release]
 opt-level = 3
@@ -83,3 +91,4 @@ strip = "symbols"
 
 [patch.crates-io]
 graph_builder = { path = "vendor/graph_builder" }
+esaxx-rs = { path = "../phoenix-gliner-smoke/vendor/esaxx-rs" }

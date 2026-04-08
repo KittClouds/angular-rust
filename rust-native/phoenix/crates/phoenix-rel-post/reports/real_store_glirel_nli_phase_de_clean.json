@@ -1,0 +1,27 @@
+[
+  {
+    "scopeKey": "__global__::__global__::__global__::__global__",
+    "reviewCaseCount": 0,
+    "windowCount": 0,
+    "persistedRelationCount": 446,
+    "entityProfileCount": 291,
+    "nativeRelationTypeCounts": {},
+    "proposedRelationCounts": {},
+    "decisionCounts": {},
+    "supportJudgmentCount": 0,
+    "contradictionJudgmentCount": 0,
+    "archives": [
+      {
+        "documentId": "er-post-shortrun",
+        "sentenceCount": 0,
+        "chunkCount": 355,
+        "entityCount": 291,
+        "resolvedMentionCount": 0,
+        "relationCandidateCount": 0,
+        "persistedRelationCount": 536
+      }
+    ],
+    "windows": [],
+    "cases": []
+  }
+]

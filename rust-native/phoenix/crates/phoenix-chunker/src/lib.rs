@@ -1,3 +1,5 @@
+pub mod api;
+
 mod normalize;
 mod sentence;
 

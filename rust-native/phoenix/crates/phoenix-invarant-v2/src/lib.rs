@@ -3582,6 +3582,7 @@ impl PhoenixInvarantV2 {
             relation_candidates: structure.relations.clone(),
             graph_batch: kernel_batch.clone(),
             structure: Some(structure.clone()),
+            causal_substrate: None,
         };
         if progress {
             eprintln!(

@@ -1,0 +1,19 @@
+[package]
+name = "phoenix-store-overgraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+lz4_flex.workspace = true
+overgraph.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+phoenix-hyperbolic = { path = "../phoenix-hyperbolic" }
+phoenix-kernel = { path = "../phoenix-kernel" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
+phoenix-store-native-core = { path = "../phoenix-store-native-core" }
+phoenix-types = { path = "../phoenix-types" }

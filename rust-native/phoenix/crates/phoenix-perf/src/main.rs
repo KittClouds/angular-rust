@@ -2,8 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 use phoenix_perf::{
-    default_out_dir, render_markdown, run_perf_suite_filtered_with_config, strict_check,
-    write_suite_report, BenchmarkConfig,
+    default_out_dir, render_markdown, render_overgraph_native_markdown,
+    run_overgraph_native_harness_with_config, run_perf_suite_filtered_with_config, strict_check,
+    strict_check_overgraph_native, write_overgraph_native_report, write_suite_report,
+    BenchmarkConfig,
 };
 
 fn main() {
@@ -11,6 +13,13 @@ fn main() {
     let strict = args.iter().any(|arg| arg == "--strict");
     let json_only = args.iter().any(|arg| arg == "--json");
     let progress = args.iter().any(|arg| arg == "--progress");
+    let lane = parse_string_arg(&args, "--lane")
+        .or_else(|| {
+            args.iter()
+                .any(|arg| arg == "--overgraph-native")
+                .then_some("overgraph-native".to_owned())
+        })
+        .unwrap_or_else(|| "native-runtime".to_owned());
     let corpus_filter = args
         .windows(2)
         .find_map(|window| (window[0] == "--corpus").then(|| window[1].clone()));
@@ -32,13 +41,57 @@ fn main() {
         }
     }
 
-    let report = match run_perf_suite_filtered_with_config(corpus_filter.as_deref(), &benchmark_config) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("{error}");
-            std::process::exit(1);
+    if lane == "overgraph-native" {
+        let report = match run_overgraph_native_harness_with_config(
+            corpus_filter.as_deref(),
+            &benchmark_config,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+
+        let (json_path, md_path) = match write_overgraph_native_report(&report, &out_dir) {
+            Ok(paths) => paths,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+
+        if json_only {
+            println!("{}", serde_json::to_string_pretty(&report).expect("json"));
+        } else {
+            println!("{}", render_overgraph_native_markdown(&report));
+            println!();
+            println!("JSON report: {}", json_path.display());
+            println!("Markdown report: {}", md_path.display());
         }
-    };
+
+        if strict {
+            if let Err(error) = strict_check_overgraph_native(&report) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if lane != "native-runtime" {
+        eprintln!("unsupported perf lane: {lane}");
+        std::process::exit(1);
+    }
+
+    let report =
+        match run_perf_suite_filtered_with_config(corpus_filter.as_deref(), &benchmark_config) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
 
     let (json_path, md_path) = match write_suite_report(&report, &out_dir) {
         Ok(paths) => paths,
@@ -69,4 +122,9 @@ fn parse_usize_arg(args: &[String], flag: &str) -> Option<usize> {
     args.windows(2)
         .find_map(|window| (window[0] == flag).then(|| window[1].parse::<usize>().ok()))
         .flatten()
+}
+
+fn parse_string_arg(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find_map(|window| (window[0] == flag).then(|| window[1].clone()))
 }

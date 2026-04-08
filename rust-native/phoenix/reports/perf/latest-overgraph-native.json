@@ -1,0 +1,190 @@
+{
+  "generatedAt": 1775533061919,
+  "benchmarkConfig": {
+    "iterations": 1,
+    "warmupIterations": 0
+  },
+  "corpusId": "perfect_run",
+  "title": "Perfect Run",
+  "path": "\\\\?\\C:\\Users\\shuga\\1kittroot\\1code\\Angular-build\\docs\\perfect_run.md",
+  "inputBytes": 2859630,
+  "inputChars": 2759471,
+  "initPhase": {
+    "name": "init_overgraph_store",
+    "wallMs": 15,
+    "heapBeforeBytes": 5743992,
+    "heapAfterBytes": 5757710,
+    "heapPeakBytes": 5758408,
+    "heapPeakDeltaBytes": 14416,
+    "outputBytes": 0,
+    "note": null
+  },
+  "ingestPhase": {
+    "name": "overgraph_native_ingest",
+    "wallMs": 5589,
+    "heapBeforeBytes": 5757730,
+    "heapAfterBytes": 72727383,
+    "heapPeakBytes": 148928676,
+    "heapPeakDeltaBytes": 143170946,
+    "outputBytes": 2057,
+    "note": null
+  },
+  "rebuildPhase": {
+    "name": "rebuild_scope_sidecars",
+    "wallMs": 1067,
+    "heapBeforeBytes": 72727406,
+    "heapAfterBytes": 74650437,
+    "heapPeakBytes": 92247619,
+    "heapPeakDeltaBytes": 19520213,
+    "outputBytes": 1,
+    "note": null
+  },
+  "persistSessionPhase": {
+    "name": "persist_session_archive",
+    "wallMs": 2,
+    "heapBeforeBytes": 74665210,
+    "heapAfterBytes": 74673536,
+    "heapPeakBytes": 74707190,
+    "heapPeakDeltaBytes": 41980,
+    "outputBytes": 8729,
+    "note": null
+  },
+  "verifyPhase": {
+    "name": "verify_persistence_truth",
+    "wallMs": 450,
+    "heapBeforeBytes": 74673582,
+    "heapAfterBytes": 74673582,
+    "heapPeakBytes": 98938402,
+    "heapPeakDeltaBytes": 24264820,
+    "outputBytes": 243,
+    "note": null
+  },
+  "ingestSummary": {
+    "sessionId": "overgraph-session-perfect_run-0",
+    "documentCount": 1,
+    "warningCount": 2,
+    "documents": [
+      {
+        "documentId": "overgraph-perfect_run-0",
+        "noteId": null,
+        "chapterCount": 130,
+        "boundaryCount": 130,
+        "parentCount": 130,
+        "leafCount": 6298,
+        "entityCount": 2692,
+        "edgeCount": 20387,
+        "hasFrontMatterChapter": false,
+        "hasFrontMatterBoundary": false
+      }
+    ],
+    "chunkStats": {
+      "documents": 1,
+      "totalChapters": 130,
+      "totalBoundaries": 130,
+      "totalParents": 130,
+      "totalLeaves": 6298
+    },
+    "graphSummary": {
+      "documents": 1,
+      "totalChapters": 130,
+      "totalBoundaries": 130,
+      "totalLeaves": 6298,
+      "totalEntities": 2692,
+      "totalMentions": 74070,
+      "totalEdges": 20387,
+      "crossChapterLinks": 0
+    },
+    "entitySummary": {
+      "totalEntities": 2692,
+      "totalAliases": 1,
+      "totalMentions": 74070,
+      "multiChapterEntities": 0
+    },
+    "discoverySummary": {
+      "candidateCount": 74070,
+      "mentionCount": 74070,
+      "persistedCount": 2692
+    },
+    "retrievalSummary": {
+      "qgramDocuments": 1,
+      "gldrChunks": 6298,
+      "gldrEntities": 2692,
+      "gldrEdges": 20387,
+      "raptorDocuments": 1,
+      "raptorLeaves": 6298,
+      "raptorEnabled": true
+    },
+    "relationCounts": [],
+    "diagnostics": [
+      {
+        "code": "PX_INGEST_INVARANT_V2",
+        "message": "Invarant V2 ingested 1 archives, 6298 chunks, 2692 entities, 8998 graph vertices, and 20387 graph edges."
+      },
+      {
+        "code": "PX_INGEST_INVARANT_V2_SEGMENTED",
+        "message": "Native V2 persisted 1 manifests, 1 prepared segment sets, and marked 1 scopes dirty without synchronous sidecar rebuilds."
+      },
+      {
+        "code": "er_pronoun_link_match",
+        "message": "Pronouns resolved from explicit resolver links. Count=39883."
+      },
+      {
+        "code": "er_alias_link_match",
+        "message": "Mentions resolved from alias-style or linked local evidence. Count=512."
+      },
+      {
+        "code": "er_collective_merge",
+        "message": "Mentions resolved after collective surface/link reinforcement. Count=28757."
+      },
+      {
+        "code": "er_ambiguous_resolution",
+        "message": "Mentions remained ambiguous after collective resolution. Count=4918."
+      },
+      {
+        "code": "er_alias_rejected_low_margin",
+        "message": "Alias confirmations were rejected because evidence or margin was too weak. Count=68652."
+      },
+      {
+        "code": "er_relation_skipped_unresolved_entity",
+        "message": "Skipped 19686 asserted relations because one or more arguments stayed unresolved."
+      }
+    ]
+  },
+  "steadyState": {
+    "name": "overgraph_native_ingest",
+    "summary": {
+      "iterations": 1,
+      "warmupIterations": 0,
+      "minWallMs": 5589,
+      "p50WallMs": 5589,
+      "p95WallMs": 5589,
+      "maxWallMs": 5589,
+      "meanWallMs": 5589.0,
+      "maxPeakDeltaBytes": 143170946,
+      "totalOutputBytes": 2057,
+      "totalChunkHits": 0,
+      "totalNodeHits": 0
+    },
+    "samples": [
+      {
+        "wallMs": 5589,
+        "heapPeakDeltaBytes": 143170946,
+        "outputBytes": 2057,
+        "chunkHits": 0,
+        "nodeHits": 0
+      }
+    ],
+    "note": "Each sample uses a fresh OverGraph store, ingests one corpus document, and verifies persisted state."
+  },
+  "truth": {
+    "manifestPresent": true,
+    "archiveCount": 1,
+    "dirtyScopeCountBeforeRebuild": 1,
+    "rebuiltScopeCount": 1,
+    "lexicalSpanCount": 6298,
+    "sessionArchivePresent": true,
+    "kernelCheckpointPresent": true,
+    "subsequentPrepareHasKernelSnapshot": true,
+    "kernelGeneration": 1
+  }
+}

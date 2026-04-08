@@ -1523,6 +1523,9 @@ impl PhoenixLmdbStore {
                 DocumentSegmentKind::CorefClusterTable => {
                     archive.coref_clusters = decode_segment_payload(&segment.payload)?;
                 }
+                DocumentSegmentKind::CausalSubstrateTable => {
+                    archive.causal_substrate = Some(decode_segment_payload(&segment.payload)?);
+                }
                 DocumentSegmentKind::ChunkTable => {
                     archive.chunks = decode_segment_payload(&segment.payload)?;
                 }

@@ -1,0 +1,130 @@
+﻿[
+  {
+    "scopeKey": "__global__::__global__::__global__::__global__",
+    "reviewCaseCount": 2,
+    "windowCount": 2,
+    "seededPairCount": 2,
+    "persistedRelationCount": 446,
+    "entityProfileCount": 291,
+    "nativeRelationTypeCounts": {
+      "located_in": 2
+    },
+    "proposedRelationCounts": {},
+    "decisionCounts": {
+      "reject": 2
+    },
+    "supportJudgmentCount": 0,
+    "contradictionJudgmentCount": 0,
+    "windowSourceCounts": {
+      "synthetic_sentence": 2
+    },
+    "anchorEvidenceCounts": {
+      "canonical": 2
+    },
+    "familiesPerWindow": {
+      "er-post-shortrun::1::synthetic::1173": [
+        "located_in"
+      ],
+      "er-post-shortrun::1::synthetic::1174": [
+        "located_in"
+      ]
+    },
+    "rejectedWindowReasonCounts": {
+      "anchor_density": 3,
+      "no_family_support": 345,
+      "structural": 2,
+      "too_few_entities": 2368
+    },
+    "archives": [
+      {
+        "documentId": "er-post-shortrun",
+        "sentenceCount": 0,
+        "chunkCount": 355,
+        "entityCount": 291,
+        "resolvedMentionCount": 0,
+        "relationCandidateCount": 0,
+        "persistedRelationCount": 536
+      }
+    ],
+    "windows": [
+      {
+        "windowId": "er-post-shortrun::1::synthetic::1173",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [
+          "located_in"
+        ],
+        "evidenceLabels": [
+          "anchor_evidence:canonical",
+          "window_source:synthetic_sentence"
+        ],
+        "entities": [
+          "er-post-shortrun::little_maghreb:Little Maghreb",
+          "er-post-shortrun::ryan:Ryan"
+        ],
+        "textPreview": "The locals called it Little Maghreb from what Ryan had heard."
+      },
+      {
+        "windowId": "er-post-shortrun::1::synthetic::1174",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [
+          "located_in"
+        ],
+        "evidenceLabels": [
+          "anchor_evidence:canonical",
+          "window_source:synthetic_sentence"
+        ],
+        "entities": [
+          "er-post-shortrun::little_maghreb:Little Maghreb",
+          "er-post-shortrun::ryan:Ryan"
+        ],
+        "textPreview": "The locals called it Little Maghreb from what Ryan had heard."
+      }
+    ],
+    "cases": [
+      {
+        "caseId": "er-post-shortrun::1::1173::er-post-shortrun::ryan::er-post-shortrun::little_maghreb",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::synthetic::1173",
+        "source": "Ryan",
+        "target": "Little Maghreb",
+        "seedScoreMillis": 1045,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:11",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "candidate_relation_type:located_in",
+          "candidate_evidence:anchor_evidence:canonical",
+          "candidate_evidence:window_source:synthetic_sentence",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null,
+        "supportConfidenceMillis": null,
+        "contradictionConfidenceMillis": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::1174::er-post-shortrun::ryan::er-post-shortrun::little_maghreb",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::synthetic::1174",
+        "source": "Ryan",
+        "target": "Little Maghreb",
+        "seedScoreMillis": 1045,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:11",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "candidate_relation_type:located_in",
+          "candidate_evidence:anchor_evidence:canonical",
+          "candidate_evidence:window_source:synthetic_sentence",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null,
+        "supportConfidenceMillis": null,
+        "contradictionConfidenceMillis": null
+      }
+    ]
+  }
+]

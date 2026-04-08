@@ -5,10 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use overgraph::WalSyncMode;
+use phoenix_graph_kernel::KernelGraphSnapshot;
+use phoenix_ingest_overgraph::PhoenixInvarantV3;
 use phoenix_runtime::PhoenixRuntime;
+use phoenix_store_native_core::{IngestMode, PhoenixArchiveStoreV2, PhoenixGraphKernelStoreV2};
+use phoenix_store_overgraph::{OvergraphTuning, PhoenixOvergraphStore};
 use phoenix_types::{
     CommitRequest, CreateSessionRequest, DocumentId, GraphDeltaRequest, IngestDocument,
-    IngestRequest, QueryRequest, QueryTarget, RuntimeConfig, ScopeKey, SessionId, TemporalMarker,
+    IngestRequest, IngestResult, QueryRequest, QueryTarget, RuntimeConfig, ScopeKey, SessionId,
+    TemporalMarker,
 };
 use serde::{Deserialize, Serialize};
 
@@ -272,6 +278,51 @@ pub struct PerfSuiteReport {
     pub total_failures: usize,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OvergraphNativeTruthReport {
+    pub manifest_present: bool,
+    pub archive_count: usize,
+    pub dirty_scope_count_before_rebuild: usize,
+    pub rebuilt_scope_count: usize,
+    pub lexical_span_count: usize,
+    pub session_archive_present: bool,
+    pub kernel_checkpoint_present: bool,
+    pub subsequent_prepare_has_kernel_snapshot: bool,
+    pub kernel_generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OvergraphNativeHarnessReport {
+    pub generated_at: i64,
+    pub benchmark_config: BenchmarkConfig,
+    pub corpus_id: String,
+    pub title: String,
+    pub path: String,
+    pub input_bytes: usize,
+    pub input_chars: usize,
+    pub init_phase: PhaseReport,
+    pub ingest_phase: PhaseReport,
+    pub rebuild_phase: PhaseReport,
+    pub persist_session_phase: PhaseReport,
+    pub verify_phase: PhaseReport,
+    pub ingest_summary: IngestResult,
+    pub steady_state: SteadyStateBenchmarkReport,
+    pub truth: OvergraphNativeTruthReport,
+}
+
+#[derive(Clone, Debug)]
+struct OvergraphNativeHarnessRun {
+    init_phase: PhaseReport,
+    ingest_phase: PhaseReport,
+    rebuild_phase: PhaseReport,
+    persist_session_phase: PhaseReport,
+    verify_phase: PhaseReport,
+    ingest_summary: IngestResult,
+    truth: OvergraphNativeTruthReport,
+}
+
 pub fn load_standard_corpus() -> Result<Vec<CorpusDocument>, String> {
     let docs_dir = repo_root().join("docs");
     let mut corpus = Vec::new();
@@ -332,6 +383,72 @@ pub fn run_perf_suite_filtered_with_config(
     })
 }
 
+pub fn run_overgraph_native_harness() -> Result<OvergraphNativeHarnessReport, String> {
+    run_overgraph_native_harness_with_config(None, &BenchmarkConfig::default())
+}
+
+pub fn run_overgraph_native_harness_with_config(
+    corpus_filter: Option<&str>,
+    benchmark_config: &BenchmarkConfig,
+) -> Result<OvergraphNativeHarnessReport, String> {
+    let corpus = select_overgraph_corpus(corpus_filter)?;
+
+    for sample_ix in 0..benchmark_config.warmup_iterations {
+        let _ = run_overgraph_native_harness_once(&corpus, sample_ix, true)?;
+    }
+
+    let iterations = benchmark_config.iterations.max(1);
+    let mut final_run = None;
+    let mut samples = Vec::with_capacity(iterations);
+    for sample_ix in 0..iterations {
+        let run = run_overgraph_native_harness_once(
+            &corpus,
+            benchmark_config.warmup_iterations + sample_ix,
+            false,
+        )?;
+        samples.push(BenchmarkSample {
+            wall_ms: run.ingest_phase.wall_ms,
+            heap_peak_delta_bytes: run.ingest_phase.heap_peak_delta_bytes,
+            output_bytes: serde_json::to_vec(&run.ingest_summary)
+                .map_err(|error| error.to_string())?
+                .len(),
+            chunk_hits: 0,
+            node_hits: 0,
+        });
+        final_run = Some(run);
+    }
+
+    let final_run =
+        final_run.ok_or_else(|| "overgraph harness did not produce any samples".to_owned())?;
+    let steady_state = SteadyStateBenchmarkReport {
+        name: "overgraph_native_ingest".to_owned(),
+        summary: summarize_benchmark(benchmark_config, &samples),
+        samples,
+        note: Some(
+            "Each sample uses a fresh OverGraph store, ingests one corpus document, and verifies persisted state."
+                .to_owned(),
+        ),
+    };
+
+    Ok(OvergraphNativeHarnessReport {
+        generated_at: now_ms(),
+        benchmark_config: benchmark_config.clone(),
+        corpus_id: corpus.id,
+        title: corpus.title,
+        path: corpus.path,
+        input_bytes: corpus.bytes,
+        input_chars: corpus.text.chars().count(),
+        init_phase: final_run.init_phase,
+        ingest_phase: final_run.ingest_phase,
+        rebuild_phase: final_run.rebuild_phase,
+        persist_session_phase: final_run.persist_session_phase,
+        verify_phase: final_run.verify_phase,
+        ingest_summary: final_run.ingest_summary,
+        steady_state,
+        truth: final_run.truth,
+    })
+}
+
 pub fn write_suite_report(
     report: &PerfSuiteReport,
     out_dir: impl AsRef<Path>,
@@ -343,6 +460,24 @@ pub fn write_suite_report(
     let md_path = out_dir.join("latest-native.md");
     let json = serde_json::to_string_pretty(report).map_err(|error| error.to_string())?;
     let markdown = render_markdown(report);
+    fs::write(&json_path, json)
+        .map_err(|error| format!("failed to write {}: {error}", json_path.display()))?;
+    fs::write(&md_path, markdown)
+        .map_err(|error| format!("failed to write {}: {error}", md_path.display()))?;
+    Ok((json_path, md_path))
+}
+
+pub fn write_overgraph_native_report(
+    report: &OvergraphNativeHarnessReport,
+    out_dir: impl AsRef<Path>,
+) -> Result<(PathBuf, PathBuf), String> {
+    let out_dir = out_dir.as_ref();
+    fs::create_dir_all(out_dir)
+        .map_err(|error| format!("failed to create {}: {error}", out_dir.display()))?;
+    let json_path = out_dir.join("latest-overgraph-native.json");
+    let md_path = out_dir.join("latest-overgraph-native.md");
+    let json = serde_json::to_string_pretty(report).map_err(|error| error.to_string())?;
+    let markdown = render_overgraph_native_markdown(report);
     fs::write(&json_path, json)
         .map_err(|error| format!("failed to write {}: {error}", json_path.display()))?;
     fs::write(&md_path, markdown)
@@ -406,7 +541,10 @@ pub fn render_markdown(report: &PerfSuiteReport) -> String {
         ));
         if !corpus.steady_state.is_empty() {
             lines.push(String::new());
-            lines.push("| Benchmark | Iter | Min ms | P50 ms | P95 ms | Max ms | Peak delta MiB |".to_owned());
+            lines.push(
+                "| Benchmark | Iter | Min ms | P50 ms | P95 ms | Max ms | Peak delta MiB |"
+                    .to_owned(),
+            );
             lines.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_owned());
             for benchmark in &corpus.steady_state {
                 lines.push(format!(
@@ -427,6 +565,93 @@ pub fn render_markdown(report: &PerfSuiteReport) -> String {
     lines.join("\n")
 }
 
+pub fn render_overgraph_native_markdown(report: &OvergraphNativeHarnessReport) -> String {
+    let mut lines = vec![
+        "# Phoenix OverGraph Native Harness Report".to_owned(),
+        String::new(),
+        format!("Generated at: `{}`", report.generated_at),
+        format!("Corpus: `{}` from `{}`", report.corpus_id, report.path),
+        format!("Input bytes: `{}`", report.input_bytes),
+        format!(
+            "Benchmark iterations: `{}` with `{}` warmup iteration(s)",
+            report.steady_state.summary.iterations, report.benchmark_config.warmup_iterations
+        ),
+        String::new(),
+        "| Phase | Wall ms | Peak delta MiB | Output bytes |".to_owned(),
+        "| --- | ---: | ---: | ---: |".to_owned(),
+    ];
+
+    for phase in [
+        &report.init_phase,
+        &report.ingest_phase,
+        &report.rebuild_phase,
+        &report.persist_session_phase,
+        &report.verify_phase,
+    ] {
+        lines.push(format!(
+            "| {} | {} | {:.2} | {} |",
+            phase.name,
+            phase.wall_ms,
+            bytes_to_mib(phase.heap_peak_delta_bytes),
+            phase.output_bytes
+        ));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "| Benchmark | Iter | Min ms | P50 ms | P95 ms | Max ms | Peak delta MiB |".to_owned(),
+    );
+    lines.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: |".to_owned());
+    lines.push(format!(
+        "| {} | {} | {} | {} | {} | {} | {:.2} |",
+        report.steady_state.name,
+        report.steady_state.summary.iterations,
+        report.steady_state.summary.min_wall_ms,
+        report.steady_state.summary.p50_wall_ms,
+        report.steady_state.summary.p95_wall_ms,
+        report.steady_state.summary.max_wall_ms,
+        bytes_to_mib(report.steady_state.summary.max_peak_delta_bytes)
+    ));
+    lines.push(String::new());
+    lines.push("## Persistence Truth".to_owned());
+    lines.push(String::new());
+    lines.push(format!(
+        "- Manifest present: `{}`",
+        report.truth.manifest_present
+    ));
+    lines.push(format!("- Archive count: `{}`", report.truth.archive_count));
+    lines.push(format!(
+        "- Dirty scopes before rebuild: `{}`",
+        report.truth.dirty_scope_count_before_rebuild
+    ));
+    lines.push(format!(
+        "- Rebuilt scope count: `{}`",
+        report.truth.rebuilt_scope_count
+    ));
+    lines.push(format!(
+        "- Lexical span count: `{}`",
+        report.truth.lexical_span_count
+    ));
+    lines.push(format!(
+        "- Session archive present: `{}`",
+        report.truth.session_archive_present
+    ));
+    lines.push(format!(
+        "- Kernel checkpoint present: `{}`",
+        report.truth.kernel_checkpoint_present
+    ));
+    lines.push(format!(
+        "- Subsequent prepare has kernel snapshot: `{}`",
+        report.truth.subsequent_prepare_has_kernel_snapshot
+    ));
+    lines.push(format!(
+        "- Kernel generation: `{}`",
+        report.truth.kernel_generation
+    ));
+
+    lines.join("\n")
+}
+
 pub fn strict_check(report: &PerfSuiteReport) -> Result<(), String> {
     if report.total_failures == 0 {
         return Ok(());
@@ -438,6 +663,242 @@ pub fn strict_check(report: &PerfSuiteReport) -> Result<(), String> {
         }
     }
     Err(lines.join("\n"))
+}
+
+pub fn strict_check_overgraph_native(report: &OvergraphNativeHarnessReport) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if !report.truth.manifest_present {
+        failures.push("manifest was not reloaded from the OverGraph store".to_owned());
+    }
+    if report.truth.archive_count == 0 {
+        failures.push("no persisted archives were reloaded from the OverGraph store".to_owned());
+    }
+    if report.truth.dirty_scope_count_before_rebuild == 0 {
+        failures.push("ingest did not mark any scopes dirty".to_owned());
+    }
+    if report.truth.rebuilt_scope_count == 0 {
+        failures.push("dirty scope rebuild did not materialize any sidecars".to_owned());
+    }
+    if report.truth.lexical_span_count == 0 {
+        failures.push("lexical sidecar reload produced no spans".to_owned());
+    }
+    if !report.truth.session_archive_present {
+        failures.push("session archive was not reloaded from the OverGraph store".to_owned());
+    }
+    if !report.truth.kernel_checkpoint_present {
+        failures.push("kernel checkpoint was not present in the OverGraph store".to_owned());
+    }
+    if !report.truth.subsequent_prepare_has_kernel_snapshot {
+        failures
+            .push("subsequent prepare_ingest_context did not receive a kernel snapshot".to_owned());
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let mut lines = vec!["Phoenix OverGraph native harness failed strict checks:".to_owned()];
+    lines.extend(failures);
+    Err(lines.join("\n"))
+}
+
+fn select_overgraph_corpus(corpus_filter: Option<&str>) -> Result<CorpusDocument, String> {
+    let target = corpus_filter.unwrap_or("perfect_run");
+    load_standard_corpus()?
+        .into_iter()
+        .find(|corpus| corpus.id == target)
+        .ok_or_else(|| format!("no corpus matched filter: {target}"))
+}
+
+fn run_overgraph_native_harness_once(
+    corpus: &CorpusDocument,
+    sample_ix: usize,
+    warmup: bool,
+) -> Result<OvergraphNativeHarnessRun, String> {
+    let store_path = unique_overgraph_store_path(&corpus.id, sample_ix, warmup);
+    let created_at = now_ms();
+    let document = IngestDocument {
+        document_id: DocumentId(format!("overgraph-{}-{}", corpus.id, sample_ix)),
+        note_id: None,
+        title: corpus.title.clone(),
+        text: corpus.text.clone(),
+        scope: ScopeKey::default(),
+    };
+    let session_id = SessionId(format!("overgraph-session-{}-{}", corpus.id, sample_ix));
+
+    let run = (|| {
+        let (store, init_phase) = measure_phase("init_overgraph_store", || {
+            let store =
+                PhoenixOvergraphStore::open_with_tuning(&store_path, overgraph_harness_tuning())
+                    .map_err(|error| error.to_string())?;
+            store
+                .init_archive_schema()
+                .map_err(|error| error.to_string())?;
+            store
+                .init_graph_kernel_schema()
+                .map_err(|error| error.to_string())?;
+            store
+                .write_kernel_checkpoint(1, "seed", &KernelGraphSnapshot::default())
+                .map_err(|error| error.to_string())?;
+            Ok(store)
+        })?;
+        let engine = PhoenixInvarantV3::default();
+
+        let ((ingest_summary, artifacts), ingest_phase) =
+            measure_phase("overgraph_native_ingest", || {
+                engine
+                    .ingest_documents_native(
+                        &store,
+                        Some(&session_id),
+                        &[document.clone()],
+                        0,
+                        created_at,
+                    )
+                    .map_err(|error| error.to_string())
+            })?;
+
+        let dirty_scope_count_before_rebuild = store
+            .list_dirty_scopes()
+            .map_err(|error| error.to_string())?
+            .len();
+
+        let (rebuilt_scope_count, rebuild_phase) = measure_phase("rebuild_scope_sidecars", || {
+            store
+                .rebuild_dirty_scope_sidecars(created_at + 1)
+                .map_err(|error| error.to_string())
+        })?;
+
+        let graph_vertex_count = artifacts
+            .document_manifests
+            .iter()
+            .map(|manifest| manifest.graph_vertex_count)
+            .sum();
+        let graph_edge_count = artifacts
+            .document_manifests
+            .iter()
+            .map(|manifest| manifest.graph_edge_count)
+            .sum();
+        let session_summary = engine.merge_session_summary(
+            None,
+            session_id.clone(),
+            artifacts.session_documents.clone(),
+            artifacts.document_refs.clone(),
+            artifacts.span_count,
+            artifacts.discovery_candidate_count,
+            graph_vertex_count,
+            graph_edge_count,
+            created_at,
+        );
+
+        let (_, persist_session_phase) = measure_phase("persist_session_archive", || {
+            engine
+                .persist_session_summary_native(&store, &session_summary, 1, created_at)
+                .map_err(|error| error.to_string())
+        })?;
+
+        let document_ref = artifacts
+            .document_refs
+            .first()
+            .cloned()
+            .ok_or_else(|| "native ingest did not emit a document revision ref".to_owned())?;
+
+        let (truth, verify_phase) = measure_phase("verify_persistence_truth", || {
+            let manifest_present = store
+                .load_document_manifest(&document_ref)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let archive_count = engine
+                .load_latest_document_archives_native(&store, Some(&ScopeKey::default()))
+                .map_err(|error| error.to_string())?
+                .len();
+            let lexical_span_count = engine
+                .load_latest_lex_spans_native(&store, Some(&ScopeKey::default()))
+                .map_err(|error| error.to_string())?
+                .len();
+            let session_archive_present = engine
+                .load_latest_session_summary_native(&store, &session_id)
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let kernel_checkpoint_present = store
+                .load_kernel_checkpoint()
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let subsequent_prepare_has_kernel_snapshot = store
+                .prepare_ingest_context(Some(&session_id), &[document.clone()], 1)
+                .map_err(|error| error.to_string())?
+                .kernel_snapshot
+                .is_some();
+            let kernel_generation = store
+                .kernel_current_generation()
+                .map_err(|error| error.to_string())?;
+
+            Ok::<_, String>(OvergraphNativeTruthReport {
+                manifest_present,
+                archive_count,
+                dirty_scope_count_before_rebuild,
+                rebuilt_scope_count,
+                lexical_span_count,
+                session_archive_present,
+                kernel_checkpoint_present,
+                subsequent_prepare_has_kernel_snapshot,
+                kernel_generation,
+            })
+        })?;
+
+        Ok::<_, String>(OvergraphNativeHarnessRun {
+            init_phase,
+            ingest_phase: PhaseReport {
+                output_bytes: serde_json::to_vec(&ingest_summary)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                ..ingest_phase
+            },
+            rebuild_phase: PhaseReport {
+                output_bytes: rebuilt_scope_count.to_string().len(),
+                ..rebuild_phase
+            },
+            persist_session_phase: PhaseReport {
+                output_bytes: serde_json::to_vec(&session_summary)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                ..persist_session_phase
+            },
+            verify_phase: PhaseReport {
+                output_bytes: serde_json::to_vec(&truth)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                ..verify_phase
+            },
+            ingest_summary,
+            truth,
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&store_path);
+    run
+}
+
+fn unique_overgraph_store_path(corpus_id: &str, sample_ix: usize, warmup: bool) -> PathBuf {
+    let kind = if warmup { "warmup" } else { "sample" };
+    env::temp_dir().join(format!(
+        "phoenix-overgraph-harness-{corpus_id}-{kind}-{sample_ix}-{}",
+        now_ms()
+    ))
+}
+
+fn overgraph_harness_tuning() -> OvergraphTuning {
+    OvergraphTuning {
+        memtable_flush_threshold: 256 * 1024 * 1024,
+        memtable_hard_cap_bytes: 1024 * 1024 * 1024,
+        max_immutable_memtables: 8,
+        compact_after_n_flushes: 8,
+        wal_sync_mode: WalSyncMode::GroupCommit {
+            interval_ms: 100,
+            soft_trigger_bytes: 8 * 1024 * 1024,
+            hard_cap_bytes: 64 * 1024 * 1024,
+        },
+        edge_uniqueness: false,
+        ingest_mode: IngestMode::BulkBuild,
+    }
 }
 
 fn run_corpus_suite(
@@ -671,7 +1132,9 @@ fn run_corpus_suite(
         &selected_queries,
     )?;
 
-    let relation_counts = runtime.relation_counts().map_err(|error| error.to_string())?;
+    let relation_counts = runtime
+        .relation_counts()
+        .map_err(|error| error.to_string())?;
     let session_stats = CorpusStatsSnapshot {
         document_count: stats.document_count,
         chapter_count: stats.chapter_count,
@@ -824,7 +1287,14 @@ fn run_steady_state_benchmarks(
     benchmarks.push(run_benchmark(
         "lexical_query_steady",
         benchmark_config,
-        || run_query_workload(runtime, session_id, &selected_queries.lexical, &lexical_targets),
+        || {
+            run_query_workload(
+                runtime,
+                session_id,
+                &selected_queries.lexical,
+                &lexical_targets,
+            )
+        },
     )?);
 
     benchmarks.push(run_benchmark(
@@ -929,7 +1399,10 @@ fn summarize_benchmark(config: &BenchmarkConfig, samples: &[BenchmarkSample]) ->
     if samples.is_empty() {
         return BenchmarkSummary::default();
     }
-    let mut walls = samples.iter().map(|sample| sample.wall_ms).collect::<Vec<_>>();
+    let mut walls = samples
+        .iter()
+        .map(|sample| sample.wall_ms)
+        .collect::<Vec<_>>();
     walls.sort_unstable();
     let total_wall = walls.iter().copied().sum::<u64>();
     BenchmarkSummary {
@@ -1230,10 +1703,7 @@ fn measure_phase<T>(
             bytes_to_mib(phase.heap_peak_delta_bytes)
         );
     }
-    Ok((
-        value,
-        phase,
-    ))
+    Ok((value, phase))
 }
 
 fn excerpt_text(text: &str, target_bytes: usize) -> String {
@@ -1451,6 +1921,10 @@ mod tests {
             .iter()
             .find(|corpus| corpus.corpus_id == "perfect_run")
             .expect("perfect_run corpus");
-        assert!(corpus.budget_check.passed, "{:?}", corpus.budget_check.failures);
+        assert!(
+            corpus.budget_check.passed,
+            "{:?}",
+            corpus.budget_check.failures
+        );
     }
 }

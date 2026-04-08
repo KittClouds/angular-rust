@@ -192,13 +192,22 @@ fn semantic_node_record(
             .attribution
             .as_ref()
             .and_then(|frame| frame.source_entity_id.clone()),
-        quoted: proposition.quote.is_some() || proposition.attribution.is_some(),
+        quoted: proposition_is_quoted(proposition),
         negative: proposition
             .scope_ops
             .iter()
             .any(|scope| scope.polarity.as_deref() == Some("negative")),
         evidence: proposition.evidence.iter().take(2).cloned().collect(),
     }
+}
+
+fn proposition_is_quoted(proposition: &Proposition) -> bool {
+    proposition.quote.is_some()
+        || proposition
+            .attribution
+            .as_ref()
+            .and_then(|frame| frame.quote_range)
+            .is_some()
 }
 
 fn nearest_nodes<'a>(

@@ -1,0 +1,14 @@
+{
+  "forward": {
+    "contradiction": 0.002409754,
+    "entailment": 0.9910624,
+    "neutral": 0.0065277973
+  },
+  "reverse": {
+    "contradiction": 0.00019046996,
+    "entailment": 0.9979328,
+    "neutral": 0.0018767175
+  },
+  "usedReverse": true,
+  "bestHypothesis": "Ryan is employed by Dynamis."
+}

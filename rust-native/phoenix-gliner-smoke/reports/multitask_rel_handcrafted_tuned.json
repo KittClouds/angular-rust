@@ -1,0 +1,66 @@
+﻿{
+  "threshold": 0.35,
+  "relationThreshold": 0.35,
+  "warmRuns": 1,
+  "inputMode": "full-document",
+  "seedModel": "gliner-x-small",
+  "labels": [
+    "person",
+    "organization",
+    "location",
+    "event",
+    "item",
+    "concept"
+  ],
+  "relationLabels": [
+    "protects",
+    "member_of",
+    "serves",
+    "commands",
+    "located_in",
+    "works_for"
+  ],
+  "loadMs": 8740,
+  "warmMsRuns": [
+    983
+  ],
+  "warmMsAvg": 983.0,
+  "textCount": 1,
+  "entityCount": 9,
+  "relationCount": 4,
+  "entityLabelCounts": {
+    "location": 3,
+    "organization": 3,
+    "person": 3
+  },
+  "relationLabelCounts": {
+    "located_in": 2,
+    "protects": 1,
+    "serves": 1
+  },
+  "sequences": [
+    {
+      "sequence": 0,
+      "textPreview": "﻿Ryan joined Dynamis in New Rome. Augustus commanded Vulcan in Rust Town. Wyvern caused chaos in Campania while Renesco worked for Il Migliore.",
+      "entityCount": 9,
+      "relationCount": 4,
+      "entities": [
+        "Augustus [person] (0.825)",
+        "Campania [location] (0.913)",
+        "Dynamis [organization] (0.889)",
+        "Il Migliore [organization] (0.784)",
+        "New Rome [location] (0.893)",
+        "Renesco [person] (0.786)",
+        "Rust Town [location] (0.902)",
+        "Ryan [person] (0.671)",
+        "Vulcan [organization] (0.730)"
+      ],
+      "relations": [
+        "Augustus --protects--> Vulcan (0.564)",
+        "Dynamis --located_in--> New Rome (0.630)",
+        "Vulcan --located_in--> Rust Town (0.540)",
+        "Vulcan --serves--> Dynamis (0.603)"
+      ]
+    }
+  ]
+}

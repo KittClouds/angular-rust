@@ -1,0 +1,668 @@
+﻿[
+  {
+    "scopeKey": "__global__::__global__::__global__::__global__",
+    "reviewCaseCount": 30,
+    "windowCount": 11,
+    "persistedRelationCount": 446,
+    "entityProfileCount": 291,
+    "nativeRelationTypeCounts": {},
+    "proposedRelationCounts": {},
+    "decisionCounts": {
+      "reject": 30
+    },
+    "archives": [
+      {
+        "documentId": "er-post-shortrun",
+        "sentenceCount": 0,
+        "chunkCount": 355,
+        "entityCount": 291,
+        "resolvedMentionCount": 0,
+        "relationCandidateCount": 0,
+        "persistedRelationCount": 536
+      }
+    ],
+    "windows": [
+      {
+        "windowId": "er-post-shortrun::1::chunk::5",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::quicksave:Quicksave"
+        ],
+        "textPreview": "He even glimpsed the famous Colosseum Maximus, a modern replica of the old world’s Colosseum. This district truly deserved its name of the Golden Coast. Ryan himself attracted a fe..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::8",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::driving:Driving",
+          "er-post-shortrun::ryan:Ryan"
+        ],
+        "textPreview": "‘Want to be as strong as Wyvern? With our Hercules Elixir, what Hercules did in twelve labors, you will do in an afternoon!’ ‘One hundred thousand euros, only at Dynamis!’ Meh, eve..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::33",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::security:Security",
+          "er-post-shortrun::quicksave:Quicksave"
+        ],
+        "textPreview": "“The guy on the floor tried to attack us, the other weirdo came to help.” “You have a license?” one of the security guards asked Ryan, who shook his head. “You’re a vigilante? An A..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::len:Len",
+          "er-post-shortrun::new_rome:New Rome",
+          "er-post-shortrun::renesco:Renesco"
+        ],
+        "textPreview": "The job was just an excuse to travel across Italy, looking for new adventures. Though he had put his endless wandering on hold, once he heard Len might be in New Rome. From what Re..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::78",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ghoul:Ghoul",
+          "er-post-shortrun::quicksave:Quicksave",
+          "er-post-shortrun::private_security:Private Security",
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::wyvern:Wyvern"
+        ],
+        "textPreview": "Bouncers formed a security perimeter around them, to allow them some privacy. “Ghoul escaped,” Zanbato told Quicksave. “A mole in the Private Security told us his pals bust him out..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::106",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::luigi:Luigi"
+        ],
+        "textPreview": "“They are pisto-gauntlets, but they aren’t any pisto-gauntlets,” Ryan boasted at Luigi, as he put his gloves on and showed them off. “I call them The Fisty Brothers because they fi..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::125",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ghoul:Ghoul",
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::fisty:Fisty",
+          "er-post-shortrun::psycho:Psycho"
+        ],
+        "textPreview": "Not understanding the concept of personal space, Ghoul kept trying to nail Ryan with his blade and received a punch in the stomach for his trouble. Fisty activated on contact, the ..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::133",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ghoul:Ghoul",
+          "er-post-shortrun::psycho:Psycho",
+          "er-post-shortrun::ryan:Ryan"
+        ],
+        "textPreview": "So it must have been very frustrating for these two. “Stop it!” By now, Ghoul fumed so much that it became difficult to see through the white mist surrounding him. The whole harbor..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::187",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::wyvern:Wyvern",
+          "er-post-shortrun::dynamis:Dynamis",
+          "er-post-shortrun::mmm:Mmm",
+          "er-post-shortrun::len:Len",
+          "er-post-shortrun::the_augusti:The Augusti"
+        ],
+        "textPreview": "When the Genome exited the Bakuto, all the locals were fighting over the bills, the woman included. Even the bouncers and the staff tried to grab a fistful. Ignoring the chaos he s..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::188",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::the_augusti:The Augusti",
+          "er-post-shortrun::ryan:Ryan",
+          "er-post-shortrun::genius:Genius",
+          "er-post-shortrun::rust_town:Rust Town",
+          "er-post-shortrun::chapter:Chapter"
+        ],
+        "textPreview": "When the Genome exited the Bakuto, all the locals were fighting over the bills, the woman included. Even the bouncers and the staff tried to grab a fistful. Ignoring the chaos he s..."
+      },
+      {
+        "windowId": "er-post-shortrun::1::chunk::193",
+        "documentId": "er-post-shortrun",
+        "candidateRelationTypes": [],
+        "entities": [
+          "er-post-shortrun::dynamis:Dynamis",
+          "er-post-shortrun::new_rome:New Rome",
+          "er-post-shortrun::wyvern:Wyvern",
+          "er-post-shortrun::private_security:Private Security",
+          "er-post-shortrun::ghoul:Ghoul",
+          "er-post-shortrun::ryan:Ryan"
+        ],
+        "textPreview": "“Enrique Manada, manager of the superhero team, stated that ‘as long as Dynamis remains strong, warlords and madmen will never gain a foothold in New Rome.’” At least warning Wyver..."
+      }
+    ],
+    "cases": [
+      {
+        "caseId": "er-post-shortrun::1::5::er-post-shortrun::quicksave::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::5",
+        "source": "Quicksave",
+        "target": "Ryan",
+        "seedScoreMillis": 991,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:69",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::5::er-post-shortrun::ryan::er-post-shortrun::quicksave",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::5",
+        "source": "Ryan",
+        "target": "Quicksave",
+        "seedScoreMillis": 991,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:69",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::8::er-post-shortrun::driving::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::8",
+        "source": "Driving",
+        "target": "Ryan",
+        "seedScoreMillis": 1005,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:58",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::8::er-post-shortrun::ryan::er-post-shortrun::driving",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::8",
+        "source": "Ryan",
+        "target": "Driving",
+        "seedScoreMillis": 1005,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:58",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::33::er-post-shortrun::security::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::33",
+        "source": "Security",
+        "target": "Ryan",
+        "seedScoreMillis": 1062,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:27",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::41::er-post-shortrun::len::er-post-shortrun::new_rome",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "source": "Len",
+        "target": "New Rome",
+        "seedScoreMillis": 1097,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:13",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::41::er-post-shortrun::len::er-post-shortrun::renesco",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "source": "Len",
+        "target": "Renesco",
+        "seedScoreMillis": 1049,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:33",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::41::er-post-shortrun::new_rome::er-post-shortrun::len",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "source": "New Rome",
+        "target": "Len",
+        "seedScoreMillis": 1097,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:13",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::41::er-post-shortrun::new_rome::er-post-shortrun::renesco",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "source": "New Rome",
+        "target": "Renesco",
+        "seedScoreMillis": 1101,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:12",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::41::er-post-shortrun::renesco::er-post-shortrun::len",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "source": "Renesco",
+        "target": "Len",
+        "seedScoreMillis": 1049,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:33",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::41::er-post-shortrun::renesco::er-post-shortrun::new_rome",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::41",
+        "source": "Renesco",
+        "target": "New Rome",
+        "seedScoreMillis": 1101,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:12",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::78::er-post-shortrun::ghoul::er-post-shortrun::private_security",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::78",
+        "source": "Ghoul",
+        "target": "Private Security",
+        "seedScoreMillis": 1009,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:54",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::78::er-post-shortrun::private_security::er-post-shortrun::ghoul",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::78",
+        "source": "Private Security",
+        "target": "Ghoul",
+        "seedScoreMillis": 1009,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:54",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::78::er-post-shortrun::private_security::er-post-shortrun::quicksave",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::78",
+        "source": "Private Security",
+        "target": "Quicksave",
+        "seedScoreMillis": 1081,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:19",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::78::er-post-shortrun::quicksave::er-post-shortrun::private_security",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::78",
+        "source": "Quicksave",
+        "target": "Private Security",
+        "seedScoreMillis": 1081,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:19",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::106::er-post-shortrun::luigi::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::106",
+        "source": "Luigi",
+        "target": "Ryan",
+        "seedScoreMillis": 1104,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:12",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::106::er-post-shortrun::ryan::er-post-shortrun::luigi",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::106",
+        "source": "Ryan",
+        "target": "Luigi",
+        "seedScoreMillis": 1104,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:12",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::125::er-post-shortrun::fisty::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::125",
+        "source": "Fisty",
+        "target": "Ryan",
+        "seedScoreMillis": 991,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:69",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::125::er-post-shortrun::ryan::er-post-shortrun::fisty",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::125",
+        "source": "Ryan",
+        "target": "Fisty",
+        "seedScoreMillis": 991,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:69",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::133::er-post-shortrun::psycho::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::133",
+        "source": "Psycho",
+        "target": "Ryan",
+        "seedScoreMillis": 1047,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:34",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::133::er-post-shortrun::ryan::er-post-shortrun::psycho",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::133",
+        "source": "Ryan",
+        "target": "Psycho",
+        "seedScoreMillis": 1047,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:34",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::187::er-post-shortrun::dynamis::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::187",
+        "source": "Dynamis",
+        "target": "Ryan",
+        "seedScoreMillis": 1026,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:45",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::187::er-post-shortrun::ryan::er-post-shortrun::dynamis",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::187",
+        "source": "Ryan",
+        "target": "Dynamis",
+        "seedScoreMillis": 1026,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:45",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::187::er-post-shortrun::ryan::er-post-shortrun::wyvern",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::187",
+        "source": "Ryan",
+        "target": "Wyvern",
+        "seedScoreMillis": 1104,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:12",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::187::er-post-shortrun::wyvern::er-post-shortrun::ryan",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::187",
+        "source": "Wyvern",
+        "target": "Ryan",
+        "seedScoreMillis": 1104,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:12",
+          "name_quality:0.90",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::188::er-post-shortrun::genius::er-post-shortrun::rust_town",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::188",
+        "source": "Genius",
+        "target": "Rust Town",
+        "seedScoreMillis": 1011,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:52",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::188::er-post-shortrun::genius::er-post-shortrun::the_augusti",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::188",
+        "source": "Genius",
+        "target": "The Augusti",
+        "seedScoreMillis": 1002,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:59",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::188::er-post-shortrun::rust_town::er-post-shortrun::genius",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::188",
+        "source": "Rust Town",
+        "target": "Genius",
+        "seedScoreMillis": 1011,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:52",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::188::er-post-shortrun::the_augusti::er-post-shortrun::genius",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::188",
+        "source": "The Augusti",
+        "target": "Genius",
+        "seedScoreMillis": 1002,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:59",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      },
+      {
+        "caseId": "er-post-shortrun::1::193::er-post-shortrun::dynamis::er-post-shortrun::new_rome",
+        "documentId": "er-post-shortrun",
+        "windowId": "er-post-shortrun::1::chunk::193",
+        "source": "Dynamis",
+        "target": "New Rome",
+        "seedScoreMillis": 990,
+        "decisionStatus": "relation_reject",
+        "seedEvidence": [
+          "char_distance:67",
+          "name_quality:0.89",
+          "sentence_window_radius:1",
+          "continuity_bonus:100"
+        ],
+        "topRelation": null,
+        "topConfidence": null
+      }
+    ]
+  }
+]

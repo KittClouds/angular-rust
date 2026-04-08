@@ -1,0 +1,18 @@
+[package]
+name = "phoenix-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+phoenix-alex = { path = "../phoenix-alex" }
+phoenix-causal-post = { path = "../phoenix-causal-post" }
+phoenix-chunker = { path = "../phoenix-chunker" }
+phoenix-er-post = { path = "../phoenix-er-post" }
+phoenix-memory-post = { path = "../phoenix-memory-post" }
+phoenix-rel-post = { path = "../phoenix-rel-post" }
+phoenix-store-native-core = { path = "../phoenix-store-native-core" }
+phoenix-types = { path = "../phoenix-types" }
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,525 @@
+﻿{
+    "timestamp":  "20260407-194750",
+    "storePath":  "C:\\Users\\shuga\\AppData\\Local\\Temp\\phoenix-er-post-smoke-shortrun-1775605671715",
+    "targetDir":  "G:\\phoenix-target-overgraph",
+    "modelRoot":  "G:\\phoenix-models\\glirel-large-v0",
+    "er":  {
+               "storePath":  "C:\\Users\\shuga\\AppData\\Local\\Temp\\phoenix-er-post-smoke-shortrun-1775605671715",
+               "sessionId":  null,
+               "seed":  {
+                            "seeded":  true,
+                            "corpusId":  "shortrun",
+                            "storePath":  "C:\\Users\\shuga\\AppData\\Local\\Temp\\phoenix-er-post-smoke-shortrun-1775605671715",
+                            "dirtyScopeCount":  1
+                        },
+               "aggregate":  {
+                                 "scopeCount":  1,
+                                 "caseCount":  1,
+                                 "casesWithCandidates":  1,
+                                 "totalCandidateCount":  1,
+                                 "averageCandidatesPerCase":  1.0,
+                                 "embeddingCasesWithCandidates":  0,
+                                 "embeddingTotalCandidateCount":  0,
+                                 "embeddingAverageCandidatesPerCase":  0.0,
+                                 "fusedCasesWithCandidates":  1,
+                                 "fusedTotalCandidateCount":  1,
+                                 "fusedAverageCandidatesPerCase":  1.0,
+                                 "additionalCasesCovered":  0,
+                                 "additionalCandidates":  0,
+                                 "aliasCaseCount":  1,
+                                 "aliasExactHitCount":  1,
+                                 "aliasExactHitRate":  1.0,
+                                 "typeDisagreementCaseCount":  0,
+                                 "typeDisagreementRescueCount":  0,
+                                 "typeDisagreementRescueRate":  0.0,
+                                 "unresolvedCaseCount":  0,
+                                 "ambiguousCaseCount":  0,
+                                 "unresolvedOrAmbiguousCaseCount":  0,
+                                 "unresolvedOrAmbiguousCoveredCount":  0,
+                                 "unresolvedOrAmbiguousCoverageRate":  0.0,
+                                 "decisionCounts":  {
+                                                        "confirm_alias":  1
+                                                    }
+                             },
+               "scopes":  [
+                              {
+                                  "scopeKey":  "__global__::__global__::__global__::__global__",
+                                  "sessionId":  "er-post-session-shortrun",
+                                  "documentRefCount":  0,
+                                  "reviewCaseCount":  1,
+                                  "entityProfileCount":  291,
+                                  "lexicalSummary":  {
+                                                         "caseCount":  1,
+                                                         "matchedCaseCount":  1,
+                                                         "totalCandidateCount":  1,
+                                                         "exactMatchCaseCount":  1,
+                                                         "tokenOverlapCaseCount":  1
+                                                     },
+                                  "embeddingSummary":  null,
+                                  "fusedSummary":  {
+                                                       "caseCount":  1,
+                                                       "matchedCaseCount":  1,
+                                                       "totalCandidateCount":  1,
+                                                       "exactMatchCaseCount":  1,
+                                                       "embeddingOnlyCaseCount":  0
+                                                   },
+                                  "metrics":  {
+                                                  "caseCount":  1,
+                                                  "casesWithCandidates":  1,
+                                                  "totalCandidateCount":  1,
+                                                  "averageCandidatesPerCase":  1.0,
+                                                  "aliasCaseCount":  1,
+                                                  "aliasExactHitCount":  1,
+                                                  "aliasExactHitRate":  1.0,
+                                                  "typeDisagreementCaseCount":  0,
+                                                  "typeDisagreementRescueCount":  0,
+                                                  "typeDisagreementRescueRate":  0.0,
+                                                  "unresolvedCaseCount":  0,
+                                                  "ambiguousCaseCount":  0,
+                                                  "unresolvedOrAmbiguousCaseCount":  0,
+                                                  "unresolvedOrAmbiguousCoveredCount":  0,
+                                                  "unresolvedOrAmbiguousCoverageRate":  0.0
+                                              },
+                                  "retrieval":  {
+                                                    "caseCount":  1,
+                                                    "lexicalCasesWithCandidates":  1,
+                                                    "lexicalTotalCandidateCount":  1,
+                                                    "lexicalAverageCandidatesPerCase":  1.0,
+                                                    "lexicalAliasExactHitRate":  1.0,
+                                                    "lexicalTypeDisagreementRescueRate":  0.0,
+                                                    "lexicalUnresolvedOrAmbiguousCoverageRate":  0.0,
+                                                    "unionCasesWithCandidates":  1,
+                                                    "unionTotalCandidateCount":  1,
+                                                    "unionAverageCandidatesPerCase":  1.0,
+                                                    "unionAliasExactHitRate":  1.0,
+                                                    "unionTypeDisagreementRescueRate":  0.0,
+                                                    "unionUnresolvedOrAmbiguousCoverageRate":  0.0,
+                                                    "additionalCasesCovered":  0,
+                                                    "additionalCandidates":  0
+                                                },
+                                  "decisionCounts":  {
+                                                         "confirm_alias":  1
+                                                     },
+                                  "decisions":  [
+                                                    {
+                                                        "caseId":  "er-post-shortrun::alias::mention::er-post-shortrun:2480",
+                                                        "kind":  "confirmAlias",
+                                                        "entityId":  "er-post-shortrun::leo_hargraves",
+                                                        "patchedKind":  null,
+                                                        "scoreMillis":  2550,
+                                                        "rationale":  "exact alias matched existing entity",
+                                                        "evidence":  [
+                                                                         "exact_canonical:Leo Hargraves",
+                                                                         "exact_alias:leo hargraves",
+                                                                         "token_overlap:hargraves,leo",
+                                                                         "blocking_overlap:token:hargraves,token:leo",
+                                                                         "native_candidate_overlap",
+                                                                         "current_resolution_overlap"
+                                                                     ]
+                                                    }
+                                                ],
+                                  "caseSummaries":  [
+                                                        {
+                                                            "caseId":  "er-post-shortrun::alias::mention::er-post-shortrun:2480",
+                                                            "kind":  "alias",
+                                                            "surface":  "Leo Hargraves",
+                                                            "normalizedSurface":  "leo hargraves",
+                                                            "documentId":  "er-post-shortrun",
+                                                            "decisionStatus":  "alias_confirmed",
+                                                            "mentionKind":  null,
+                                                            "resolvedEntityId":  "er-post-shortrun::leo_hargraves",
+                                                            "lexicalCandidateCount":  1,
+                                                            "embeddingCandidateCount":  0,
+                                                            "fusedCandidateCount":  1,
+                                                            "topCandidate":  {
+                                                                                 "entityId":  "er-post-shortrun::leo_hargraves",
+                                                                                 "source":  "lexical",
+                                                                                 "scoreMillis":  2550,
+                                                                                 "evidence":  [
+                                                                                                  "exact_canonical:Leo Hargraves",
+                                                                                                  "exact_alias:leo hargraves",
+                                                                                                  "token_overlap:hargraves,leo",
+                                                                                                  "blocking_overlap:token:hargraves,token:leo",
+                                                                                                  "native_candidate_overlap",
+                                                                                                  "current_resolution_overlap"
+                                                                                              ]
+                                                                             },
+                                                            "topEmbeddingCandidate":  null,
+                                                            "topFusedCandidate":  {
+                                                                                      "entityId":  "er-post-shortrun::leo_hargraves",
+                                                                                      "source":  "lexical",
+                                                                                      "scoreMillis":  2550,
+                                                                                      "evidence":  [
+                                                                                                       "exact_canonical:Leo Hargraves",
+                                                                                                       "exact_alias:leo hargraves",
+                                                                                                       "token_overlap:hargraves,leo",
+                                                                                                       "blocking_overlap:token:hargraves,token:leo",
+                                                                                                       "native_candidate_overlap",
+                                                                                                       "current_resolution_overlap"
+                                                                                                   ]
+                                                                                  },
+                                                            "topCandidateExact":  true,
+                                                            "topCandidateKindMatch":  false
+                                                        }
+                                                    ]
+                              }
+                          ]
+           },
+    "relation":  {
+                     "value":  [
+                                   {
+                                       "scopeKey":  "__global__::__global__::__global__::__global__",
+                                       "reviewCaseCount":  0,
+                                       "windowCount":  0,
+                                       "seededPairCount":  0,
+                                       "persistedRelationCount":  446,
+                                       "entityProfileCount":  291,
+                                       "nativeRelationTypeCounts":  {
+
+                                                                    },
+                                       "proposedRelationCounts":  {
+
+                                                                  },
+                                       "decisionCounts":  {
+
+                                                          },
+                                       "supportJudgmentCount":  0,
+                                       "contradictionJudgmentCount":  0,
+                                       "windowSourceCounts":  {
+
+                                                              },
+                                       "anchorEvidenceCounts":  {
+
+                                                                },
+                                       "familiesPerWindow":  {
+
+                                                             },
+                                       "rejectedWindowReasonCounts":  {
+                                                                          "anchor_density":  25,
+                                                                          "empty_text":  4,
+                                                                          "no_family_support":  622,
+                                                                          "structural":  3,
+                                                                          "too_few_entities":  2423
+                                                                      },
+                                       "archives":  [
+                                                        {
+                                                            "documentId":  "er-post-shortrun",
+                                                            "sentenceCount":  0,
+                                                            "chunkCount":  355,
+                                                            "entityCount":  291,
+                                                            "resolvedMentionCount":  0,
+                                                            "relationCandidateCount":  0,
+                                                            "persistedRelationCount":  536
+                                                        }
+                                                    ],
+                                       "windows":  [
+
+                                                   ],
+                                       "cases":  [
+
+                                                 ]
+                                   }
+                               ],
+                     "Count":  1
+                 },
+    "memoryBefore":  {
+                         "value":  [
+                                       {
+                                           "scopeKey":  "__global__::__global__::__global__::__global__",
+                                           "claimCount":  536,
+                                           "eventCount":  0,
+                                           "stateCount":  0,
+                                           "deltaCount":  0,
+                                           "conflictCount":  0,
+                                           "gapCount":  873,
+                                           "entityCardCount":  291,
+                                           "relationshipLedgerCount":  0,
+                                           "activeSlotCounts":  {
+
+                                                                },
+                                           "unresolvedGapCounts":  {
+                                                                       "missingcurrentvalue":  873
+                                                                   },
+                                           "sourceClassCounts":  {
+                                                                     "archive_relation":  536
+                                                                 },
+                                           "statusCounts":  {
+                                                                "candidate":  536
+                                                            },
+                                           "cards":  [
+                                                         {
+                                                             "entityId":  "er-post-shortrun::abomb",
+                                                             "canonicalName":  "A-bomb",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  "Character",
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::abombs",
+                                                             "canonicalName":  "A-bombs",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  "Character",
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::adam",
+                                                             "canonicalName":  "him",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  null,
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::add",
+                                                             "canonicalName":  "you",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  null,
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::adventure",
+                                                             "canonicalName":  "Adventure",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  "Character",
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::alchemist",
+                                                             "canonicalName":  "Alchemist",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  "Character",
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::all_psychos",
+                                                             "canonicalName":  "she",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  null,
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         },
+                                                         {
+                                                             "entityId":  "er-post-shortrun::alright",
+                                                             "canonicalName":  "Alright",
+                                                             "aliases":  [
+
+                                                                         ],
+                                                             "effectiveKind":  "Character",
+                                                             "currentState":  {
+
+                                                                              },
+                                                             "recentDeltaCount":  0,
+                                                             "activeRelationshipCount":  0,
+                                                             "activeConflictCount":  0,
+                                                             "openGapCount":  3
+                                                         }
+                                                     ]
+                                       }
+                                   ],
+                         "Count":  1
+                     },
+    "memoryAfter":  {
+                        "value":  [
+                                      {
+                                          "scopeKey":  "__global__::__global__::__global__::__global__",
+                                          "claimCount":  536,
+                                          "eventCount":  0,
+                                          "stateCount":  0,
+                                          "deltaCount":  0,
+                                          "conflictCount":  0,
+                                          "gapCount":  873,
+                                          "entityCardCount":  291,
+                                          "relationshipLedgerCount":  0,
+                                          "activeSlotCounts":  {
+
+                                                               },
+                                          "unresolvedGapCounts":  {
+                                                                      "missingcurrentvalue":  873
+                                                                  },
+                                          "sourceClassCounts":  {
+                                                                    "archive_relation":  536
+                                                                },
+                                          "statusCounts":  {
+                                                               "candidate":  536
+                                                           },
+                                          "cards":  [
+                                                        {
+                                                            "entityId":  "er-post-shortrun::abomb",
+                                                            "canonicalName":  "A-bomb",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  "Character",
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::abombs",
+                                                            "canonicalName":  "A-bombs",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  "Character",
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::adam",
+                                                            "canonicalName":  "him",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  null,
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::add",
+                                                            "canonicalName":  "you",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  null,
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::adventure",
+                                                            "canonicalName":  "Adventure",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  "Character",
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::alchemist",
+                                                            "canonicalName":  "Alchemist",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  "Character",
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::all_psychos",
+                                                            "canonicalName":  "she",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  null,
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        },
+                                                        {
+                                                            "entityId":  "er-post-shortrun::alright",
+                                                            "canonicalName":  "Alright",
+                                                            "aliases":  [
+
+                                                                        ],
+                                                            "effectiveKind":  "Character",
+                                                            "currentState":  {
+
+                                                                             },
+                                                            "recentDeltaCount":  0,
+                                                            "activeRelationshipCount":  0,
+                                                            "activeConflictCount":  0,
+                                                            "openGapCount":  3
+                                                        }
+                                                    ]
+                                      }
+                                  ],
+                        "Count":  1
+                    }
+}

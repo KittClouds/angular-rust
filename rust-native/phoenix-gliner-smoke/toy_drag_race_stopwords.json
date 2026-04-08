@@ -1,0 +1,270 @@
+﻿{
+  "threshold": 0.45,
+  "warmRuns": 3,
+  "textCount": 3,
+  "native": {
+    "name": "native",
+    "mode": "deterministic-hot-path",
+    "loadMs": 0,
+    "warmRuns": 3,
+    "warmMsRuns": [
+      44,
+      4,
+      12
+    ],
+    "warmMsAvg": 20.0,
+    "textCount": 3,
+    "mentionCount": 8,
+    "labelCounts": {
+      "location": 1,
+      "organization": 1,
+      "person": 6
+    },
+    "namedCount": 8,
+    "nominalCount": 0,
+    "pronounCount": 0,
+    "discoveryCount": 4,
+    "spans": [
+      {
+        "sequence": 0,
+        "text": "Bill Gates",
+        "normalized": "bill gates",
+        "label": "person",
+        "probability": 0.9
+      },
+      {
+        "sequence": 0,
+        "text": "Albuquerque",
+        "normalized": "albuquerque",
+        "label": "person",
+        "probability": 0.78
+      },
+      {
+        "sequence": 0,
+        "text": "Washington",
+        "normalized": "washington",
+        "label": "location",
+        "probability": 0.9
+      },
+      {
+        "sequence": 1,
+        "text": "Steve Jobs",
+        "normalized": "steve jobs",
+        "label": "person",
+        "probability": 0.55
+      },
+      {
+        "sequence": 1,
+        "text": "Apple",
+        "normalized": "apple",
+        "label": "organization",
+        "probability": 0.9
+      },
+      {
+        "sequence": 1,
+        "text": "Cupertino",
+        "normalized": "cupertino",
+        "label": "person",
+        "probability": 0.78
+      },
+      {
+        "sequence": 2,
+        "text": "Satya Nadella",
+        "normalized": "satya nadella",
+        "label": "person",
+        "probability": 0.9
+      },
+      {
+        "sequence": 2,
+        "text": "Redmond",
+        "normalized": "redmond",
+        "label": "person",
+        "probability": 0.78
+      }
+    ]
+  },
+  "glinerXSmall": {
+    "name": "gliner-x-small",
+    "mode": "span-ner",
+    "loadMs": 3299,
+    "warmRuns": 3,
+    "warmMsRuns": [
+      57,
+      49,
+      120
+    ],
+    "warmMsAvg": 75.333336,
+    "textCount": 3,
+    "mentionCount": 10,
+    "labelCounts": {
+      "location": 4,
+      "organization": 3,
+      "person": 3
+    },
+    "namedCount": null,
+    "nominalCount": null,
+    "pronounCount": null,
+    "discoveryCount": null,
+    "spans": [
+      {
+        "sequence": 0,
+        "text": "Bill Gates",
+        "normalized": "bill gates",
+        "label": "person",
+        "probability": 0.9556465
+      },
+      {
+        "sequence": 0,
+        "text": "Microsoft",
+        "normalized": "microsoft",
+        "label": "organization",
+        "probability": 0.8913266
+      },
+      {
+        "sequence": 0,
+        "text": "Albuquerque",
+        "normalized": "albuquerque",
+        "label": "location",
+        "probability": 0.89602476
+      },
+      {
+        "sequence": 0,
+        "text": "Washington",
+        "normalized": "washington",
+        "label": "location",
+        "probability": 0.9229857
+      },
+      {
+        "sequence": 1,
+        "text": "Steve Jobs",
+        "normalized": "steve jobs",
+        "label": "person",
+        "probability": 0.96079534
+      },
+      {
+        "sequence": 1,
+        "text": "Apple",
+        "normalized": "apple",
+        "label": "organization",
+        "probability": 0.8948931
+      },
+      {
+        "sequence": 1,
+        "text": "Cupertino",
+        "normalized": "cupertino",
+        "label": "location",
+        "probability": 0.89908445
+      },
+      {
+        "sequence": 2,
+        "text": "Satya Nadella",
+        "normalized": "satya nadella",
+        "label": "person",
+        "probability": 0.95306075
+      },
+      {
+        "sequence": 2,
+        "text": "Microsoft",
+        "normalized": "microsoft",
+        "label": "organization",
+        "probability": 0.88543254
+      },
+      {
+        "sequence": 2,
+        "text": "Redmond",
+        "normalized": "redmond",
+        "label": "location",
+        "probability": 0.892172
+      }
+    ]
+  },
+  "glinerMultitask": {
+    "name": "gliner-multitask-large-v0.5",
+    "mode": "token-ner",
+    "loadMs": 7000,
+    "warmRuns": 3,
+    "warmMsRuns": [
+      297,
+      355,
+      387
+    ],
+    "warmMsAvg": 346.33334,
+    "textCount": 3,
+    "mentionCount": 7,
+    "labelCounts": {
+      "company": 6,
+      "person": 1
+    },
+    "namedCount": null,
+    "nominalCount": null,
+    "pronounCount": null,
+    "discoveryCount": null,
+    "spans": [
+      {
+        "sequence": 0,
+        "text": "Bill Gates",
+        "normalized": "bill gates",
+        "label": "company",
+        "probability": 0.7263576
+      },
+      {
+        "sequence": 0,
+        "text": "Microsoft",
+        "normalized": "microsoft",
+        "label": "company",
+        "probability": 0.71670705
+      },
+      {
+        "sequence": 1,
+        "text": "Steve Jobs",
+        "normalized": "steve jobs",
+        "label": "company",
+        "probability": 0.69420016
+      },
+      {
+        "sequence": 1,
+        "text": "Apple",
+        "normalized": "apple",
+        "label": "company",
+        "probability": 0.70370746
+      },
+      {
+        "sequence": 1,
+        "text": "Cupertino",
+        "normalized": "cupertino",
+        "label": "company",
+        "probability": 0.5562218
+      },
+      {
+        "sequence": 2,
+        "text": "Satya Nadella",
+        "normalized": "satya nadella",
+        "label": "person",
+        "probability": 0.711537
+      },
+      {
+        "sequence": 2,
+        "text": "Microsoft",
+        "normalized": "microsoft",
+        "label": "company",
+        "probability": 0.80197656
+      }
+    ]
+  },
+  "nativeVsXSmall": {
+    "unlabeledOverlap": 8,
+    "exactLabelOverlap": 5,
+    "nativeOnly": 0,
+    "challengerOnly": 2,
+    "nativeRecallVsChallenger": 0.8,
+    "exactLabelAgreement": 0.5
+  },
+  "nativeVsMultitask": {
+    "unlabeledOverlap": 5,
+    "exactLabelOverlap": 1,
+    "nativeOnly": 3,
+    "challengerOnly": 2,
+    "nativeRecallVsChallenger": 0.71428573,
+    "exactLabelAgreement": 0.14285715
+  }
+}

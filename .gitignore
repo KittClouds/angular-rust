@@ -58,3 +58,9 @@ GoKitt/.gocache/
 # Rust target directories
 /target/
 **/target/
+
+# Large artifacts/binaries
+*.onnx
+*.zip
+*.exe
+*.bin

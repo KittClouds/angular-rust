@@ -1,0 +1,52 @@
+﻿{
+  "threshold": 0.45,
+  "relationThreshold": 0.45,
+  "warmRuns": 1,
+  "inputMode": "full-document",
+  "seedModel": "gliner-x-small",
+  "labels": [
+    "person",
+    "organization",
+    "location",
+    "event",
+    "item",
+    "concept"
+  ],
+  "relationLabels": [
+    "commands",
+    "works_for",
+    "protects",
+    "located_in",
+    "serves",
+    "member_of"
+  ],
+  "loadMs": 8199,
+  "warmMsRuns": [
+    2274
+  ],
+  "warmMsAvg": 2274.0,
+  "textCount": 1,
+  "entityCount": 5,
+  "relationCount": 0,
+  "entityLabelCounts": {
+    "location": 3,
+    "person": 2
+  },
+  "relationLabelCounts": {},
+  "sequences": [
+    {
+      "sequence": 0,
+      "textPreview": "power to rule the world and dangers lurk everywhere. Ryan only sees different routes; and from Hero to Villain, he has to try them all. Only then will he achieve his perfect ending...",
+      "entityCount": 5,
+      "relationCount": 0,
+      "entities": [
+        "Dynamis Tower [location] (0.810)",
+        "Mechron [person] (0.649)",
+        "Naples [location] (0.805)",
+        "New Rome [location] (0.816)",
+        "Ryan [person] (0.884)"
+      ],
+      "relations": []
+    }
+  ]
+}

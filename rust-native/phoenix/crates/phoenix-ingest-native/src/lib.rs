@@ -4,37 +4,42 @@ use std::path::PathBuf;
 #[cfg(feature = "background-verifier")]
 use std::path::Path;
 
-use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use memchr::memchr3_iter;
+use phoenix_alex::Lexicon;
+use phoenix_causality::{CausalityLowerer, CausalityRequest};
 use phoenix_chunker::{build_chunks, ChunkerConfig};
 use phoenix_kernel::{
     DeterministicKernel, KernelEdge, KernelEdgeType, KernelEntityFacet, KernelEntitySidecar,
     KernelGraphLayer, KernelGraphSnapshot, KernelMutationBatch, KernelMutationScope,
     KernelProvenance, KernelResolutionFacet, KernelVertex, KernelVertexId,
 };
+use phoenix_machine::SurfaceCompileArtifacts;
+use phoenix_proposition::PropositionLowerer;
+use phoenix_semantics::SemanticLowerer;
 use phoenix_semantic_v2::{
     scope_storage_key, AliasConfirmation, AliasEntry, AliasPosting, CandidateEntity,
     CandidateEvidence, ChunkId, ChunkRecord, CompactResolutionKind, CompactResolutionRow,
-    CorefClusterRecord, DirtyScopeRecord, DocumentArchive, DocumentManifest, DocumentOrd,
-    DocumentOrdinalAssignment, DocumentRevisionRef, DocumentSegmentHeader, DocumentSegmentKind,
-    DocumentSegmentRef, DocumentVersionId, LexicalPostingsSegment, NativeCorefSummary,
-    NativeErSummary, PreparedDocument, PreparedDocumentSegment, ResolutionDecision,
-    ResolvedMention, ScopeLexSidecar, ScopeOrd, SemanticEntityRecord, SemanticRelationRecord,
-    SessionArchive,
+    CorefClusterRecord, DirtyScopeRecord, DocumentArchive, DocumentCausalSubstrate,
+    DocumentManifest, DocumentOrd, DocumentOrdinalAssignment, DocumentRevisionRef,
+    DocumentSegmentHeader, DocumentSegmentKind, DocumentSegmentRef, DocumentVersionId,
+    LexicalPostingsSegment, NativeCorefSummary, NativeErSummary, PreparedDocument,
+    PreparedDocumentSegment, RecordedTemporalBinding, ResolutionDecision, ResolvedMention,
+    ScopeLexSidecar, ScopeOrd, SemanticEntityRecord, SemanticRelationRecord, SessionArchive,
 };
 use phoenix_store_native_core::{
     BundleHeader, BundleKey, BundleKind, PhoenixArchiveStoreV2, PhoenixBundleStoreV2,
     StoreError,
 };
+use phoenix_time::TimeKernel;
 use phoenix_types::{
     BoundaryKind, ChunkKind, ChunkSpan, Diagnostic, DocumentId, EntityId, EntityKind,
     EvidenceSpan, FrameSlot, IndexedSpan, IndexedTextField, IngestDocument, IngestDocumentSummary,
-    IngestResult, LexicalField, MentionEntityRef, MentionSource, MentionSpan,
-    NarrativeTransitivity, NarrativeVerbHit, PosTag, RelationCandidate, ResolverEntitySeed,
-    ResolverLink, ResolverLinkKind, ScopeKey, ScanArtifact, SentenceFrame, SentenceSpan,
-    SessionDocumentState, SessionId, StructureArtifact, TextRange, TokenClass, TokenSpan,
-    VerbFrame,
+    IngestResult, KnownMatch, KnownMatchSource, LexicalField, LexiconEntry, MentionEntityRef,
+    MentionSource, MentionSpan, NarrativeTransitivity, NarrativeVerbHit, PosTag,
+    RelationCandidate, ResolverEntitySeed, ResolverLink, ResolverLinkKind, ScopeKey,
+    ScanArtifact, SentenceFrame, SentenceSpan, SessionDocumentState, SessionId,
+    StructureArtifact, TextRange, TokenClass, TokenSpan, VerbFrame,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -47,7 +52,9 @@ use scirs2_text::named_entity_recognition::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use smallvec::SmallVec;
+use std::sync::OnceLock;
 use std::time::Instant;
+use stop_words::{get, LANGUAGE};
 #[cfg(feature = "background-verifier")]
 use thiserror::Error;
 
@@ -346,20 +353,9 @@ struct DetectedMention {
     sentence_index: usize,
 }
 
-#[derive(Clone, Debug)]
-struct GazetteerEntry {
-    kind: Option<EntityKind>,
-    entity_ref: Option<MentionEntityRef>,
-}
-
-#[derive(Clone, Debug)]
-struct CompiledSeedPattern {
-    entries: SmallVec<[GazetteerEntry; 4]>,
-}
-
 struct CompiledSeedGazetteer {
-    matcher: DoubleArrayAhoCorasick,
-    patterns: Vec<CompiledSeedPattern>,
+    scope: ScopeKey,
+    lexicon: Lexicon,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -518,120 +514,114 @@ fn infer_seed_kind(surface: &str, seeds: &[ResolverEntitySeed]) -> Option<Entity
     })
 }
 
-fn build_seed_gazetteer(resolver_seed: &[ResolverEntitySeed]) -> Option<CompiledSeedGazetteer> {
-    let mut by_surface = FxHashMap::<String, SmallVec<[GazetteerEntry; 4]>>::default();
-    for seed in resolver_seed {
-        let forms =
-            std::iter::once(seed.canonical_name.as_str()).chain(seed.aliases.iter().map(String::as_str));
-        for form in forms {
-            let normalized = normalize_surface(form);
-            if normalized.is_empty() {
-                continue;
-            }
-            by_surface
-                .entry(normalized)
-                .or_default()
-                .push(GazetteerEntry {
-                kind: seed.kind.clone(),
-                entity_ref: Some(MentionEntityRef::Known(seed.entity_id.clone())),
-            });
+fn lexicon_entry_from_seed(seed: &ResolverEntitySeed) -> LexiconEntry {
+    LexiconEntry {
+        entity_id: seed.entity_id.clone(),
+        label: seed.canonical_name.clone(),
+        aliases: seed.aliases.clone(),
+        kind: seed.kind.clone(),
+        gender: seed.gender.clone(),
+        number: seed.number.clone(),
+        scope: seed.scope.clone(),
+    }
+}
+
+fn seed_match_binding(entries: &[LexiconEntry]) -> (Option<EntityKind>, Option<MentionEntityRef>) {
+    let mut entity_id = None::<EntityId>;
+    let mut ambiguous_entity = false;
+    let mut type_hint = None::<EntityKind>;
+    let mut ambiguous_kind = false;
+
+    for entry in entries {
+        match (&entity_id, &entry.entity_id) {
+            (None, next) => entity_id = Some(next.clone()),
+            (Some(existing), next) if existing == next => {}
+            (Some(_), _) => ambiguous_entity = true,
+        }
+        match (&type_hint, &entry.kind) {
+            (None, Some(next)) => type_hint = Some(next.clone()),
+            (Some(existing), Some(next)) if existing == next => {}
+            (Some(_), Some(_)) => ambiguous_kind = true,
+            _ => {}
         }
     }
-    if by_surface.is_empty() {
+
+    let entity_ref = if ambiguous_entity {
+        None
+    } else {
+        entity_id.map(MentionEntityRef::Known)
+    };
+    let type_hint = if ambiguous_kind { None } else { type_hint };
+    (type_hint, entity_ref)
+}
+
+fn build_seed_gazetteer(
+    scope: &ScopeKey,
+    resolver_seed: &[ResolverEntitySeed],
+) -> Option<CompiledSeedGazetteer> {
+    let entries = resolver_seed
+        .iter()
+        .map(lexicon_entry_from_seed)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
         return None;
     }
-    let mut patterns = by_surface.into_iter().collect::<Vec<_>>();
-    patterns.sort_by(|left, right| left.0.cmp(&right.0));
-    let pattern_strings = patterns
-        .iter()
-        .map(|(surface, _)| surface.clone())
-        .collect::<Vec<_>>();
-    let matcher = DoubleArrayAhoCorasickBuilder::new()
-        .match_kind(MatchKind::Standard)
-        .build(&pattern_strings)
-        .ok()?;
-    let patterns = patterns
-        .into_iter()
-        .map(|(_, entries)| CompiledSeedPattern { entries })
-        .collect::<Vec<_>>();
-    Some(CompiledSeedGazetteer { matcher, patterns })
+    let lexicon = Lexicon::from_entries(&entries).ok()?;
+    Some(CompiledSeedGazetteer {
+        scope: scope.clone(),
+        lexicon,
+    })
 }
 
 fn seeded_gazetteer_mentions(
     text: &str,
-    tokens: &[TokenSpan],
+    _tokens: &[TokenSpan],
     sentences: &[SentenceSpan],
     gazetteer: Option<&CompiledSeedGazetteer>,
 ) -> Vec<DetectedMention> {
     let Some(gazetteer) = gazetteer else {
         return Vec::new();
     };
-    let normalized_tokens = tokens
-        .iter()
-        .map(|token| normalize_token_surface(slice_or_empty(text, token.range)))
-        .collect::<Vec<_>>();
-    if normalized_tokens.is_empty() {
-        return Vec::new();
+    gazetteer
+        .lexicon
+        .scan(text, &gazetteer.scope)
+        .into_iter()
+        .filter_map(|matched| detected_seed_mention_from_match(sentences, matched))
+        .collect()
+}
+
+fn detected_seed_mention_from_match(
+    sentences: &[SentenceSpan],
+    matched: KnownMatch,
+) -> Option<DetectedMention> {
+    let surface = matched.surface.trim().to_owned();
+    if surface.is_empty() {
+        return None;
     }
-    let mut token_stream = String::new();
-    let mut token_start_by_byte = FxHashMap::<usize, usize>::default();
-    let mut token_end_by_byte = FxHashMap::<usize, usize>::default();
-    for (index, normalized) in normalized_tokens.iter().enumerate() {
-        if index > 0 {
-            token_stream.push(' ');
-        }
-        let start = token_stream.len();
-        token_stream.push_str(normalized);
-        let end = token_stream.len();
-        token_start_by_byte.insert(start, index);
-        token_end_by_byte.insert(end, index);
+    let normalized = normalize_surface(&surface);
+    if normalized.is_empty() {
+        return None;
     }
-    let mut best_matches = FxHashMap::<usize, (usize, usize)>::default();
-    for found in gazetteer.matcher.find_overlapping_iter(token_stream.as_bytes()) {
-        let Some(start_ix) = token_start_by_byte.get(&found.start()).copied() else {
-            continue;
-        };
-        let Some(end_ix) = token_end_by_byte.get(&found.end()).copied() else {
-            continue;
-        };
-        let pattern_ix = found.value();
-        let replace = best_matches
-            .get(&start_ix)
-            .map(|(best_end_ix, best_pattern_ix)| {
-                end_ix > *best_end_ix
-                    || (end_ix == *best_end_ix && pattern_ix < *best_pattern_ix)
-            })
-            .unwrap_or(true);
-        if replace {
-            best_matches.insert(start_ix, (end_ix, pattern_ix));
-        }
-    }
-    let mut ordered_matches = best_matches.into_iter().collect::<Vec<_>>();
-    ordered_matches.sort_by_key(|(start_ix, _)| *start_ix);
-    let mut mentions = Vec::new();
-    let mut sentence_cursor = 0usize;
-    for (start_ix, (end_ix, pattern_ix)) in ordered_matches {
-        let start = tokens[start_ix].range.start;
-        let end = tokens[end_ix].range.end;
-        let range = TextRange { start, end };
-        let surface = slice_or_empty(text, range).to_owned();
-        let pattern = &gazetteer.patterns[pattern_ix];
-        for entry in &pattern.entries {
-            let range = TextRange { start, end };
-            mentions.push(DetectedMention {
-                range,
-                surface: surface.clone(),
-                normalized: normalize_surface(&surface),
-                mention_kind: DetectedMentionKind::Named,
-                type_hint: entry.kind.clone(),
-                entity_ref: entry.entity_ref.clone(),
-                source: DetectedMentionSourceKind::SeedGazetteer,
-                confidence: 0.98,
-                sentence_index: locate_sentence_cursor(sentences, &mut sentence_cursor, range),
-            });
-        }
-    }
-    mentions
+    let (type_hint, entity_ref) = seed_match_binding(&matched.entries);
+    let sentence_index = locate_sentence(sentences, matched.range)
+        .unwrap_or_else(|| sentences.last().map(|sentence| sentence.index).unwrap_or_default());
+    let confidence = match matched.source {
+        Some(KnownMatchSource::ExactCanonical) => 1.0,
+        Some(KnownMatchSource::ExactAlias) => 0.99,
+        Some(KnownMatchSource::ExactAutoAlias) => 0.96,
+        Some(KnownMatchSource::FuzzyAnchor) | None => matched.confidence,
+    };
+    Some(DetectedMention {
+        range: matched.range,
+        surface,
+        normalized,
+        mention_kind: DetectedMentionKind::Named,
+        type_hint,
+        entity_ref,
+        source: DetectedMentionSourceKind::SeedGazetteer,
+        confidence,
+        sentence_index,
+    })
 }
 
 fn build_rule_entities(text: &str, seeds: &[ResolverEntitySeed]) -> Vec<IeEntity> {
@@ -1273,9 +1263,10 @@ fn discover_mentions(
     text: &str,
     tokens: &[TokenSpan],
     sentences: &[SentenceSpan],
+    scope: &ScopeKey,
     resolver_seed: &[ResolverEntitySeed],
 ) -> Vec<MentionSpan> {
-    let seed_gazetteer = build_seed_gazetteer(resolver_seed);
+    let seed_gazetteer = build_seed_gazetteer(scope, resolver_seed);
     detect_mentions(
         text,
         tokens,
@@ -1530,6 +1521,266 @@ fn build_resolver_links(mentions: &[MentionSpan]) -> Vec<ResolverLink> {
     links
 }
 
+fn should_register_surface_binding(
+    mention: &MentionSpan,
+    coref_kind: CorefMentionKind,
+    surface_count: u32,
+) -> bool {
+    if coref_kind != CorefMentionKind::Named {
+        return false;
+    }
+    match mention.entity_ref.as_ref() {
+        Some(MentionEntityRef::Known(_)) => true,
+        Some(MentionEntityRef::Speculative(_)) => {
+            surface_count > 1
+                && mention.confidence >= 0.78
+                && !matches!(mention.source, Some(MentionSource::Fuzzy))
+        }
+        None => false,
+    }
+}
+
+fn merge_surface_binding(binding: &mut SurfaceLibraryBinding, entity_ref: &MentionEntityRef) {
+    if binding.ambiguous {
+        return;
+    }
+    match (&binding.entity_ref, entity_ref) {
+        (None, next) => binding.entity_ref = Some(next.clone()),
+        (Some(MentionEntityRef::Known(existing)), MentionEntityRef::Known(next))
+            if existing == next => {}
+        (Some(MentionEntityRef::Known(_)), MentionEntityRef::Known(_)) => {
+            binding.entity_ref = None;
+            binding.ambiguous = true;
+        }
+        (Some(MentionEntityRef::Speculative(existing)), MentionEntityRef::Speculative(next))
+            if existing == next => {}
+        (Some(MentionEntityRef::Speculative(_)), MentionEntityRef::Speculative(_)) => {
+            binding.entity_ref = None;
+            binding.ambiguous = true;
+        }
+        (Some(MentionEntityRef::Speculative(_)), MentionEntityRef::Known(next)) => {
+            binding.entity_ref = Some(MentionEntityRef::Known(next.clone()));
+        }
+        (Some(MentionEntityRef::Known(_)), MentionEntityRef::Speculative(_)) => {}
+    }
+}
+
+fn build_surface_library_bindings(
+    mentions: &[MentionSpan],
+    mention_surface_ords: &[u32],
+    mention_coref_kinds: &[CorefMentionKind],
+    surface_counts: &[u32],
+) -> Vec<SurfaceLibraryBinding> {
+    let mut bindings = vec![SurfaceLibraryBinding::default(); surface_counts.len()];
+    for preferred_known in [true, false] {
+        for (mention_ix, mention) in mentions.iter().enumerate() {
+            let Some(entity_ref) = mention.entity_ref.as_ref() else {
+                continue;
+            };
+            if preferred_known != matches!(entity_ref, MentionEntityRef::Known(_)) {
+                continue;
+            }
+            let surface_ord = mention_surface_ords[mention_ix] as usize;
+            if !should_register_surface_binding(
+                mention,
+                mention_coref_kinds[mention_ix],
+                surface_counts[surface_ord],
+            ) {
+                continue;
+            }
+            merge_surface_binding(&mut bindings[surface_ord], entity_ref);
+        }
+    }
+    bindings
+}
+
+fn build_entity_library(
+    mentions: &[MentionSpan],
+    mention_surface_ords: &[u32],
+    mention_coref_kinds: &[CorefMentionKind],
+    surface_counts: &[u32],
+) -> AlexEntityLibrary {
+    let surface_bindings = build_surface_library_bindings(
+        mentions,
+        mention_surface_ords,
+        mention_coref_kinds,
+        surface_counts,
+    );
+    let resolved_surface_count = surface_bindings
+        .iter()
+        .filter(|binding| binding.entity_ref.is_some() && !binding.ambiguous)
+        .count();
+    let ambiguous_surface_count = surface_bindings
+        .iter()
+        .filter(|binding| binding.ambiguous)
+        .count();
+    AlexEntityLibrary {
+        surface_bindings,
+        resolved_surface_count,
+        ambiguous_surface_count,
+    }
+}
+
+fn apply_surface_library_bindings(
+    mentions: &mut [MentionSpan],
+    mention_surface_ords: &[u32],
+    mention_coref_kinds: &[CorefMentionKind],
+    surface_library_bindings: &[SurfaceLibraryBinding],
+) {
+    for (mention_ix, mention) in mentions.iter_mut().enumerate() {
+        if mention_coref_kinds[mention_ix] != CorefMentionKind::Named {
+            continue;
+        }
+        let binding = &surface_library_bindings[mention_surface_ords[mention_ix] as usize];
+        if binding.ambiguous {
+            continue;
+        }
+        let Some(entity_ref) = binding.entity_ref.as_ref() else {
+            continue;
+        };
+        let should_bind = match (mention.entity_ref.as_ref(), entity_ref) {
+            (None, _) => true,
+            (Some(MentionEntityRef::Speculative(_)), MentionEntityRef::Known(_)) => true,
+            (Some(MentionEntityRef::Speculative(existing)), MentionEntityRef::Speculative(next)) => {
+                existing == next
+            }
+            _ => false,
+        };
+        if !should_bind {
+            continue;
+        }
+        mention.entity_ref = Some(entity_ref.clone());
+        if matches!(mention.source, None | Some(MentionSource::Discovery | MentionSource::Fuzzy)) {
+            mention.source = Some(match entity_ref {
+                MentionEntityRef::Known(_) => MentionSource::Alias,
+                MentionEntityRef::Speculative(_) => MentionSource::Discovery,
+            });
+        }
+    }
+}
+
+fn build_occurrence_layers(
+    mentions: &[MentionSpan],
+    mention_surface_ords: &[u32],
+    mention_coref_kinds: &[CorefMentionKind],
+    entity_library: &AlexEntityLibrary,
+) -> (Vec<OccurrenceAtom>, Vec<MentionFamily>, Vec<Option<u32>>, PronounLane) {
+    let mut occurrences = Vec::with_capacity(mentions.len());
+    let mut mention_families = Vec::<MentionFamily>::new();
+    let mut family_ord_by_surface = FxHashMap::<u32, u32>::default();
+    let mut family_ord_by_mention = vec![None; mentions.len()];
+    let mut pronoun_lane = PronounLane::default();
+
+    for (mention_ix, mention) in mentions.iter().enumerate() {
+        let surface_ord = mention_surface_ords[mention_ix];
+        let mention_kind = mention_coref_kinds[mention_ix];
+        let family_ord = if mention_kind == CorefMentionKind::Pronoun {
+            pronoun_lane.mention_indexes.push(mention_ix);
+            None
+        } else if let Some(existing) = family_ord_by_surface.get(&surface_ord).copied() {
+            Some(existing)
+        } else {
+            let family_ord = mention_families.len() as u32;
+            let binding = &entity_library.surface_bindings[surface_ord as usize];
+            mention_families.push(MentionFamily {
+                surface_ord,
+                mention_kind,
+                representative_mention_ix: mention_ix,
+                member_indexes: Vec::new(),
+                resolved_entity_ref: binding.entity_ref.clone(),
+                ambiguous: binding.ambiguous,
+            });
+            family_ord_by_surface.insert(surface_ord, family_ord);
+            Some(family_ord)
+        };
+        if let Some(family_ord) = family_ord {
+            family_ord_by_mention[mention_ix] = Some(family_ord);
+            if let Some(family) = mention_families.get_mut(family_ord as usize) {
+                family.member_indexes.push(mention_ix);
+                let current = &mentions[family.representative_mention_ix];
+                let preferred = match (&mention.entity_ref, &current.entity_ref) {
+                    (Some(MentionEntityRef::Known(_)), Some(MentionEntityRef::Known(_))) => {
+                        mention_ix < family.representative_mention_ix
+                    }
+                    (Some(MentionEntityRef::Known(_)), _) => true,
+                    (Some(MentionEntityRef::Speculative(_)), None) => true,
+                    (Some(MentionEntityRef::Speculative(_)), Some(MentionEntityRef::Speculative(_))) => {
+                        mention_ix < family.representative_mention_ix
+                    }
+                    _ => false,
+                };
+                if preferred {
+                    family.representative_mention_ix = mention_ix;
+                }
+            }
+        }
+        occurrences.push(OccurrenceAtom {
+            mention_ix,
+            surface_ord,
+            family_ord,
+            sentence_index: mention.sentence_index,
+            mention_kind,
+        });
+    }
+
+    (occurrences, mention_families, family_ord_by_mention, pronoun_lane)
+}
+
+fn build_resolver_links_native(
+    mentions: &[MentionSpan],
+    mention_surface_ords: &[u32],
+    mention_coref_kinds: &[CorefMentionKind],
+    surface_library_bindings: &[SurfaceLibraryBinding],
+) -> Vec<ResolverLink> {
+    let mut links = Vec::new();
+    let mut last_entity_by_surface = FxHashMap::<u32, usize>::default();
+    let mut antecedent = None::<usize>;
+    for (index, mention) in mentions.iter().enumerate() {
+        let surface_ord = mention_surface_ords[index];
+        if mention_coref_kinds[index] == CorefMentionKind::Pronoun {
+            if let Some(target_ix) = antecedent {
+                let target = &mentions[target_ix];
+                links.push(ResolverLink {
+                    source_range: mention.range,
+                    target_range: Some(target.range),
+                    target_entity: target.entity_ref.clone(),
+                    link_kind: Some(ResolverLinkKind::Pronoun),
+                    confidence: 0.72,
+                    sentence_index: mention.sentence_index,
+                });
+            }
+            continue;
+        }
+        let family_bound_exact = mention_coref_kinds[index] == CorefMentionKind::Named
+            && !surface_library_bindings[surface_ord as usize].ambiguous
+            && surface_library_bindings[surface_ord as usize]
+                .entity_ref
+                .is_some();
+        if !family_bound_exact {
+            if let Some(previous_ix) = last_entity_by_surface.get(&surface_ord).copied() {
+                let previous = &mentions[previous_ix];
+                let target_entity = surface_library_bindings[surface_ord as usize]
+                    .entity_ref
+                    .clone()
+                    .or_else(|| previous.entity_ref.clone());
+                links.push(ResolverLink {
+                    source_range: mention.range,
+                    target_range: Some(previous.range),
+                    target_entity,
+                    link_kind: Some(ResolverLinkKind::AliasCandidate),
+                    confidence: 0.61,
+                    sentence_index: mention.sentence_index,
+                });
+            }
+        }
+        if mention.entity_ref.is_some() {
+            antecedent = Some(index);
+        }
+        last_entity_by_surface.insert(surface_ord, index);
+    }
+    links
+}
+
 fn discover_narrative_hits(
     text: &str,
     tokens: &[TokenSpan],
@@ -1617,15 +1868,15 @@ fn build_chunk_records(
 
 fn scan_native_compact(
     text: &str,
-    _scope: &ScopeKey,
+    scope: &ScopeKey,
     resolver_seed: &[ResolverEntitySeed],
     extraction: &InvarantV3ExtractionConfig,
 ) -> NativeScanRows {
     let tokens = tokenize(text);
     let sentences = sentence_spans(text);
     let hot_config = hot_path_extraction_config(text.len(), resolver_seed, extraction);
-    let seed_gazetteer = build_seed_gazetteer(resolver_seed);
-    let (mentions, narrative_hits) = scan_mentions_and_hits(
+    let seed_gazetteer = build_seed_gazetteer(scope, resolver_seed);
+    let (mut mentions, narrative_hits) = scan_mentions_and_hits(
         text,
         &tokens,
         &sentences,
@@ -1633,7 +1884,7 @@ fn scan_native_compact(
         resolver_seed,
         &hot_config,
     );
-    let resolver_links = build_resolver_links(&mentions);
+    mentions.retain(hot_path_should_keep_mention);
     let mut surface_ord_by_normalized = FxHashMap::<String, u32>::default();
     let mut acronym_ord_by_value = FxHashMap::<String, u32>::default();
     let mut surface_atoms = Vec::<SurfaceAtom>::new();
@@ -1684,6 +1935,31 @@ fn scan_native_compact(
             _ => {}
         }
     }
+    let entity_library = build_entity_library(
+        &mentions,
+        &mention_surface_ords,
+        &mention_coref_kinds,
+        &surface_counts,
+    );
+    apply_surface_library_bindings(
+        &mut mentions,
+        &mention_surface_ords,
+        &mention_coref_kinds,
+        &entity_library.surface_bindings,
+    );
+    let (occurrences, mention_families, family_ord_by_mention, pronoun_lane) =
+        build_occurrence_layers(
+            &mentions,
+            &mention_surface_ords,
+            &mention_coref_kinds,
+            &entity_library,
+        );
+    let resolver_links = build_resolver_links_native(
+        &mentions,
+        &mention_surface_ords,
+        &mention_coref_kinds,
+        &entity_library.surface_bindings,
+    );
     let detected_named_count =
         mentions.len().saturating_sub(detected_nominal_count + detected_pronoun_count);
     let discovery_count = mentions
@@ -1700,6 +1976,11 @@ fn scan_native_compact(
         mentions,
         resolver_links,
         narrative_hits,
+        occurrences,
+        mention_families,
+        family_ord_by_mention,
+        pronoun_lane,
+        entity_library,
         surface_atoms,
         surface_counts,
         acronym_values,
@@ -2205,6 +2486,36 @@ fn union_find_union(parents: &mut [usize], ranks: &mut [u8], left: usize, right:
     }
 }
 
+fn seed_coref_family_edges(scan: &NativeScanRows) -> (Vec<CorefAcceptedEdge>, Vec<bool>) {
+    let mut accepted_edges = Vec::<CorefAcceptedEdge>::new();
+    let mut family_locked_mentions = vec![false; scan.mentions.len()];
+
+    for family in &scan.mention_families {
+        if family.mention_kind != CorefMentionKind::Named
+            || family.ambiguous
+            || family.resolved_entity_ref.is_none()
+            || family.member_indexes.len() < 2
+        {
+            continue;
+        }
+        let representative = family.representative_mention_ix;
+        for &member_ix in &family.member_indexes {
+            if member_ix == representative {
+                continue;
+            }
+            accepted_edges.push(CorefAcceptedEdge {
+                left_ix: member_ix,
+                right_ix: representative,
+                route: CorefPairRoute::ExactSurface,
+                score_millis: 1320,
+            });
+            family_locked_mentions[member_ix] = true;
+        }
+    }
+
+    (accepted_edges, family_locked_mentions)
+}
+
 fn build_coref_rows(
     scan: &NativeScanRows,
     structure: &NativeStructureRows,
@@ -2277,7 +2588,7 @@ fn build_coref_rows(
     let mut recent_nominal_by_head_kind =
         FxHashMap::<(u32, u8), SmallVec<[usize; 8]>>::default();
     let mut clusters = Vec::<CorefClusterState>::new();
-    let mut accepted_edges = Vec::<CorefAcceptedEdge>::new();
+    let (mut accepted_edges, family_locked_mentions) = seed_coref_family_edges(scan);
     let mut candidate_link_count = 0usize;
 
     for (index, row) in rows.iter().enumerate() {
@@ -2289,6 +2600,33 @@ fn build_coref_rows(
         let normalized = scan.surface_atoms[surface_ord].normalized.as_ref();
         let acronym_ord = row.acronym_ord.map(|value| value as usize);
         let (_max_antecedents, max_sent_window) = coref_window_limits(row.mention_kind, config);
+
+        if family_locked_mentions[index] {
+            if !normalized.is_empty() {
+                push_recent_ix(&mut scratch.surface_recent[surface_ord], index, 8);
+            }
+            if let Some(acronym_ord) = acronym_ord {
+                push_recent_ix(&mut scratch.acronym_recent[acronym_ord], index, 8);
+            }
+            match row.mention_kind {
+                CorefMentionKind::Named => {
+                    push_recent_ix(&mut scratch.recent_named, index, 128);
+                    if let Some(head_ord) = row.head_ord {
+                        if recent_named_by_head.len() <= head_ord as usize {
+                            recent_named_by_head
+                                .resize(head_ord as usize + 1, SmallVec::<[usize; 8]>::new());
+                        }
+                        push_recent_ix(&mut recent_named_by_head[head_ord as usize], index, 8);
+                    }
+                }
+                CorefMentionKind::Nominal => {
+                    push_recent_ix(&mut scratch.recent_nominal, index, 64);
+                }
+                CorefMentionKind::Pronoun => {}
+            }
+            continue;
+        }
+
         coref_begin_candidate_pool(&mut scratch, rows.len());
         coref_block_candidates(
             &mut scratch,
@@ -3282,6 +3620,31 @@ fn resolve_mentions_compact_native(
             );
         }
     }
+    for binding in &scan.entity_library.surface_bindings {
+        match binding.entity_ref.as_ref() {
+            Some(MentionEntityRef::Known(entity_id)) => {
+                intern_entity_ord(
+                    &entity_id.0,
+                    &mut entity_ord_by_id,
+                    &mut entity_ids,
+                    &mut entity_kinds_by_ord,
+                    entity_memory,
+                );
+            }
+            Some(MentionEntityRef::Speculative(speculative)) => {
+                let speculative_id =
+                    format!("{}::{}", document.document_id.0, speculative.replace(' ', "_"));
+                intern_entity_ord(
+                    &speculative_id,
+                    &mut entity_ord_by_id,
+                    &mut entity_ids,
+                    &mut entity_kinds_by_ord,
+                    entity_memory,
+                );
+            }
+            None => {}
+        }
+    }
     for entity_id in kernel_resolved_entities.iter().flatten() {
         intern_entity_ord(
             entity_id,
@@ -3341,6 +3704,7 @@ fn resolve_mentions_compact_native(
     let mut surface_kernel_candidates =
         vec![SmallVec::<[CompactCandidateSlot; 4]>::new(); surface_count];
     let mut surface_speculative_ord = vec![None; surface_count];
+    let mut surface_library_entity_ord = vec![None; surface_count];
     let mut surface_pronouns = vec![false; surface_count];
     let mut surface_known_counts = vec![SmallVec::<[(u32, usize); 4]>::new(); surface_count];
     let mut resolver_links_by_mention =
@@ -3351,6 +3715,15 @@ fn resolve_mentions_compact_native(
     for (surface_ord, surface) in scan.surface_atoms.iter().enumerate() {
         let normalized = surface.normalized.as_ref();
         surface_pronouns[surface_ord] = surface.is_pronoun;
+        if let Some(entity_ref) = scan.entity_library.surface_bindings[surface_ord].entity_ref.as_ref() {
+            let entity_id = match entity_ref {
+                MentionEntityRef::Known(entity_id) => entity_id.0.clone(),
+                MentionEntityRef::Speculative(speculative) => {
+                    format!("{}::{}", document.document_id.0, speculative.replace(' ', "_"))
+                }
+            };
+            surface_library_entity_ord[surface_ord] = entity_ord_by_id.get(&entity_id).copied();
+        }
         if let Some(kernel_candidates) = entity_memory.entity_index.alias_candidates.get(normalized) {
             for candidate in kernel_candidates {
                 let relation = candidate.relation_type.as_deref().unwrap_or("kernel");
@@ -3369,7 +3742,10 @@ fn resolve_mentions_compact_native(
                 });
             }
         }
-        if !surface_pronouns[surface_ord] && !normalized.is_empty() {
+        if surface_library_entity_ord[surface_ord].is_none()
+            && !surface_pronouns[surface_ord]
+            && !normalized.is_empty()
+        {
             let speculative_id =
                 format!("{}::{}", document.document_id.0, normalized.replace(' ', "_"));
             surface_speculative_ord[surface_ord] = entity_ord_by_id.get(&speculative_id).copied();
@@ -3450,6 +3826,25 @@ fn resolve_mentions_compact_native(
                 1800,
                 CandidateEvidenceKind::Seed,
             );
+        }
+        if let Some(entity_ord) = surface_library_entity_ord[prepared_mention.surface_ord as usize] {
+            let score = match scan.entity_library.surface_bindings[prepared_mention.surface_ord as usize]
+                .entity_ref
+                .as_ref()
+            {
+                Some(MentionEntityRef::Known(_)) => 1560,
+                Some(MentionEntityRef::Speculative(_)) => 760,
+                None => 0,
+            };
+            if score > 0 {
+                merge_compact_candidate_slot(
+                    candidates,
+                    entity_ord,
+                    CandidateSourceKind::LocalSurface,
+                    score,
+                    CandidateEvidenceKind::LocalSurface,
+                );
+            }
         }
         for candidate in &surface_kernel_candidates[prepared_mention.surface_ord as usize] {
             merge_compact_candidate_slot(
@@ -5047,6 +5442,32 @@ fn normalize_surface(value: &str) -> String {
         .join(" ")
 }
 
+fn hot_path_stop_words() -> &'static FxHashSet<&'static str> {
+    static STOP_WORDS: OnceLock<FxHashSet<&'static str>> = OnceLock::new();
+    STOP_WORDS.get_or_init(|| {
+        get(LANGUAGE::English)
+            .iter()
+            .copied()
+            .collect::<FxHashSet<_>>()
+    })
+}
+
+fn hot_path_should_keep_mention(mention: &MentionSpan) -> bool {
+    if matches!(mention.entity_ref, Some(MentionEntityRef::Known(_))) {
+        return true;
+    }
+    let normalized = normalize_surface(&mention.surface);
+    if normalized.is_empty() {
+        return false;
+    }
+    if is_pronoun(&normalized) {
+        return true;
+    }
+    !normalized
+        .split(' ')
+        .all(|token| !token.is_empty() && hot_path_stop_words().contains(token))
+}
+
 fn normalize_token_surface(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -5889,6 +6310,32 @@ pub struct V2IngestArtifacts {
     pub touched_scopes: Vec<ScopeKey>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeNerMention {
+    pub start: u32,
+    pub end: u32,
+    pub sentence_index: usize,
+    pub surface: String,
+    pub normalized: String,
+    pub label: String,
+    pub source: Option<String>,
+    pub confidence: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeNerRaceReport {
+    pub scan_ms: u64,
+    pub sentence_count: usize,
+    pub mention_count: usize,
+    pub named_count: usize,
+    pub nominal_count: usize,
+    pub pronoun_count: usize,
+    pub discovery_count: usize,
+    pub mentions: Vec<NativeNerMention>,
+}
+
 #[derive(Clone, Debug)]
 struct BoundaryRecord {
     label: String,
@@ -5927,12 +6374,59 @@ struct SurfaceAtom {
     is_pronoun: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SurfaceLibraryBinding {
+    entity_ref: Option<MentionEntityRef>,
+    ambiguous: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+struct AlexEntityLibrary {
+    surface_bindings: Vec<SurfaceLibraryBinding>,
+    resolved_surface_count: usize,
+    ambiguous_surface_count: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+struct OccurrenceAtom {
+    mention_ix: usize,
+    surface_ord: u32,
+    family_ord: Option<u32>,
+    sentence_index: usize,
+    mention_kind: CorefMentionKind,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct MentionFamily {
+    surface_ord: u32,
+    mention_kind: CorefMentionKind,
+    representative_mention_ix: usize,
+    member_indexes: Vec<usize>,
+    resolved_entity_ref: Option<MentionEntityRef>,
+    ambiguous: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, Default)]
+struct PronounLane {
+    mention_indexes: Vec<usize>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct NativeScanRows {
     sentences: Vec<SentenceSpan>,
     mentions: Vec<MentionSpan>,
     resolver_links: Vec<ResolverLink>,
     narrative_hits: Vec<NarrativeVerbHit>,
+    occurrences: Vec<OccurrenceAtom>,
+    mention_families: Vec<MentionFamily>,
+    family_ord_by_mention: Vec<Option<u32>>,
+    pronoun_lane: PronounLane,
+    entity_library: AlexEntityLibrary,
     surface_atoms: Vec<SurfaceAtom>,
     surface_counts: Vec<u32>,
     acronym_values: Vec<Box<str>>,
@@ -6351,6 +6845,45 @@ impl PhoenixInvarantV3 {
         &self.config
     }
 
+    pub fn benchmark_native_ner(
+        &self,
+        text: &str,
+        scope: &ScopeKey,
+        resolver_seed: &[ResolverEntitySeed],
+    ) -> NativeNerRaceReport {
+        let started = Instant::now();
+        let scan = scan_native_compact(text, scope, resolver_seed, &self.config.extraction);
+        let scan_ms = started.elapsed().as_millis() as u64;
+        NativeNerRaceReport {
+            scan_ms,
+            sentence_count: scan.sentences.len(),
+            mention_count: scan.mentions.len(),
+            named_count: scan.detected_named_count,
+            nominal_count: scan.detected_nominal_count,
+            pronoun_count: scan.detected_pronoun_count,
+            discovery_count: scan.discovery_count,
+            mentions: scan
+                .mentions
+                .iter()
+                .zip(scan.mention_coref_kinds.iter())
+                .map(|(mention, coref_kind)| NativeNerMention {
+                    start: mention.range.start,
+                    end: mention.range.end,
+                    sentence_index: mention.sentence_index,
+                    surface: mention.surface.clone(),
+                    normalized: normalize_surface(&mention.surface),
+                    label: native_ner_label(mention, *coref_kind).to_owned(),
+                    source: mention
+                        .source
+                        .as_ref()
+                        .map(native_mention_source_name)
+                        .map(str::to_owned),
+                    confidence: mention.confidence,
+                })
+                .collect(),
+        }
+    }
+
     pub fn scan_parts(
         &self,
         text: &str,
@@ -6377,7 +6910,7 @@ impl PhoenixInvarantV3 {
             );
         }
         let phase_started = Instant::now();
-        let seed_gazetteer = build_seed_gazetteer(resolver_seed);
+        let seed_gazetteer = build_seed_gazetteer(_scope, resolver_seed);
         let mentions = detect_mentions(
             text,
             &tokens,
@@ -7690,6 +8223,8 @@ impl PhoenixInvarantV3 {
             resolution_bundle.discovery_count,
             mention_count,
         );
+        let causal_substrate =
+            build_document_causal_substrate(document, &scan_bundle, created_at);
 
         let mut segments = Vec::<PreparedDocumentSegment>::new();
         let mut segment_refs = Vec::<DocumentSegmentRef>::new();
@@ -7730,6 +8265,21 @@ impl PhoenixInvarantV3 {
             DocumentSegmentKind::RelationTable,
             resolution_bundle.relations.len(),
             &resolution_bundle.relations,
+        )?;
+        self.push_segment(
+            &mut segments,
+            &mut segment_refs,
+            DocumentSegmentKind::CausalSubstrateTable,
+            causal_substrate.propositions.len()
+                + causal_substrate.semantic_events.len()
+                + causal_substrate.semantic_states.len()
+                + causal_substrate.semantic_claims.len()
+                + causal_substrate.semantic_relations.len()
+                + causal_substrate.temporal_bindings.len()
+                + causal_substrate.causal_candidates.len()
+                + causal_substrate.causal_links.len()
+                + causal_substrate.causal_diagnostics.len(),
+            &causal_substrate,
         )?;
 
         let lexical_started = Instant::now();
@@ -7894,6 +8444,8 @@ impl PhoenixInvarantV3 {
             resolution_bundle.discovery_count,
             mention_count,
         );
+        let causal_substrate =
+            build_document_causal_substrate(document, &scan_bundle, created_at);
         let phase_started = Instant::now();
         let archive = DocumentArchive {
             manifest,
@@ -7914,6 +8466,7 @@ impl PhoenixInvarantV3 {
             relation_candidates: Vec::new(),
             graph_batch: KernelMutationBatch::default(),
             structure: None,
+            causal_substrate: Some(causal_substrate),
         };
         if progress {
             eprintln!(
@@ -7936,6 +8489,223 @@ impl PhoenixInvarantV3 {
             discovery_count: resolution_bundle.discovery_count,
             diagnostics: resolution_bundle.diagnostics,
         })
+    }
+}
+
+fn build_document_causal_substrate(
+    document: &IngestDocument,
+    scan_bundle: &NativeScanBundle,
+    created_at: i64,
+) -> DocumentCausalSubstrate {
+    let chunk_spans = scan_bundle
+        .chunks
+        .iter()
+        .map(|chunk| ChunkSpan {
+            kind: None,
+            range: chunk.range,
+            head: chunk.range,
+            modifiers: Vec::new(),
+            sentence_index: scan_bundle
+                .scan
+                .sentences
+                .iter()
+                .position(|sentence| {
+                    sentence.range.start <= chunk.range.start && sentence.range.end >= chunk.range.end
+                })
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let artifacts = SurfaceCompileArtifacts {
+        scan: ScanArtifact {
+            sentences: scan_bundle.scan.sentences.clone(),
+            tokens: Vec::new(),
+            mentions: scan_bundle.scan.mentions.clone(),
+            chunks: chunk_spans,
+            resolver_links: scan_bundle.scan.resolver_links.clone(),
+            narrative_hits: scan_bundle.scan.narrative_hits.clone(),
+            diagnostics: vec![Diagnostic {
+                code: "PX_CAUSAL_SUBSTRATE_SCAN".to_owned(),
+                message: "Rebuilt compact scan artifact for causal substrate compilation."
+                    .to_owned(),
+            }],
+        },
+        structure: build_causal_structure_artifact(document, scan_bundle),
+        surface: phoenix_types::SurfaceDocument::default(),
+    };
+    let propositions = PropositionLowerer::lower(&artifacts);
+    let semantics = SemanticLowerer::lower(&propositions);
+    let temporal_bindings = propositions
+        .iter()
+        .map(|proposition| TimeKernel::bind_label(proposition.predicate.predicate.as_str(), Some(created_at)))
+        .collect::<Vec<_>>();
+    let causality = CausalityLowerer::lower(CausalityRequest {
+        text: &document.text,
+        artifacts: &artifacts,
+        propositions: &propositions,
+        semantics: &semantics,
+        temporal_bindings: &temporal_bindings,
+    });
+    DocumentCausalSubstrate {
+        propositions,
+        semantic_events: semantics.events,
+        semantic_states: semantics.states,
+        semantic_claims: semantics.claims,
+        semantic_relations: semantics.relations,
+        temporal_bindings: temporal_bindings
+            .into_iter()
+            .map(|binding| RecordedTemporalBinding {
+                anchor: binding.anchor,
+                recorded_window: binding.recorded_window,
+            })
+            .collect(),
+        causal_candidates: causality.candidates,
+        causal_links: causality.links,
+        causal_diagnostics: causality.diagnostics,
+    }
+}
+
+fn build_causal_structure_artifact(document: &IngestDocument, scan_bundle: &NativeScanBundle) -> StructureArtifact {
+    let mut sentence_frames = scan_bundle
+        .scan
+        .sentences
+        .iter()
+        .map(|sentence| SentenceFrame {
+            sentence: sentence.clone(),
+            mentions: scan_bundle
+                .scan
+                .mentions
+                .iter()
+                .filter(|mention| mention.sentence_index == sentence.index)
+                .cloned()
+                .collect(),
+            chunks: scan_bundle
+                .chunks
+                .iter()
+                .filter(|chunk| {
+                    sentence.range.start <= chunk.range.start && sentence.range.end >= chunk.range.end
+                })
+                .map(|chunk| ChunkSpan {
+                    kind: None,
+                    range: chunk.range,
+                    head: chunk.range,
+                    modifiers: Vec::new(),
+                    sentence_index: sentence.index,
+                })
+                .collect(),
+            verb_frames: Vec::new(),
+            clause_ranges: vec![sentence.range],
+            diagnostics: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut relations = Vec::new();
+    let mut evidence_spans = Vec::new();
+    for seed in &scan_bundle.structure.relation_seeds {
+        let Some(hit) = scan_bundle
+            .scan
+            .narrative_hits
+            .iter()
+            .find(|hit| hit.sentence_index == seed.sentence_index && hit.relation_type == seed.relation_type)
+        else {
+            continue;
+        };
+        let sentence = match scan_bundle.scan.sentences.get(seed.sentence_index) {
+            Some(sentence) => sentence,
+            None => continue,
+        };
+        let evidence = vec![EvidenceSpan {
+            document_id: Some(DocumentId(document.document_id.0.clone())),
+            note_id: document.note_id.clone(),
+            label: document
+                .text
+                .get(sentence.range.start as usize..sentence.range.end as usize)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            kind: Some("sentence".to_owned()),
+            range: sentence.range,
+        }];
+        let subject = seed
+            .subject_mention_ix
+            .and_then(|index| scan_bundle.scan.mentions.get(index))
+            .map(frame_slot_from_native_mention);
+        let object = seed
+            .object_mention_ix
+            .and_then(|index| scan_bundle.scan.mentions.get(index))
+            .map(frame_slot_from_native_mention);
+        let relation = RelationCandidate {
+            sentence_index: seed.sentence_index,
+            verb_range: hit.range,
+            lemma: hit.lemma.clone(),
+            event_class: hit.event_class.clone(),
+            relation_type: hit.relation_type.clone(),
+            subject,
+            object,
+            recipient: None,
+            attachments: Vec::new(),
+            evidence: evidence.clone(),
+        };
+        if let Some(frame) = sentence_frames.get_mut(seed.sentence_index) {
+            frame.verb_frames.push(VerbFrame {
+                verb_range: hit.range,
+                lemma: hit.lemma.clone(),
+                event_class: hit.event_class.clone(),
+                relation_type: hit.relation_type.clone(),
+                transitivity: hit.transitivity.clone(),
+                subject_candidates: relation.subject.clone().into_iter().collect(),
+                object_candidates: relation.object.clone().into_iter().collect(),
+                recipient_candidates: Vec::new(),
+                pp_attachments: Vec::new(),
+                clause_range: sentence.range,
+                evidence: evidence.clone(),
+            });
+        }
+        evidence_spans.extend(evidence.iter().cloned());
+        relations.push(relation);
+    }
+
+    StructureArtifact {
+        sentence_frames,
+        relations,
+        evidence_spans,
+        diagnostics: vec![Diagnostic {
+            code: "PX_CAUSAL_SUBSTRATE_STRUCTURE".to_owned(),
+            message: "Rebuilt compact structure artifact for causal substrate compilation."
+                .to_owned(),
+        }],
+    }
+}
+
+fn frame_slot_from_native_mention(mention: &MentionSpan) -> FrameSlot {
+    FrameSlot {
+        range: mention.range,
+        entity_ref: mention.entity_ref.clone(),
+        confidence: mention.confidence,
+    }
+}
+
+fn native_ner_label(mention: &MentionSpan, coref_kind: CorefMentionKind) -> &'static str {
+    match coref_kind {
+        CorefMentionKind::Pronoun => "pronoun",
+        CorefMentionKind::Nominal => "nominal",
+        CorefMentionKind::Named => match mention.kind {
+            Some(EntityKind::Character | EntityKind::Npc) => "person",
+            Some(EntityKind::Organization | EntityKind::Faction) => "organization",
+            Some(EntityKind::Location) => "location",
+            Some(EntityKind::Event) => "event",
+            Some(EntityKind::Item) => "item",
+            Some(EntityKind::Concept) => "concept",
+            Some(EntityKind::Other) | None => "named",
+        },
+    }
+}
+
+fn native_mention_source_name(source: &MentionSource) -> &'static str {
+    match source {
+        MentionSource::Known => "known",
+        MentionSource::Alias => "alias",
+        MentionSource::Fuzzy => "fuzzy",
+        MentionSource::Discovery => "discovery",
     }
 }
 
