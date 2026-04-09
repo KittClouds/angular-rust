@@ -34,6 +34,7 @@ pub enum KernelMutationScope {
     Document { document_id: String },
     Session { session_id: String },
     Candidate { scope_key: String },
+    Projection { scope_key: String },
     Full,
 }
 
@@ -49,6 +50,7 @@ impl KernelMutationScope {
             Self::Document { document_id } => format!("document:{document_id}"),
             Self::Session { session_id } => format!("session:{session_id}"),
             Self::Candidate { scope_key } => format!("candidate:{scope_key}"),
+            Self::Projection { scope_key } => format!("projection:{scope_key}"),
             Self::Full => "__full__".to_owned(),
         }
     }
@@ -391,6 +393,101 @@ pub struct KernelCalendarWindowRequest {
     pub include_candidate_graph: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelSlotQueryRequest {
+    pub entity_id: String,
+    pub slot_key: String,
+    pub valid_at: Option<i64>,
+    pub recorded_at: Option<i64>,
+    pub include_candidate_graph: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelUnresolvedQueryRequest {
+    pub entity_id: String,
+    pub slot_key: Option<String>,
+    pub valid_at: Option<i64>,
+    pub recorded_at: Option<i64>,
+    pub include_candidate_graph: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelWhatChangedRequest {
+    pub entity_id: String,
+    pub slot_key: Option<String>,
+    pub since_valid_at: i64,
+    pub until_valid_at: Option<i64>,
+    pub recorded_at: Option<i64>,
+    pub include_candidate_graph: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelSlotState {
+    pub state_vertex_id: String,
+    pub entity_id: String,
+    pub slot_key: String,
+    pub value: String,
+    pub value_entity_id: Option<String>,
+    pub status: Option<String>,
+    pub source_class: Option<String>,
+    pub confidence: Option<f64>,
+    pub temporal: KernelBiTemporal,
+    #[serde(default)]
+    pub supporting_claim_ids: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelStateIssue {
+    pub issue_vertex_id: String,
+    pub issue_kind: String,
+    pub entity_id: String,
+    pub slot_key: String,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+    pub preferred_claim_id: Option<String>,
+    pub temporal: KernelBiTemporal,
+    #[serde(default)]
+    pub supporting_claim_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelSlotAnswer {
+    pub entity_id: String,
+    pub slot_key: String,
+    pub active_state: Option<KernelSlotState>,
+    #[serde(default)]
+    pub competing_states: Vec<KernelSlotState>,
+    #[serde(default)]
+    pub conflicts: Vec<KernelStateIssue>,
+    #[serde(default)]
+    pub gaps: Vec<KernelStateIssue>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum KernelStateChangeKind {
+    #[default]
+    Activated,
+    Expired,
+    ActivatedAndExpired,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelStateChange {
+    pub change_kind: KernelStateChangeKind,
+    pub state: KernelSlotState,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelCalendarAnchorSet {
     pub year_id: String,
@@ -448,6 +545,8 @@ pub struct PhoenixGraphKernel {
     document_scope_edges: FxHashMap<String, FxHashSet<KernelEdgeKey>>,
     session_scope_vertices: FxHashMap<String, FxHashSet<String>>,
     session_scope_edges: FxHashMap<String, FxHashSet<KernelEdgeKey>>,
+    projection_scope_vertices: FxHashMap<String, FxHashSet<String>>,
+    projection_scope_edges: FxHashMap<String, FxHashSet<KernelEdgeKey>>,
     candidate_scope_edges: FxHashMap<String, FxHashSet<KernelEdgeKey>>,
     dirty_flags: RwLock<KernelDirtyFlags>,
     csr: RwLock<KernelCsrSidecar>,
@@ -508,7 +607,11 @@ impl PhoenixGraphKernel {
             vertices: self.vertices.clone(),
             asserted_edges: self.asserted_edges.clone(),
             candidate_edges: self.candidate_edges.clone(),
-            csr: self.csr.read().expect("kernel csr sidecar poisoned").clone(),
+            csr: self
+                .csr
+                .read()
+                .expect("kernel csr sidecar poisoned")
+                .clone(),
         }
     }
 
@@ -562,7 +665,10 @@ impl PhoenixGraphKernel {
 
     pub fn csr_sidecar(&self) -> KernelCsrSidecar {
         self.ensure_csr_sidecar();
-        self.csr.read().expect("kernel csr sidecar poisoned").clone()
+        self.csr
+            .read()
+            .expect("kernel csr sidecar poisoned")
+            .clone()
     }
 
     pub fn valid_time_index(&self) -> KernelTemporalIndexSidecar {
@@ -706,7 +812,8 @@ impl PhoenixGraphKernel {
             });
         }
         candidates.sort_by(|left, right| {
-            right.score
+            right
+                .score
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.entity_id.cmp(&right.entity_id))
@@ -808,6 +915,136 @@ impl PhoenixGraphKernel {
         }
     }
 
+    pub fn current_slot(
+        &self,
+        entity_id: &str,
+        slot_key: &str,
+        recorded_at: Option<i64>,
+    ) -> KernelSlotAnswer {
+        self.slot_at(KernelSlotQueryRequest {
+            entity_id: entity_id.to_owned(),
+            slot_key: slot_key.to_owned(),
+            valid_at: Some(now_ms()),
+            recorded_at,
+            include_candidate_graph: false,
+        })
+    }
+
+    pub fn slot_at(&self, request: KernelSlotQueryRequest) -> KernelSlotAnswer {
+        let snapshot = self.snapshot_for_query(
+            request.valid_at,
+            request.recorded_at,
+            request.include_candidate_graph,
+        );
+        let mut states = collect_slot_states(
+            &snapshot.vertices,
+            &snapshot.asserted_edges,
+            &request.entity_id,
+            &request.slot_key,
+        );
+        states.sort_by(compare_slot_states);
+        let mut conflicts = collect_state_issues(
+            &snapshot.vertices,
+            &snapshot.asserted_edges,
+            "conflict",
+            &request.entity_id,
+            Some(request.slot_key.as_str()),
+            false,
+        );
+        let mut gaps = collect_state_issues(
+            &snapshot.vertices,
+            &snapshot.asserted_edges,
+            "gap",
+            &request.entity_id,
+            Some(request.slot_key.as_str()),
+            false,
+        );
+        conflicts.sort_by(compare_state_issues);
+        gaps.sort_by(compare_state_issues);
+
+        let active_state = states.first().cloned();
+        let competing_states = states.into_iter().skip(1).collect::<Vec<_>>();
+        KernelSlotAnswer {
+            entity_id: request.entity_id,
+            slot_key: request.slot_key,
+            active_state,
+            competing_states,
+            conflicts,
+            gaps,
+        }
+    }
+
+    pub fn what_is_unresolved(
+        &self,
+        request: KernelUnresolvedQueryRequest,
+    ) -> Vec<KernelStateIssue> {
+        let snapshot = self.snapshot_for_query(
+            request.valid_at,
+            request.recorded_at,
+            request.include_candidate_graph,
+        );
+        let mut issues = collect_state_issues(
+            &snapshot.vertices,
+            &snapshot.asserted_edges,
+            "conflict",
+            &request.entity_id,
+            request.slot_key.as_deref(),
+            true,
+        );
+        issues.extend(collect_state_issues(
+            &snapshot.vertices,
+            &snapshot.asserted_edges,
+            "gap",
+            &request.entity_id,
+            request.slot_key.as_deref(),
+            true,
+        ));
+        issues.sort_by(compare_state_issues);
+        issues
+    }
+
+    pub fn what_changed(&self, request: KernelWhatChangedRequest) -> Vec<KernelStateChange> {
+        let until = request.until_valid_at.unwrap_or_else(now_ms);
+        let timeline = self.entity_timeline(
+            &request.entity_id,
+            Some((request.since_valid_at, until)),
+            request.recorded_at.or(Some(until)),
+        );
+        let mut changes = timeline
+            .vertices
+            .iter()
+            .filter(|vertex| {
+                vertex.kind == "state"
+                    && vertex.entity_id.as_deref() == Some(request.entity_id.as_str())
+                    && request
+                        .slot_key
+                        .as_deref()
+                        .map(|slot_key| vertex_slot_key(vertex) == Some(slot_key))
+                        .unwrap_or(true)
+            })
+            .filter_map(|vertex| {
+                classify_state_change(&vertex.temporal, request.since_valid_at, until).map(
+                    |change_kind| KernelStateChange {
+                        change_kind,
+                        state: build_slot_state(
+                            vertex,
+                            &timeline.asserted_edges,
+                            &request.entity_id,
+                        ),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        changes.sort_by(|left, right| {
+            left.state
+                .temporal
+                .valid_from
+                .cmp(&right.state.temporal.valid_from)
+                .then_with(|| left.state.state_vertex_id.cmp(&right.state.state_vertex_id))
+        });
+        changes
+    }
+
     pub fn calendar_slice(&self, request: KernelCalendarWindowRequest) -> KernelGraphSnapshot {
         let snapshot = self.view_as_of(KernelViewRequest {
             valid_at: request.end_ms.or(request.start_ms),
@@ -860,6 +1097,45 @@ impl PhoenixGraphKernel {
             })
             .collect::<Vec<_>>();
         vertices.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        KernelGraphSnapshot {
+            vertices,
+            asserted_edges,
+            candidate_edges,
+        }
+    }
+
+    fn snapshot_for_query(
+        &self,
+        valid_at: Option<i64>,
+        recorded_at: Option<i64>,
+        include_candidate_graph: bool,
+    ) -> KernelGraphSnapshot {
+        if valid_at.is_some() || recorded_at.is_some() || include_candidate_graph {
+            return self.view_as_of(KernelViewRequest {
+                valid_at,
+                recorded_at,
+                include_candidate_graph,
+            });
+        }
+
+        let mut vertices = self.vertices.values().cloned().collect::<Vec<_>>();
+        let mut asserted_edges = self.asserted_edges.values().cloned().collect::<Vec<_>>();
+        let mut candidate_edges = if include_candidate_graph {
+            self.candidate_edges.values().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        vertices.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        asserted_edges.sort_by(|left, right| {
+            KernelEdgeKey::from_edge(left)
+                .storage_key()
+                .cmp(&KernelEdgeKey::from_edge(right).storage_key())
+        });
+        candidate_edges.sort_by(|left, right| {
+            KernelEdgeKey::from_edge(left)
+                .storage_key()
+                .cmp(&KernelEdgeKey::from_edge(right).storage_key())
+        });
         KernelGraphSnapshot {
             vertices,
             asserted_edges,
@@ -977,7 +1253,10 @@ impl PhoenixGraphKernel {
         let mut edges = Vec::new();
         if let Some(valid_from) = temporal.valid_from {
             let (anchor_vertices, mut anchor_edges, anchors) =
-                Self::build_calendar_anchor_artifacts(valid_from, recorded_at.or(temporal.recorded_at));
+                Self::build_calendar_anchor_artifacts(
+                    valid_from,
+                    recorded_at.or(temporal.recorded_at),
+                );
             vertices.extend(anchor_vertices);
             edges.append(&mut anchor_edges);
             edges.push(KernelEdge {
@@ -1015,7 +1294,10 @@ impl PhoenixGraphKernel {
         }
         if let Some(valid_to) = temporal.valid_to {
             let (anchor_vertices, mut anchor_edges, anchors) =
-                Self::build_calendar_anchor_artifacts(valid_to, recorded_at.or(temporal.recorded_at));
+                Self::build_calendar_anchor_artifacts(
+                    valid_to,
+                    recorded_at.or(temporal.recorded_at),
+                );
             vertices.extend(anchor_vertices);
             edges.append(&mut anchor_edges);
             edges.push(KernelEdge {
@@ -1105,10 +1387,18 @@ impl PhoenixGraphKernel {
             let key = KernelEdgeKey::from_edge(&edge);
             match edge.layer {
                 KernelGraphLayer::Asserted => {
-                    kernel.asserted_edge_history.entry(key).or_default().push(edge);
+                    kernel
+                        .asserted_edge_history
+                        .entry(key)
+                        .or_default()
+                        .push(edge);
                 }
                 KernelGraphLayer::Candidate => {
-                    kernel.candidate_edge_history.entry(key).or_default().push(edge);
+                    kernel
+                        .candidate_edge_history
+                        .entry(key)
+                        .or_default()
+                        .push(edge);
                 }
             }
         }
@@ -1132,6 +1422,8 @@ impl PhoenixGraphKernel {
         self.document_scope_edges.clear();
         self.session_scope_vertices.clear();
         self.session_scope_edges.clear();
+        self.projection_scope_vertices.clear();
+        self.projection_scope_edges.clear();
         self.candidate_scope_edges.clear();
         *self.csr.write().expect("kernel csr sidecar poisoned") = KernelCsrSidecar::default();
         *self
@@ -1151,15 +1443,20 @@ impl PhoenixGraphKernel {
             .calendar_index
             .write()
             .expect("kernel calendar sidecar poisoned") = KernelCalendarSidecar::default();
-        *self.dirty_flags.write().expect("kernel dirty flags poisoned") =
-            KernelDirtyFlags::default();
+        *self
+            .dirty_flags
+            .write()
+            .expect("kernel dirty flags poisoned") = KernelDirtyFlags::default();
         for batch in batches {
             self.apply_kernel_batch_inner(batch, false)?;
         }
         Ok(())
     }
 
-    pub fn apply_kernel_batch(&mut self, batch: KernelMutationBatch) -> Result<(), GraphBackendError> {
+    pub fn apply_kernel_batch(
+        &mut self,
+        batch: KernelMutationBatch,
+    ) -> Result<(), GraphBackendError> {
         self.apply_kernel_batch_inner(batch, true)
     }
 
@@ -1226,6 +1523,27 @@ impl PhoenixGraphKernel {
                 Self::prune_edge_map_with_vertices(&mut self.asserted_edges, &self.vertices);
                 Self::prune_edge_map_with_vertices(&mut self.candidate_edges, &self.vertices);
             }
+            (KernelGraphLayer::Asserted, KernelMutationScope::Projection { .. }) => {
+                Self::replace_vertex_scope(
+                    &mut self.vertex_history,
+                    &mut self.vertices,
+                    &mut self.projection_scope_vertices,
+                    scope_key.clone(),
+                    recorded_at,
+                    vertices,
+                );
+                Self::replace_edge_scope(
+                    &mut self.asserted_edge_history,
+                    &mut self.asserted_edges,
+                    &self.vertices,
+                    &mut self.projection_scope_edges,
+                    scope_key,
+                    recorded_at,
+                    edges,
+                );
+                Self::prune_edge_map_with_vertices(&mut self.asserted_edges, &self.vertices);
+                Self::prune_edge_map_with_vertices(&mut self.candidate_edges, &self.vertices);
+            }
             (KernelGraphLayer::Candidate, KernelMutationScope::Candidate { .. }) => {
                 Self::replace_edge_scope(
                     &mut self.candidate_edge_history,
@@ -1244,6 +1562,8 @@ impl PhoenixGraphKernel {
                 self.document_scope_edges.clear();
                 self.session_scope_vertices.clear();
                 self.session_scope_edges.clear();
+                self.projection_scope_vertices.clear();
+                self.projection_scope_edges.clear();
                 self.vertices.clear();
                 self.asserted_edges.clear();
                 for vertex in vertices {
@@ -1365,10 +1685,7 @@ impl PhoenixGraphKernel {
         }
     }
 
-    fn expire_all_edges(
-        history: &mut FxHashMap<KernelEdgeKey, Vec<KernelEdge>>,
-        recorded_at: i64,
-    ) {
+    fn expire_all_edges(history: &mut FxHashMap<KernelEdgeKey, Vec<KernelEdge>>, recorded_at: i64) {
         for edge_key in history.keys().cloned().collect::<Vec<_>>() {
             expire_current_edge(history, &edge_key, recorded_at);
         }
@@ -1382,14 +1699,16 @@ impl PhoenixGraphKernel {
             .map(|vertex| (vertex.id.0.clone(), vertex))
             .collect();
         let vertex_ids = self.vertices.keys().cloned().collect::<FxHashSet<_>>();
-        self.asserted_edges = visible_edges(&self.asserted_edge_history, valid_at, tx_at, &vertex_ids)
-            .into_iter()
-            .map(|edge| (KernelEdgeKey::from_edge(&edge), edge))
-            .collect();
-        self.candidate_edges = visible_edges(&self.candidate_edge_history, valid_at, tx_at, &vertex_ids)
-            .into_iter()
-            .map(|edge| (KernelEdgeKey::from_edge(&edge), edge))
-            .collect();
+        self.asserted_edges =
+            visible_edges(&self.asserted_edge_history, valid_at, tx_at, &vertex_ids)
+                .into_iter()
+                .map(|edge| (KernelEdgeKey::from_edge(&edge), edge))
+                .collect();
+        self.candidate_edges =
+            visible_edges(&self.candidate_edge_history, valid_at, tx_at, &vertex_ids)
+                .into_iter()
+                .map(|edge| (KernelEdgeKey::from_edge(&edge), edge))
+                .collect();
     }
 
     fn prune_edge_map_with_vertices(
@@ -1402,7 +1721,10 @@ impl PhoenixGraphKernel {
     }
 
     fn mark_all_sidecars_dirty(&self) {
-        *self.dirty_flags.write().expect("kernel dirty flags poisoned") = KernelDirtyFlags {
+        *self
+            .dirty_flags
+            .write()
+            .expect("kernel dirty flags poisoned") = KernelDirtyFlags {
             csr: true,
             valid_time_index: true,
             transaction_time_index: true,
@@ -1478,12 +1800,8 @@ impl PhoenixGraphKernel {
         *self
             .entity_index
             .write()
-            .expect("kernel entity sidecar poisoned") = build_entity_sidecar(
-            &active_vertices,
-            &active_asserted,
-            &active_candidate,
-            true,
-        );
+            .expect("kernel entity sidecar poisoned") =
+            build_entity_sidecar(&active_vertices, &active_asserted, &active_candidate, true);
         flags.entity_index = false;
     }
 
@@ -1515,7 +1833,9 @@ impl PhoenixGraphBackend for PhoenixGraphKernel {
         &mut self,
         batches: Vec<GraphMutationBatch>,
     ) -> Result<(), GraphBackendError> {
-        self.rebuild_from_kernel_batches(batches.into_iter().map(KernelMutationBatch::from).collect())
+        self.rebuild_from_kernel_batches(
+            batches.into_iter().map(KernelMutationBatch::from).collect(),
+        )
     }
 
     fn snapshot(&self, include_candidate_graph: bool) -> Result<GraptorGraph, GraphBackendError> {
@@ -1593,6 +1913,7 @@ impl From<GraphMutationScope> for KernelMutationScope {
             GraphMutationScope::Document { document_id } => Self::Document { document_id },
             GraphMutationScope::Session { session_id } => Self::Session { session_id },
             GraphMutationScope::Candidate { scope_key } => Self::Candidate { scope_key },
+            GraphMutationScope::Projection { scope_key } => Self::Projection { scope_key },
             GraphMutationScope::Full => Self::Full,
         }
     }
@@ -1604,6 +1925,7 @@ impl From<KernelMutationScope> for GraphMutationScope {
             KernelMutationScope::Document { document_id } => Self::Document { document_id },
             KernelMutationScope::Session { session_id } => Self::Session { session_id },
             KernelMutationScope::Candidate { scope_key } => Self::Candidate { scope_key },
+            KernelMutationScope::Projection { scope_key } => Self::Projection { scope_key },
             KernelMutationScope::Full => Self::Full,
         }
     }
@@ -1671,8 +1993,14 @@ impl From<KernelVertex> for GraphVertexRecord {
                 ("class", serde_json::to_value(&value.class).ok()),
                 ("temporal", serde_json::to_value(&value.temporal).ok()),
                 ("provenance", serde_json::to_value(&value.provenance).ok()),
-                ("entityFacet", serde_json::to_value(&value.entity_facet).ok()),
-                ("calendarFacet", serde_json::to_value(&value.calendar_facet).ok()),
+                (
+                    "entityFacet",
+                    serde_json::to_value(&value.entity_facet).ok(),
+                ),
+                (
+                    "calendarFacet",
+                    serde_json::to_value(&value.calendar_facet).ok(),
+                ),
             ],
         );
         Self {
@@ -1737,10 +2065,16 @@ impl From<KernelEdge> for GraphEdgeRecord {
         attach_kernel_meta(
             &mut attributes,
             &[
-                ("relationClass", serde_json::to_value(&value.relation_class).ok()),
+                (
+                    "relationClass",
+                    serde_json::to_value(&value.relation_class).ok(),
+                ),
                 ("temporal", serde_json::to_value(&value.temporal).ok()),
                 ("provenance", serde_json::to_value(&value.provenance).ok()),
-                ("resolutionFacet", serde_json::to_value(&value.resolution_facet).ok()),
+                (
+                    "resolutionFacet",
+                    serde_json::to_value(&value.resolution_facet).ok(),
+                ),
             ],
         );
         Self {
@@ -1786,7 +2120,11 @@ impl From<KernelMutationBatch> for GraphMutationBatch {
         Self {
             layer: value.layer.into(),
             scope: value.scope.into(),
-            vertices: value.vertices.into_iter().map(GraphVertexRecord::from).collect(),
+            vertices: value
+                .vertices
+                .into_iter()
+                .map(GraphVertexRecord::from)
+                .collect(),
             edges: value.edges.into_iter().map(GraphEdgeRecord::from).collect(),
         }
     }
@@ -1837,11 +2175,7 @@ fn normalize_vertex(mut vertex: KernelVertex, recorded_at: i64) -> KernelVertex 
     vertex
 }
 
-fn normalize_edge(
-    mut edge: KernelEdge,
-    recorded_at: i64,
-    layer: &KernelGraphLayer,
-) -> KernelEdge {
+fn normalize_edge(mut edge: KernelEdge, recorded_at: i64, layer: &KernelGraphLayer) -> KernelEdge {
     edge.layer = layer.clone();
     edge.relation_class = if matches!(edge.relation_class, KernelRelationClass::Custom) {
         infer_relation_class(&edge.edge_type.0)
@@ -1896,7 +2230,10 @@ fn expire_current_vertex(
     expired_at: i64,
 ) {
     if let Some(records) = history.get_mut(vertex_id) {
-        if let Some(record) = records.iter_mut().rev().find(|record| record.temporal.expired_at.is_none())
+        if let Some(record) = records
+            .iter_mut()
+            .rev()
+            .find(|record| record.temporal.expired_at.is_none())
         {
             record.temporal.expired_at = Some(expired_at);
         }
@@ -1909,7 +2246,10 @@ fn expire_current_edge(
     expired_at: i64,
 ) {
     if let Some(records) = history.get_mut(edge_key) {
-        if let Some(record) = records.iter_mut().rev().find(|record| record.temporal.expired_at.is_none())
+        if let Some(record) = records
+            .iter_mut()
+            .rev()
+            .find(|record| record.temporal.expired_at.is_none())
         {
             record.temporal.expired_at = Some(expired_at);
         }
@@ -2046,7 +2386,10 @@ fn build_temporal_sidecar(
         .collect();
 
     let key = move |entry: &KernelTemporalIndexEntry| match axis {
-        TemporalAxis::Valid => (entry.valid_from.unwrap_or(i64::MIN), entry.valid_to.unwrap_or(i64::MAX)),
+        TemporalAxis::Valid => (
+            entry.valid_from.unwrap_or(i64::MIN),
+            entry.valid_to.unwrap_or(i64::MAX),
+        ),
         TemporalAxis::Transaction => (
             entry.recorded_at.unwrap_or(i64::MIN),
             entry.expired_at.unwrap_or(i64::MAX),
@@ -2221,7 +2564,8 @@ fn build_entity_sidecar(
     }
     for candidates in sidecar.alias_candidates.values_mut() {
         candidates.sort_by(|left, right| {
-            right.score
+            right
+                .score
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.entity_id.cmp(&right.entity_id))
@@ -2231,7 +2575,10 @@ fn build_entity_sidecar(
     sidecar
 }
 
-fn build_calendar_sidecar(vertices: &[KernelVertex], asserted_edges: &[KernelEdge]) -> KernelCalendarSidecar {
+fn build_calendar_sidecar(
+    vertices: &[KernelVertex],
+    asserted_edges: &[KernelEdge],
+) -> KernelCalendarSidecar {
     let mut sidecar = KernelCalendarSidecar::default();
     for vertex in vertices {
         if matches!(
@@ -2265,6 +2612,193 @@ fn build_calendar_sidecar(vertices: &[KernelVertex], asserted_edges: &[KernelEdg
         members.dedup();
     }
     sidecar
+}
+
+fn collect_slot_states(
+    vertices: &[KernelVertex],
+    asserted_edges: &[KernelEdge],
+    entity_id: &str,
+    slot_key: &str,
+) -> Vec<KernelSlotState> {
+    vertices
+        .iter()
+        .filter(|vertex| {
+            vertex.kind == "state"
+                && vertex.entity_id.as_deref() == Some(entity_id)
+                && vertex_slot_key(vertex) == Some(slot_key)
+        })
+        .map(|vertex| build_slot_state(vertex, asserted_edges, entity_id))
+        .collect()
+}
+
+fn collect_state_issues(
+    vertices: &[KernelVertex],
+    asserted_edges: &[KernelEdge],
+    issue_kind: &str,
+    entity_id: &str,
+    slot_key: Option<&str>,
+    unresolved_only: bool,
+) -> Vec<KernelStateIssue> {
+    vertices
+        .iter()
+        .filter(|vertex| {
+            vertex.kind == issue_kind
+                && vertex.entity_id.as_deref() == Some(entity_id)
+                && slot_key
+                    .map(|slot_key| vertex_slot_key(vertex) == Some(slot_key))
+                    .unwrap_or(true)
+        })
+        .filter_map(|vertex| {
+            let issue = KernelStateIssue {
+                issue_vertex_id: vertex.id.0.clone(),
+                issue_kind: issue_kind.to_owned(),
+                entity_id: entity_id.to_owned(),
+                slot_key: vertex_slot_key(vertex).unwrap_or_default().to_owned(),
+                status: vertex_string_field(vertex, "status").map(str::to_owned),
+                reason: vertex_string_field(vertex, "kind").map(str::to_owned),
+                detail: vertex_string_field(vertex, "detail").map(str::to_owned),
+                preferred_claim_id: vertex_string_field(vertex, "preferredClaimId")
+                    .map(str::to_owned),
+                temporal: vertex.temporal.clone(),
+                supporting_claim_ids: supporting_claim_ids(&vertex.id.0, asserted_edges),
+            };
+            if unresolved_only
+                && !issue
+                    .status
+                    .as_deref()
+                    .map(is_unresolved_status)
+                    .unwrap_or(true)
+            {
+                return None;
+            }
+            Some(issue)
+        })
+        .collect()
+}
+
+fn build_slot_state(
+    vertex: &KernelVertex,
+    asserted_edges: &[KernelEdge],
+    entity_id: &str,
+) -> KernelSlotState {
+    KernelSlotState {
+        state_vertex_id: vertex.id.0.clone(),
+        entity_id: entity_id.to_owned(),
+        slot_key: vertex_slot_key(vertex).unwrap_or_default().to_owned(),
+        value: vertex_string_field(vertex, "value")
+            .unwrap_or_default()
+            .to_owned(),
+        value_entity_id: vertex_string_field(vertex, "valueEntityId").map(str::to_owned),
+        status: vertex_string_field(vertex, "status").map(str::to_owned),
+        source_class: vertex_string_field(vertex, "sourceClass").map(str::to_owned),
+        confidence: vertex_confidence(vertex),
+        temporal: vertex.temporal.clone(),
+        supporting_claim_ids: supporting_claim_ids(&vertex.id.0, asserted_edges),
+        evidence_refs: vertex.provenance.evidence_refs.clone(),
+    }
+}
+
+fn vertex_slot_key(vertex: &KernelVertex) -> Option<&str> {
+    vertex_string_field(vertex, "slotKey")
+}
+
+fn vertex_string_field<'a>(vertex: &'a KernelVertex, field: &str) -> Option<&'a str> {
+    vertex
+        .value
+        .get(field)
+        .and_then(Value::as_str)
+        .or_else(|| vertex.attributes.get(field).and_then(Value::as_str))
+}
+
+fn vertex_confidence(vertex: &KernelVertex) -> Option<f64> {
+    vertex.provenance.confidence.or_else(|| {
+        vertex
+            .attributes
+            .get("confidenceMillis")
+            .and_then(Value::as_u64)
+            .map(|value| value as f64 / 1000.0)
+    })
+}
+
+fn supporting_claim_ids(source_vertex_id: &str, asserted_edges: &[KernelEdge]) -> Vec<String> {
+    let mut claim_ids = asserted_edges
+        .iter()
+        .filter(|edge| edge.source_id.0 == source_vertex_id && edge.edge_type.0 == "supported_by")
+        .filter_map(|edge| claim_id_from_vertex_id(&edge.target_id.0))
+        .collect::<Vec<_>>();
+    claim_ids.sort();
+    claim_ids.dedup();
+    claim_ids
+}
+
+fn claim_id_from_vertex_id(vertex_id: &str) -> Option<String> {
+    vertex_id
+        .strip_prefix("graph::claim::")
+        .map(str::to_owned)
+        .or_else(|| vertex_id.strip_prefix("claim::").map(str::to_owned))
+}
+
+fn compare_slot_states(left: &KernelSlotState, right: &KernelSlotState) -> std::cmp::Ordering {
+    state_status_rank(right.status.as_deref())
+        .cmp(&state_status_rank(left.status.as_deref()))
+        .then_with(|| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            right
+                .supporting_claim_ids
+                .len()
+                .cmp(&left.supporting_claim_ids.len())
+        })
+        .then_with(|| right.temporal.valid_from.cmp(&left.temporal.valid_from))
+        .then_with(|| left.state_vertex_id.cmp(&right.state_vertex_id))
+}
+
+fn compare_state_issues(left: &KernelStateIssue, right: &KernelStateIssue) -> std::cmp::Ordering {
+    left.slot_key
+        .cmp(&right.slot_key)
+        .then_with(|| left.issue_kind.cmp(&right.issue_kind))
+        .then_with(|| right.temporal.valid_from.cmp(&left.temporal.valid_from))
+        .then_with(|| left.issue_vertex_id.cmp(&right.issue_vertex_id))
+}
+
+fn state_status_rank(status: Option<&str>) -> u8 {
+    match status.unwrap_or_default() {
+        "supported" => 6,
+        "active" => 5,
+        "candidate" => 4,
+        "deferred" => 3,
+        "contradicted" => 2,
+        "superseded" => 1,
+        "rejected" => 0,
+        _ => 0,
+    }
+}
+
+fn is_unresolved_status(status: &str) -> bool {
+    !matches!(status, "rejected" | "superseded")
+}
+
+fn classify_state_change(
+    temporal: &KernelBiTemporal,
+    since_valid_at: i64,
+    until_valid_at: i64,
+) -> Option<KernelStateChangeKind> {
+    let activated = temporal
+        .valid_from
+        .is_some_and(|value| value >= since_valid_at && value < until_valid_at);
+    let expired = temporal
+        .valid_to
+        .is_some_and(|value| value > since_valid_at && value <= until_valid_at);
+    match (activated, expired) {
+        (true, true) => Some(KernelStateChangeKind::ActivatedAndExpired),
+        (true, false) => Some(KernelStateChangeKind::Activated),
+        (false, true) => Some(KernelStateChangeKind::Expired),
+        (false, false) => None,
+    }
 }
 
 fn surface_for_vertex(vertex: &KernelVertex) -> Option<String> {
@@ -2430,7 +2964,12 @@ fn calendar_anchor_vertex(
     }
 }
 
-fn calendar_edge(source_id: &str, target_id: &str, edge_type: &str, recorded_at: i64) -> KernelEdge {
+fn calendar_edge(
+    source_id: &str,
+    target_id: &str,
+    edge_type: &str,
+    recorded_at: i64,
+) -> KernelEdge {
     KernelEdge {
         source_id: KernelVertexId(source_id.to_owned()),
         target_id: KernelVertexId(target_id.to_owned()),
@@ -2734,15 +3273,26 @@ mod tests {
             limit: Some(4),
             ..KernelEntityResolveRequest::default()
         });
-        assert_eq!(current.first().map(|candidate| candidate.entity_id.as_str()), Some("entity-b"));
+        assert_eq!(
+            current
+                .first()
+                .map(|candidate| candidate.entity_id.as_str()),
+            Some("entity-b")
+        );
 
         let old = kernel.view_as_of(KernelViewRequest {
             valid_at: Some(1),
             recorded_at: Some(15),
             include_candidate_graph: false,
         });
-        assert!(old.asserted_edges.iter().any(|edge| edge.target_id.0 == "entity::a"));
-        assert!(!old.asserted_edges.iter().any(|edge| edge.target_id.0 == "entity::b"));
+        assert!(old
+            .asserted_edges
+            .iter()
+            .any(|edge| edge.target_id.0 == "entity::a"));
+        assert!(!old
+            .asserted_edges
+            .iter()
+            .any(|edge| edge.target_id.0 == "entity::b"));
     }
 
     #[test]
@@ -2752,7 +3302,9 @@ mod tests {
             Some(1_710_000_000_000),
         );
         assert!(vertices.iter().any(|vertex| vertex.id.0 == anchors.year_id));
-        assert!(vertices.iter().any(|vertex| vertex.id.0 == anchors.month_id));
+        assert!(vertices
+            .iter()
+            .any(|vertex| vertex.id.0 == anchors.month_id));
         assert!(vertices.iter().any(|vertex| vertex.id.0 == anchors.week_id));
         assert!(vertices.iter().any(|vertex| vertex.id.0 == anchors.day_id));
         assert!(vertices.iter().any(|vertex| vertex.id.0 == anchors.hour_id));
@@ -2761,5 +3313,271 @@ mod tests {
                 && edge.target_id.0 == anchors.month_id
                 && edge.edge_type.0 == "contains"
         }));
+    }
+
+    #[test]
+    fn world_state_queries_return_active_slot_and_unresolved_issues() {
+        let mut kernel = PhoenixGraphKernel::new();
+        kernel
+            .apply_kernel_batch(KernelMutationBatch {
+                layer: KernelGraphLayer::Asserted,
+                scope: KernelMutationScope::Projection {
+                    scope_key: "scope-1".to_owned(),
+                },
+                recorded_at: Some(100),
+                vertices: vec![
+                    KernelVertex {
+                        id: KernelVertexId("graph::claim::claim-1".to_owned()),
+                        kind: "claim".to_owned(),
+                        value: json!({"slotKey":"entity.employer","objectValue":"Acme"}),
+                        attributes: json!({}),
+                        ..KernelVertex::default()
+                    },
+                    KernelVertex {
+                        id: KernelVertexId("graph::claim::claim-2".to_owned()),
+                        kind: "claim".to_owned(),
+                        value: json!({"slotKey":"entity.employer","objectValue":"Zenith"}),
+                        attributes: json!({}),
+                        ..KernelVertex::default()
+                    },
+                    KernelVertex {
+                        id: KernelVertexId("graph::state::old".to_owned()),
+                        kind: "state".to_owned(),
+                        class: KernelVertexClass::State,
+                        value: json!({
+                            "slotKey":"entity.employer",
+                            "value":"Acme",
+                            "status":"superseded",
+                            "sourceClass":"world",
+                        }),
+                        attributes: json!({"confidenceMillis": 400}),
+                        temporal: KernelBiTemporal {
+                            valid_from: Some(0),
+                            valid_to: Some(50),
+                            recorded_at: Some(100),
+                            expired_at: None,
+                        },
+                        provenance: KernelProvenance {
+                            confidence: Some(0.4),
+                            ..KernelProvenance::default()
+                        },
+                        entity_id: Some("alice".to_owned()),
+                        ..KernelVertex::default()
+                    },
+                    KernelVertex {
+                        id: KernelVertexId("graph::state::current".to_owned()),
+                        kind: "state".to_owned(),
+                        class: KernelVertexClass::State,
+                        value: json!({
+                            "slotKey":"entity.employer",
+                            "value":"Zenith",
+                            "status":"active",
+                            "sourceClass":"world",
+                        }),
+                        attributes: json!({"confidenceMillis": 900}),
+                        temporal: KernelBiTemporal {
+                            valid_from: Some(50),
+                            valid_to: None,
+                            recorded_at: Some(100),
+                            expired_at: None,
+                        },
+                        provenance: KernelProvenance {
+                            confidence: Some(0.9),
+                            ..KernelProvenance::default()
+                        },
+                        entity_id: Some("alice".to_owned()),
+                        ..KernelVertex::default()
+                    },
+                    KernelVertex {
+                        id: KernelVertexId("graph::conflict::conflict-1".to_owned()),
+                        kind: "conflict".to_owned(),
+                        value: json!({
+                            "slotKey":"entity.employer",
+                            "kind":"mutuallyExclusive",
+                            "status":"supported",
+                        }),
+                        attributes: json!({"preferredClaimId":"claim-2"}),
+                        temporal: KernelBiTemporal {
+                            valid_from: Some(60),
+                            valid_to: None,
+                            recorded_at: Some(100),
+                            expired_at: None,
+                        },
+                        entity_id: Some("alice".to_owned()),
+                        ..KernelVertex::default()
+                    },
+                    KernelVertex {
+                        id: KernelVertexId("graph::gap::gap-1".to_owned()),
+                        kind: "gap".to_owned(),
+                        value: json!({
+                            "slotKey":"entity.employer",
+                            "kind":"unresolvedConflict",
+                            "detail":"Need review",
+                            "status":"active",
+                        }),
+                        attributes: json!({}),
+                        temporal: KernelBiTemporal {
+                            valid_from: Some(70),
+                            valid_to: None,
+                            recorded_at: Some(100),
+                            expired_at: None,
+                        },
+                        entity_id: Some("alice".to_owned()),
+                        ..KernelVertex::default()
+                    },
+                ],
+                edges: vec![
+                    KernelEdge {
+                        source_id: KernelVertexId("graph::state::old".to_owned()),
+                        target_id: KernelVertexId("graph::claim::claim-1".to_owned()),
+                        edge_type: KernelEdgeType("supported_by".to_owned()),
+                        relation_class: KernelRelationClass::Resolution,
+                        weight: 1,
+                        attributes: json!({}),
+                        ..KernelEdge::default()
+                    },
+                    KernelEdge {
+                        source_id: KernelVertexId("graph::state::current".to_owned()),
+                        target_id: KernelVertexId("graph::claim::claim-2".to_owned()),
+                        edge_type: KernelEdgeType("supported_by".to_owned()),
+                        relation_class: KernelRelationClass::Resolution,
+                        weight: 1,
+                        attributes: json!({}),
+                        ..KernelEdge::default()
+                    },
+                    KernelEdge {
+                        source_id: KernelVertexId("graph::conflict::conflict-1".to_owned()),
+                        target_id: KernelVertexId("graph::claim::claim-2".to_owned()),
+                        edge_type: KernelEdgeType("supported_by".to_owned()),
+                        relation_class: KernelRelationClass::Resolution,
+                        weight: 1,
+                        attributes: json!({}),
+                        ..KernelEdge::default()
+                    },
+                    KernelEdge {
+                        source_id: KernelVertexId("graph::gap::gap-1".to_owned()),
+                        target_id: KernelVertexId("graph::claim::claim-2".to_owned()),
+                        edge_type: KernelEdgeType("supported_by".to_owned()),
+                        relation_class: KernelRelationClass::Resolution,
+                        weight: 1,
+                        attributes: json!({}),
+                        ..KernelEdge::default()
+                    },
+                ],
+            })
+            .expect("projection batch");
+
+        let current = kernel.current_slot("alice", "entity.employer", Some(100));
+        assert_eq!(
+            current
+                .active_state
+                .as_ref()
+                .map(|state| state.value.as_str()),
+            Some("Zenith")
+        );
+        assert_eq!(
+            current
+                .active_state
+                .as_ref()
+                .map(|state| state.supporting_claim_ids.clone()),
+            Some(vec!["claim-2".to_owned()])
+        );
+        assert_eq!(current.competing_states.len(), 0);
+        assert_eq!(current.conflicts.len(), 1);
+        assert_eq!(current.gaps.len(), 1);
+
+        let past = kernel.slot_at(KernelSlotQueryRequest {
+            entity_id: "alice".to_owned(),
+            slot_key: "entity.employer".to_owned(),
+            valid_at: Some(25),
+            recorded_at: Some(100),
+            include_candidate_graph: false,
+        });
+        assert_eq!(
+            past.active_state.as_ref().map(|state| state.value.as_str()),
+            Some("Acme")
+        );
+
+        let unresolved = kernel.what_is_unresolved(KernelUnresolvedQueryRequest {
+            entity_id: "alice".to_owned(),
+            slot_key: Some("entity.employer".to_owned()),
+            valid_at: Some(100),
+            recorded_at: Some(100),
+            include_candidate_graph: false,
+        });
+        assert_eq!(unresolved.len(), 2);
+    }
+
+    #[test]
+    fn what_changed_reports_state_activations_and_expirations() {
+        let mut kernel = PhoenixGraphKernel::new();
+        kernel
+            .apply_kernel_batch(KernelMutationBatch {
+                layer: KernelGraphLayer::Asserted,
+                scope: KernelMutationScope::Projection {
+                    scope_key: "scope-2".to_owned(),
+                },
+                recorded_at: Some(100),
+                vertices: vec![
+                    KernelVertex {
+                        id: KernelVertexId("graph::state::old".to_owned()),
+                        kind: "state".to_owned(),
+                        class: KernelVertexClass::State,
+                        value: json!({
+                            "slotKey":"entity.location",
+                            "value":"Austin",
+                            "status":"superseded",
+                            "sourceClass":"world",
+                        }),
+                        temporal: KernelBiTemporal {
+                            valid_from: Some(0),
+                            valid_to: Some(50),
+                            recorded_at: Some(100),
+                            expired_at: None,
+                        },
+                        entity_id: Some("alice".to_owned()),
+                        ..KernelVertex::default()
+                    },
+                    KernelVertex {
+                        id: KernelVertexId("graph::state::new".to_owned()),
+                        kind: "state".to_owned(),
+                        class: KernelVertexClass::State,
+                        value: json!({
+                            "slotKey":"entity.location",
+                            "value":"Boston",
+                            "status":"active",
+                            "sourceClass":"world",
+                        }),
+                        temporal: KernelBiTemporal {
+                            valid_from: Some(50),
+                            valid_to: None,
+                            recorded_at: Some(100),
+                            expired_at: None,
+                        },
+                        entity_id: Some("alice".to_owned()),
+                        ..KernelVertex::default()
+                    },
+                ],
+                edges: Vec::new(),
+            })
+            .expect("projection batch");
+
+        let changes = kernel.what_changed(KernelWhatChangedRequest {
+            entity_id: "alice".to_owned(),
+            slot_key: Some("entity.location".to_owned()),
+            since_valid_at: 40,
+            until_valid_at: Some(100),
+            recorded_at: Some(100),
+            include_candidate_graph: false,
+        });
+
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|change| change.change_kind
+            == KernelStateChangeKind::Activated
+            && change.state.value == "Boston"));
+        assert!(changes.iter().any(
+            |change| change.change_kind == KernelStateChangeKind::Expired
+                && change.state.value == "Austin"
+        ));
     }
 }

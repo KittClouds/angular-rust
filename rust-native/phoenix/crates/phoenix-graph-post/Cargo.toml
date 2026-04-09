@@ -1,0 +1,24 @@
+[package]
+name = "phoenix-graph-post"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rustc-hash.workspace = true
+hashbrown.workspace = true
+thiserror.workspace = true
+memchr.workspace = true
+memmap2 = "0.9"
+phoenix-embed = { path = "../phoenix-embed" }
+phoenix-chunker = { path = "../phoenix-chunker" }
+phoenix-graph = { path = "../phoenix-graph" }
+phoenix-graph-kernel = { path = "../phoenix-graph-kernel" }
+phoenix-rel-post = { path = "../phoenix-rel-post" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
+phoenix-store-native-core = { path = "../phoenix-store-native-core" }
+phoenix-store-overgraph = { path = "../phoenix-store-overgraph" }
+phoenix-types = { path = "../phoenix-types" }

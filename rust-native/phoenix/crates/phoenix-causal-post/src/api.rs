@@ -7,7 +7,8 @@
 //! into the worker internals from orchestration code.
 
 use phoenix_store_native_core::{
-    PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore, StoreError,
+    PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore,
+    PhoenixEventIdentityPatchStore, StoreError,
 };
 use phoenix_types::SessionId;
 
@@ -21,7 +22,10 @@ pub fn derive_batches<S>(
     session_id: Option<&SessionId>,
 ) -> Result<Vec<CausalScopeReviewBatch>, StoreError>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixCausalPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixCausalPatchStore
+        + PhoenixEventIdentityPatchStore,
 {
     derive_dirty_scope_review_batches(store, session_id)
 }

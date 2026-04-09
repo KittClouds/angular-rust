@@ -1,103 +1,50 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TrackedSlot {
-    pub slot_key: &'static str,
-    pub relation_family: &'static str,
-    pub single_value: bool,
-    pub relationship_only: bool,
-    pub active: bool,
+use phoenix_semantic_v2::{
+    default_state_slot_definitions, StateSchemaScopeSidecar, StateSlotDefinitionRecord,
+    StateSlotLifecycle,
+};
+
+pub fn merged_slot_definitions(
+    state_schema_sidecar: Option<&StateSchemaScopeSidecar>,
+) -> Vec<StateSlotDefinitionRecord> {
+    let mut definitions = default_state_slot_definitions();
+    if let Some(sidecar) = state_schema_sidecar {
+        for update in &sidecar.slot_definitions {
+            match definitions
+                .iter()
+                .position(|definition| definition.slot_key == update.slot_key)
+            {
+                Some(index) => definitions[index] = update.clone(),
+                None => definitions.push(update.clone()),
+            }
+        }
+    }
+    definitions.sort_by(|left, right| left.slot_key.cmp(&right.slot_key));
+    definitions
 }
 
-pub const TRACKED_SLOTS: &[TrackedSlot] = &[
-    TrackedSlot {
-        slot_key: "entity.location",
-        relation_family: "located_in",
-        single_value: true,
-        relationship_only: false,
-        active: true,
-    },
-    TrackedSlot {
-        slot_key: "entity.employer",
-        relation_family: "works_for",
-        single_value: true,
-        relationship_only: false,
-        active: true,
-    },
-    TrackedSlot {
-        slot_key: "entity.membership",
-        relation_family: "member_of",
-        single_value: true,
-        relationship_only: false,
-        active: true,
-    },
-    TrackedSlot {
-        slot_key: "relationship.commands",
-        relation_family: "commands",
-        single_value: false,
-        relationship_only: true,
-        active: true,
-    },
-    TrackedSlot {
-        slot_key: "relationship.protects",
-        relation_family: "protects",
-        single_value: false,
-        relationship_only: true,
-        active: true,
-    },
-    TrackedSlot {
-        slot_key: "project.status",
-        relation_family: "",
-        single_value: true,
-        relationship_only: false,
-        active: false,
-    },
-    TrackedSlot {
-        slot_key: "task.owner",
-        relation_family: "",
-        single_value: true,
-        relationship_only: false,
-        active: false,
-    },
-    TrackedSlot {
-        slot_key: "task.due_date",
-        relation_family: "",
-        single_value: true,
-        relationship_only: false,
-        active: false,
-    },
-    TrackedSlot {
-        slot_key: "task.completion_state",
-        relation_family: "",
-        single_value: true,
-        relationship_only: false,
-        active: false,
-    },
-    TrackedSlot {
-        slot_key: "entity.preference",
-        relation_family: "",
-        single_value: true,
-        relationship_only: false,
-        active: false,
-    },
-    TrackedSlot {
-        slot_key: "entity.role",
-        relation_family: "",
-        single_value: true,
-        relationship_only: false,
-        active: false,
-    },
-];
-
-pub fn slot_for_relation_family(relation_family: &str) -> Option<&'static TrackedSlot> {
-    TRACKED_SLOTS
-        .iter()
-        .find(|slot| slot.active && slot.relation_family == relation_family)
+pub fn slot_definition_for_relation_family<'a>(
+    relation_family: &str,
+    definitions: &'a [StateSlotDefinitionRecord],
+) -> Option<&'a StateSlotDefinitionRecord> {
+    definitions.iter().find(|definition| {
+        definition.lifecycle != StateSlotLifecycle::Deprecated
+            && definition
+                .relation_families
+                .iter()
+                .any(|value| value == relation_family)
+    })
 }
 
-pub fn active_scalar_slot_keys() -> Vec<&'static str> {
-    TRACKED_SLOTS
+pub fn active_scalar_slot_keys(definitions: &[StateSlotDefinitionRecord]) -> Vec<String> {
+    definitions
         .iter()
-        .filter(|slot| slot.active && !slot.relationship_only)
-        .map(|slot| slot.slot_key)
+        .filter(|definition| {
+            matches!(
+                definition.lifecycle,
+                StateSlotLifecycle::Active | StateSlotLifecycle::Stable
+            ) && !definition.relationship_only
+        })
+        .map(|definition| definition.slot_key.clone())
         .collect()
 }
 

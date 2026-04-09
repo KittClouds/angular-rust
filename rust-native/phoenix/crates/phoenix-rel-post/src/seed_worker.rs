@@ -13,7 +13,8 @@ use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::{
-    derive_relation_entity_profiles, GlirelWorkerError, RelationEntityProfile, RelationMentionSeeder,
+    derive_relation_entity_profiles, GlirelWorkerError, RelationEntityProfile,
+    RelationMentionSeeder,
 };
 
 #[derive(Clone, Debug)]
@@ -106,7 +107,8 @@ pub fn build_relation_mention_seed_sidecar(
     };
     let mut seeds = Vec::new();
     for archive in archives {
-        let candidate_chunks = select_candidate_chunks(archive, &profiles, config.max_chunks_per_archive);
+        let candidate_chunks =
+            select_candidate_chunks(archive, &profiles, config.max_chunks_per_archive);
         report.candidate_chunk_count += candidate_chunks.len();
         let microchunks = build_microchunks(archive, &candidate_chunks, config);
         report.microchunk_count += microchunks.len();
@@ -305,7 +307,10 @@ fn build_microchunks(
             microchunks.push(SeedMicrochunk {
                 input_id: format!(
                     "{}::{}::{}::{}",
-                    archive.manifest.document_id, archive.manifest.revision, chunk.chunk_id.0, window_index
+                    archive.manifest.document_id,
+                    archive.manifest.revision,
+                    chunk.chunk_id.0,
+                    window_index
                 ),
                 document_id: archive.manifest.document_id.clone(),
                 revision: archive.manifest.revision,
@@ -448,7 +453,8 @@ mod tests {
                 range: TextRange { start: 0, end: 84 },
                 chapter_id: 0,
                 boundary_label: None,
-                text: "Alice works for Dynamis. Dynamis is in New Rome. Ryan later meets Len.".to_owned(),
+                text: "Alice works for Dynamis. Dynamis is in New Rome. Ryan later meets Len."
+                    .to_owned(),
             }],
             ..Default::default()
         };

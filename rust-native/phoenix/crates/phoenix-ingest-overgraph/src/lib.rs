@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 use memchr::memchr3_iter;
 use phoenix_alex::Lexicon;
-use phoenix_causality::{CausalityLowerer, CausalityRequest};
+use phoenix_causality::{CausalityLowerer, CausalityRequest, SemanticLowerer};
 use phoenix_chunker::{build_chunks, ChunkerConfig};
 use phoenix_kernel::{
     DeterministicKernel, KernelEdge, KernelEdgeType, KernelEntityFacet, KernelEntitySidecar,
@@ -16,29 +16,34 @@ use phoenix_kernel::{
 };
 use phoenix_machine::SurfaceCompileArtifacts;
 use phoenix_proposition::PropositionLowerer;
-use phoenix_semantics::SemanticLowerer;
 use phoenix_semantic_v2::{
     scope_storage_key, AliasConfirmation, AliasEntry, AliasPosting, CandidateEntity,
     CandidateEvidence, ChunkId, ChunkRecord, CompactResolutionKind, CompactResolutionRow,
     CorefClusterRecord, DirtyScopeRecord, DocumentArchive, DocumentCausalSubstrate,
-    DocumentManifest, DocumentOrd, DocumentOrdinalAssignment, DocumentRevisionRef,
-    DocumentSegmentHeader, DocumentSegmentKind, DocumentSegmentRef, DocumentVersionId,
+    DocumentEventIdentitySubstrate, DocumentManifest, DocumentOrd, DocumentOrdinalAssignment,
+    DocumentRevisionRef, DocumentSegmentHeader, DocumentSegmentKind, DocumentSegmentRef,
+    DocumentTemporalSubstrate, DocumentVersionId, EventIdentityDiagnosticRecord, EventMentionId,
+    EventMentionPacketSeed, EventModalitySemantics, EventParticipantSlot, EventSourceSemantics,
     LexicalPostingsSegment, NativeCorefSummary, NativeErSummary, PreparedDocument,
     PreparedDocumentSegment, RecordedTemporalBinding, ResolutionDecision, ResolvedMention,
     ScopeLexSidecar, ScopeOrd, SemanticEntityRecord, SemanticRelationRecord, SessionArchive,
+    SurfaceTemporalCueRecord, TemporalAnchorId, TemporalAnchorRecord, TemporalAxisId,
+    TemporalAxisKind, TemporalAxisRecord, TemporalClaimAtom, TemporalConstraintId,
+    TemporalConstraintKind, TemporalConstraintRecord, TemporalDiagnosticRecord,
+    TemporalReferenceEdge, TemporalTimexId, TemporalTimexRecord,
 };
 use phoenix_store_native_core::{
     BundleHeader, BundleKey, BundleKind, PhoenixArchiveStoreV2, PhoenixBundleStoreV2, StoreError,
 };
 use phoenix_time::TimeKernel;
 use phoenix_types::{
-    BoundaryKind, ChunkKind, ChunkSpan, Diagnostic, DocumentId, EntityId, EntityKind, EvidenceSpan,
-    FrameSlot, IndexedSpan, IndexedTextField, IngestDocument, IngestDocumentSummary, IngestResult,
-    KnownMatch, KnownMatchSource, LexicalField, LexiconEntry, MentionEntityRef, MentionSource,
-    MentionSpan, NarrativeTransitivity, NarrativeVerbHit, PosTag, RelationCandidate,
-    ResolverEntitySeed, ResolverLink, ResolverLinkKind, ScanArtifact, ScopeKey, SentenceFrame,
-    SentenceSpan, SessionDocumentState, SessionId, StructureArtifact, TextRange, TokenClass,
-    TokenSpan, VerbFrame,
+    BiTemporalWindow, BoundaryKind, ChunkKind, ChunkSpan, Diagnostic, DocumentId, EntityId,
+    EntityKind, EvidenceSpan, FrameSlot, IndexedSpan, IndexedTextField, IngestDocument,
+    IngestDocumentSummary, IngestResult, KnownMatch, KnownMatchSource, LexicalField, LexiconEntry,
+    MentionEntityRef, MentionSource, MentionSpan, NarrativeTransitivity, NarrativeVerbHit, PosTag,
+    RelationCandidate, ResolverEntitySeed, ResolverLink, ResolverLinkKind, ScanArtifact, ScopeKey,
+    SemanticNodeRef, SentenceFrame, SentenceSpan, SessionDocumentState, SessionId,
+    StructureArtifact, TextRange, TokenClass, TokenSpan, VerbFrame,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -5873,7 +5878,7 @@ mod tests {
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         env::temp_dir().join(format!(
-            "phoenix-invarant-v2-test-{name}-{}",
+            "phoenix-ingest-overgraph-test-{name}-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time")
@@ -8510,8 +8515,15 @@ impl PhoenixInvarantV3 {
             resolution_bundle.discovery_count,
             mention_count,
         );
-        let causal_substrate =
-            build_document_causal_substrate(document, &scan_bundle, created_at);
+        let causal_substrate = build_document_causal_substrate(document, &scan_bundle, created_at);
+        let temporal_substrate =
+            build_document_temporal_substrate(document, &scan_bundle, created_at);
+        let event_identity_substrate = build_document_event_identity_substrate(
+            document,
+            manifest.revision,
+            &causal_substrate,
+            &temporal_substrate,
+        );
 
         let mut segments = Vec::<PreparedDocumentSegment>::new();
         let mut segment_refs = Vec::<DocumentSegmentRef>::new();
@@ -8567,6 +8579,33 @@ impl PhoenixInvarantV3 {
                 + causal_substrate.causal_links.len()
                 + causal_substrate.causal_diagnostics.len(),
             &causal_substrate,
+        )?;
+        self.push_segment(
+            &mut segments,
+            &mut segment_refs,
+            DocumentSegmentKind::TemporalSubstrateTable,
+            temporal_substrate.propositions.len()
+                + temporal_substrate.semantic_events.len()
+                + temporal_substrate.semantic_states.len()
+                + temporal_substrate.semantic_claims.len()
+                + temporal_substrate.surface_temporal_cues.len()
+                + temporal_substrate.timex_records.len()
+                + temporal_substrate.anchor_candidates.len()
+                + temporal_substrate.axis_records.len()
+                + temporal_substrate.reference_timex_edges.len()
+                + temporal_substrate.reference_event_edges.len()
+                + temporal_substrate.temporal_claims.len()
+                + temporal_substrate.temporal_constraints.len()
+                + temporal_substrate.temporal_diagnostics.len(),
+            &temporal_substrate,
+        )?;
+        self.push_segment(
+            &mut segments,
+            &mut segment_refs,
+            DocumentSegmentKind::EventIdentitySubstrateTable,
+            event_identity_substrate.mention_seeds.len()
+                + event_identity_substrate.diagnostics.len(),
+            &event_identity_substrate,
         )?;
 
         let lexical_started = Instant::now();
@@ -8737,8 +8776,15 @@ impl PhoenixInvarantV3 {
             resolution_bundle.discovery_count,
             mention_count,
         );
-        let causal_substrate =
-            build_document_causal_substrate(document, &scan_bundle, created_at);
+        let causal_substrate = build_document_causal_substrate(document, &scan_bundle, created_at);
+        let temporal_substrate =
+            build_document_temporal_substrate(document, &scan_bundle, created_at);
+        let event_identity_substrate = build_document_event_identity_substrate(
+            document,
+            manifest.revision,
+            &causal_substrate,
+            &temporal_substrate,
+        );
         let phase_started = Instant::now();
         let archive = DocumentArchive {
             manifest,
@@ -8760,6 +8806,8 @@ impl PhoenixInvarantV3 {
             graph_batch: KernelMutationBatch::default(),
             structure: None,
             causal_substrate: Some(causal_substrate),
+            temporal_substrate: Some(temporal_substrate),
+            event_identity_substrate: Some(event_identity_substrate),
         };
         if progress {
             eprintln!(
@@ -8803,7 +8851,8 @@ fn build_document_causal_substrate(
                 .sentences
                 .iter()
                 .position(|sentence| {
-                    sentence.range.start <= chunk.range.start && sentence.range.end >= chunk.range.end
+                    sentence.range.start <= chunk.range.start
+                        && sentence.range.end >= chunk.range.end
                 })
                 .unwrap_or_default(),
         })
@@ -8829,7 +8878,9 @@ fn build_document_causal_substrate(
     let semantics = SemanticLowerer::lower(&propositions);
     let temporal_bindings = propositions
         .iter()
-        .map(|proposition| TimeKernel::bind_label(proposition.predicate.predicate.as_str(), Some(created_at)))
+        .map(|proposition| {
+            TimeKernel::bind_label(proposition.predicate.predicate.as_str(), Some(created_at))
+        })
         .collect::<Vec<_>>();
     let causality = CausalityLowerer::lower(CausalityRequest {
         text: &document.text,
@@ -8857,7 +8908,917 @@ fn build_document_causal_substrate(
     }
 }
 
-fn build_causal_structure_artifact(document: &IngestDocument, scan_bundle: &NativeScanBundle) -> StructureArtifact {
+fn build_document_temporal_substrate(
+    document: &IngestDocument,
+    scan_bundle: &NativeScanBundle,
+    created_at: i64,
+) -> DocumentTemporalSubstrate {
+    let chunk_spans = scan_bundle
+        .chunks
+        .iter()
+        .map(|chunk| ChunkSpan {
+            kind: None,
+            range: chunk.range,
+            head: chunk.range,
+            modifiers: Vec::new(),
+            sentence_index: scan_bundle
+                .scan
+                .sentences
+                .iter()
+                .position(|sentence| {
+                    sentence.range.start <= chunk.range.start
+                        && sentence.range.end >= chunk.range.end
+                })
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    let artifacts = SurfaceCompileArtifacts {
+        scan: ScanArtifact {
+            sentences: scan_bundle.scan.sentences.clone(),
+            tokens: Vec::new(),
+            mentions: scan_bundle.scan.mentions.clone(),
+            chunks: chunk_spans,
+            resolver_links: scan_bundle.scan.resolver_links.clone(),
+            narrative_hits: scan_bundle.scan.narrative_hits.clone(),
+            diagnostics: vec![Diagnostic {
+                code: "PX_TEMPORAL_SUBSTRATE_SCAN".to_owned(),
+                message: "Rebuilt compact scan artifact for temporal substrate compilation."
+                    .to_owned(),
+            }],
+        },
+        structure: build_causal_structure_artifact(document, scan_bundle),
+        surface: phoenix_types::SurfaceDocument::default(),
+    };
+    let propositions = PropositionLowerer::lower(&artifacts);
+    let semantics = SemanticLowerer::lower(&propositions);
+    let document_id = document.document_id.0.clone();
+    let dct_axis_id = TemporalAxisId("axis:world".to_owned());
+    let mut axis_records = vec![TemporalAxisRecord {
+        axis_id: dct_axis_id.clone(),
+        document_id: document_id.clone(),
+        kind: TemporalAxisKind::World,
+        label: "world".to_owned(),
+        evidence_refs: vec!["document_created_at".to_owned()],
+    }];
+    let mut axis_by_kind = FxHashMap::<TemporalAxisKind, TemporalAxisId>::default();
+    axis_by_kind.insert(TemporalAxisKind::World, dct_axis_id.clone());
+
+    let dct_temporal = temporal_window(Some(created_at), Some(created_at), Some(created_at));
+    let dct_timex_id = TemporalTimexId(format!("timex:{document_id}:dct"));
+    let mut timex_records = vec![TemporalTimexRecord {
+        timex_id: dct_timex_id.clone(),
+        document_id: document_id.clone(),
+        proposition_id: None,
+        sentence_index: 0,
+        label: "document_created_at".to_owned(),
+        normalized_value: Some(created_at.to_string()),
+        range: None,
+        axis_id: dct_axis_id.clone(),
+        temporal: dct_temporal.clone(),
+        confidence_millis: 1000,
+        source_class: "document_created_at".to_owned(),
+        evidence_refs: vec!["manifest.created_at".to_owned()],
+    }];
+    let node_id_by_proposition = semantics
+        .events
+        .iter()
+        .filter_map(|event| {
+            event
+                .event_id
+                .as_ref()
+                .map(|event_id| (event.proposition_id.to_string(), event_id.0.clone()))
+        })
+        .chain(semantics.states.iter().filter_map(|state| {
+            state
+                .state_id
+                .as_ref()
+                .map(|state_id| (state.proposition_id.to_string(), state_id.0.clone()))
+        }))
+        .chain(semantics.claims.iter().filter_map(|claim| {
+            claim
+                .claim_id
+                .as_ref()
+                .map(|claim_id| (claim.proposition_id.to_string(), claim_id.0.clone()))
+        }))
+        .collect::<FxHashMap<_, _>>();
+
+    let mut propositions_sorted = propositions.iter().collect::<Vec<_>>();
+    propositions_sorted.sort_by(|left, right| {
+        left.sentence_index
+            .cmp(&right.sentence_index)
+            .then_with(|| {
+                left.proposition_id
+                    .as_str()
+                    .cmp(right.proposition_id.as_str())
+            })
+    });
+
+    let mut surface_temporal_cues = Vec::<SurfaceTemporalCueRecord>::new();
+    let mut anchor_candidates = Vec::<TemporalAnchorRecord>::new();
+    let mut reference_timex_edges = Vec::<TemporalReferenceEdge>::new();
+    let mut reference_event_edges = Vec::<TemporalReferenceEdge>::new();
+    let mut temporal_claims = Vec::<TemporalClaimAtom>::new();
+    let mut temporal_constraints = Vec::<TemporalConstraintRecord>::new();
+    let mut temporal_diagnostics = Vec::<TemporalDiagnosticRecord>::new();
+    let mut last_event_by_axis = FxHashMap::<String, (String, usize)>::default();
+
+    for proposition in propositions_sorted {
+        let axis_kind = proposition_axis_kind(proposition);
+        let axis_id = ensure_temporal_axis(
+            &mut axis_records,
+            &mut axis_by_kind,
+            &document_id,
+            axis_kind,
+        );
+        let snippet = proposition_snippet(document, proposition);
+        let snippet_lower = snippet.to_ascii_lowercase();
+        let snippet_range = proposition_text_range(proposition);
+
+        let mut cue_specs = temporal_cue_specs(proposition, &snippet_lower);
+        if cue_specs.is_empty() {
+            cue_specs.push((
+                "predicate".to_owned(),
+                proposition.predicate.predicate.to_string(),
+            ));
+        }
+        for (index, (cue_kind, label)) in cue_specs.into_iter().enumerate() {
+            surface_temporal_cues.push(SurfaceTemporalCueRecord {
+                cue_id: format!("cue:{}:{}:{index}", document_id, proposition.proposition_id),
+                proposition_id: Some(proposition.proposition_id.to_string()),
+                sentence_index: proposition.sentence_index,
+                cue_kind,
+                label,
+                range: snippet_range,
+            });
+        }
+
+        let explicit_timex = detect_explicit_timex(
+            &document_id,
+            proposition,
+            &snippet_lower,
+            snippet_range,
+            &axis_id,
+            created_at,
+        );
+        let mut timex_id = dct_timex_id.clone();
+        let mut anchor_kind = "document_created_at".to_owned();
+        let mut anchor_temporal = dct_temporal.clone();
+        let mut anchor_evidence = vec!["manifest.created_at".to_owned()];
+        let mut anchor_source = "document_created_at".to_owned();
+        if let Some(record) = explicit_timex {
+            timex_id = record.timex_id.clone();
+            anchor_kind = "explicit_timex".to_owned();
+            anchor_temporal = record.temporal.clone();
+            anchor_evidence = vec![record.label.clone()];
+            anchor_source = record.source_class.clone();
+            timex_records.push(record);
+        }
+
+        if let Some(event_id) = node_id_by_proposition.get(proposition.proposition_id.as_str()) {
+            let event_fingerprint = temporal_event_fingerprint(&document_id, proposition, event_id);
+            let anchor_id = TemporalAnchorId(format!("anchor:{event_fingerprint}"));
+            anchor_candidates.push(TemporalAnchorRecord {
+                anchor_id: anchor_id.clone(),
+                document_id: document_id.clone(),
+                proposition_id: Some(proposition.proposition_id.to_string()),
+                event_id: Some(event_id.clone()),
+                canonical_event_id: None,
+                timex_id: Some(timex_id.clone()),
+                reference_event_id: None,
+                canonical_reference_event_id: None,
+                axis_id: axis_id.clone(),
+                label: anchor_kind.clone(),
+                anchor_kind: anchor_kind.clone(),
+                temporal: anchor_temporal.clone(),
+                confidence_millis: if anchor_kind == "explicit_timex" {
+                    900
+                } else {
+                    520
+                },
+                source_class: anchor_source.clone(),
+                evidence_refs: anchor_evidence.clone(),
+            });
+            reference_timex_edges.push(TemporalReferenceEdge {
+                edge_id: format!("ref-timex:{event_fingerprint}"),
+                document_id: document_id.clone(),
+                axis_id: axis_id.clone(),
+                source_event_id: event_id.clone(),
+                canonical_source_event_id: None,
+                target_event_id: None,
+                canonical_target_event_id: None,
+                target_timex_id: Some(timex_id.clone()),
+                relation: "anchors_to".to_owned(),
+                confidence_millis: if anchor_kind == "explicit_timex" {
+                    900
+                } else {
+                    520
+                },
+                evidence_refs: anchor_evidence.clone(),
+            });
+            temporal_claims.push(TemporalClaimAtom {
+                claim_id: format!("tclaim:anchor:{event_fingerprint}"),
+                document_id: document_id.clone(),
+                proposition_id: Some(proposition.proposition_id.to_string()),
+                event_id: Some(event_id.clone()),
+                canonical_event_id: None,
+                axis_id: axis_id.clone(),
+                source_kind: anchor_source.clone(),
+                label: format!("{event_id} anchored to {}", timex_id.0),
+                confidence_millis: if anchor_kind == "explicit_timex" {
+                    900
+                } else {
+                    520
+                },
+                temporal: anchor_temporal.clone(),
+                evidence_refs: anchor_evidence.clone(),
+            });
+            temporal_constraints.push(TemporalConstraintRecord {
+                constraint_id: TemporalConstraintId(format!(
+                    "tconstraint:anchor:{event_fingerprint}"
+                )),
+                document_id: document_id.clone(),
+                axis_id: axis_id.clone(),
+                source_event_id: Some(event_id.clone()),
+                canonical_source_event_id: None,
+                target_event_id: None,
+                canonical_target_event_id: None,
+                target_timex_id: Some(timex_id.clone()),
+                kind: TemporalConstraintKind::AnchoredAt,
+                confidence_millis: if anchor_kind == "explicit_timex" {
+                    900
+                } else {
+                    520
+                },
+                hard: anchor_kind == "explicit_timex",
+                temporal: anchor_temporal.clone(),
+                evidence_refs: anchor_evidence.clone(),
+            });
+
+            if let Some((previous_event_id, previous_sentence_index)) =
+                last_event_by_axis.get(&axis_id.0).cloned()
+            {
+                let relation_label = if snippet_lower.contains("before") {
+                    "before_previous"
+                } else if snippet_lower.contains("after") || snippet_lower.contains("later") {
+                    "after_previous"
+                } else {
+                    "narrative_sequence"
+                };
+                reference_event_edges.push(TemporalReferenceEdge {
+                    edge_id: format!("ref-event:{previous_event_id}:{event_id}"),
+                    document_id: document_id.clone(),
+                    axis_id: axis_id.clone(),
+                    source_event_id: previous_event_id.clone(),
+                    canonical_source_event_id: None,
+                    target_event_id: Some(event_id.clone()),
+                    canonical_target_event_id: None,
+                    target_timex_id: None,
+                    relation: relation_label.to_owned(),
+                    confidence_millis: 640,
+                    evidence_refs: vec![relation_label.to_owned()],
+                });
+                temporal_claims.push(TemporalClaimAtom {
+                    claim_id: format!("tclaim:order:{previous_event_id}:{event_id}"),
+                    document_id: document_id.clone(),
+                    proposition_id: Some(proposition.proposition_id.to_string()),
+                    event_id: Some(event_id.clone()),
+                    canonical_event_id: None,
+                    axis_id: axis_id.clone(),
+                    source_kind: "narrative_sequence".to_owned(),
+                    label: format!(
+                        "{previous_event_id} precedes {event_id} across sentences {previous_sentence_index}->{}",
+                        proposition.sentence_index
+                    ),
+                    confidence_millis: 640,
+                    temporal: temporal_window(None, Some(created_at), None),
+                    evidence_refs: vec![relation_label.to_owned()],
+                });
+                temporal_constraints.push(TemporalConstraintRecord {
+                    constraint_id: TemporalConstraintId(format!(
+                        "tconstraint:order:{previous_event_id}:{event_id}"
+                    )),
+                    document_id: document_id.clone(),
+                    axis_id: axis_id.clone(),
+                    source_event_id: Some(previous_event_id.clone()),
+                    canonical_source_event_id: None,
+                    target_event_id: Some(event_id.clone()),
+                    canonical_target_event_id: None,
+                    target_timex_id: None,
+                    kind: TemporalConstraintKind::EndBeforeStart,
+                    confidence_millis: 640,
+                    hard: false,
+                    temporal: temporal_window(None, Some(created_at), None),
+                    evidence_refs: vec![relation_label.to_owned()],
+                });
+            }
+
+            last_event_by_axis.insert(
+                axis_id.0.clone(),
+                (event_id.clone(), proposition.sentence_index),
+            );
+        } else {
+            temporal_diagnostics.push(TemporalDiagnosticRecord {
+                code: "temporal_missing_event".to_owned(),
+                message: format!(
+                    "no semantic event id found for proposition {}",
+                    proposition.proposition_id
+                ),
+            });
+        }
+    }
+
+    if timex_records.len() == 1 {
+        temporal_diagnostics.push(TemporalDiagnosticRecord {
+            code: "temporal_only_dct_anchor".to_owned(),
+            message: "Only document created time was available as a normalized timex.".to_owned(),
+        });
+    }
+
+    DocumentTemporalSubstrate {
+        propositions,
+        semantic_events: semantics.events,
+        semantic_states: semantics.states,
+        semantic_claims: semantics.claims,
+        surface_temporal_cues,
+        timex_records,
+        anchor_candidates,
+        axis_records,
+        reference_timex_edges,
+        reference_event_edges,
+        temporal_claims,
+        temporal_constraints,
+        temporal_diagnostics,
+    }
+}
+
+fn build_document_event_identity_substrate(
+    document: &IngestDocument,
+    revision: u64,
+    causal_substrate: &DocumentCausalSubstrate,
+    temporal_substrate: &DocumentTemporalSubstrate,
+) -> DocumentEventIdentitySubstrate {
+    let proposition_by_id = temporal_substrate
+        .propositions
+        .iter()
+        .map(|proposition| (proposition.proposition_id.to_string(), proposition))
+        .collect::<FxHashMap<_, _>>();
+    let anchors_by_event = temporal_substrate
+        .anchor_candidates
+        .iter()
+        .filter_map(|anchor| {
+            anchor
+                .event_id
+                .as_ref()
+                .map(|event_id| (event_id.clone(), anchor.clone()))
+        })
+        .fold(
+            FxHashMap::<String, Vec<TemporalAnchorRecord>>::default(),
+            |mut rows, (event_id, anchor)| {
+                rows.entry(event_id).or_default().push(anchor);
+                rows
+            },
+        );
+    let temporal_neighbors = temporal_substrate.reference_event_edges.iter().fold(
+        FxHashMap::<String, Vec<String>>::default(),
+        |mut rows, edge| {
+            rows.entry(edge.source_event_id.clone())
+                .or_default()
+                .extend(edge.target_event_id.clone());
+            if let Some(target) = edge.target_event_id.as_ref() {
+                rows.entry(target.clone())
+                    .or_default()
+                    .push(edge.source_event_id.clone());
+            }
+            rows
+        },
+    );
+    let mut causal_neighbors = FxHashMap::<String, Vec<String>>::default();
+    for edge in &causal_substrate.causal_links {
+        let Some(source_id) = semantic_node_id(&edge.source) else {
+            continue;
+        };
+        let Some(target_id) = semantic_node_id(&edge.target) else {
+            continue;
+        };
+        causal_neighbors
+            .entry(source_id.clone())
+            .or_default()
+            .push(target_id.clone());
+        causal_neighbors
+            .entry(target_id)
+            .or_default()
+            .push(source_id);
+    }
+    for edge in &causal_substrate.causal_candidates {
+        let Some(source_id) = semantic_node_id(&edge.source) else {
+            continue;
+        };
+        let Some(target_id) = semantic_node_id(&edge.target) else {
+            continue;
+        };
+        causal_neighbors
+            .entry(source_id.clone())
+            .or_default()
+            .push(target_id.clone());
+        causal_neighbors
+            .entry(target_id)
+            .or_default()
+            .push(source_id);
+    }
+    let mut mention_seeds = Vec::<EventMentionPacketSeed>::new();
+    let mut diagnostics = Vec::<EventIdentityDiagnosticRecord>::new();
+
+    for (event_id, proposition_id, label, event_type) in temporal_substrate
+        .semantic_events
+        .iter()
+        .filter_map(|event| {
+            event.event_id.as_ref().map(|event_id| {
+                (
+                    event_id.0.clone(),
+                    event.proposition_id.to_string(),
+                    event.label.to_string(),
+                    "event".to_owned(),
+                )
+            })
+        })
+        .chain(
+            temporal_substrate
+                .semantic_states
+                .iter()
+                .filter_map(|state| {
+                    state.state_id.as_ref().map(|state_id| {
+                        (
+                            state_id.0.clone(),
+                            state.proposition_id.to_string(),
+                            state.label.to_string(),
+                            "state".to_owned(),
+                        )
+                    })
+                }),
+        )
+    {
+        let Some(proposition) = proposition_by_id.get(proposition_id.as_str()) else {
+            diagnostics.push(EventIdentityDiagnosticRecord {
+                code: "event_identity_missing_proposition".to_owned(),
+                message: format!("missing proposition for event node {event_id}"),
+            });
+            continue;
+        };
+
+        let participant_slots = proposition
+            .arguments
+            .iter()
+            .map(|argument| EventParticipantSlot {
+                role: argument.role.to_string(),
+                entity_id: argument.entity_id.clone(),
+                mention_index: argument.mention_index,
+                label: argument
+                    .range
+                    .map(source_range_to_text_range)
+                    .map(|range| safe_text_slice(&document.text, range).trim().to_owned())
+                    .filter(|label| !label.is_empty()),
+                range: argument.range.map(|range| TextRange {
+                    start: range.start,
+                    end: range.end,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let place_labels = proposition
+            .arguments
+            .iter()
+            .filter(|argument| is_place_role(argument.role.as_str()))
+            .filter_map(|argument| {
+                argument
+                    .range
+                    .map(source_range_to_text_range)
+                    .map(|range| safe_text_slice(&document.text, range).trim().to_owned())
+                    .filter(|label| !label.is_empty())
+            })
+            .collect::<Vec<_>>();
+        let source_semantics = proposition_source_semantics(proposition);
+        let modality_semantics = proposition_modality_semantics(proposition);
+        let event_fingerprint = event_identity_fingerprint(
+            proposition,
+            event_type.as_str(),
+            &participant_slots,
+            &place_labels,
+        );
+        let time_anchor_rows = anchors_by_event.get(&event_id).cloned().unwrap_or_default();
+        mention_seeds.push(EventMentionPacketSeed {
+            mention_id: EventMentionId(format!(
+                "event-mention:{}:{}:{}:{}",
+                scope_storage_key(&document.scope),
+                document.document_id.0,
+                revision,
+                proposition_id
+            )),
+            event_id: event_id.clone(),
+            document_id: document.document_id.0.clone(),
+            proposition_id: proposition_id.clone(),
+            revision,
+            label,
+            normalized_predicate: proposition
+                .predicate
+                .predicate
+                .to_string()
+                .to_ascii_lowercase(),
+            event_type,
+            participant_slots,
+            place_labels,
+            explicit_timex_ids: time_anchor_rows
+                .iter()
+                .filter_map(|anchor| anchor.timex_id.clone())
+                .collect(),
+            time_anchor_ids: time_anchor_rows
+                .iter()
+                .map(|anchor| anchor.anchor_id.clone())
+                .collect(),
+            causal_neighbor_event_ids: dedupe_strings(
+                causal_neighbors.get(&event_id).cloned().unwrap_or_default(),
+            ),
+            temporal_neighbor_event_ids: dedupe_strings(
+                temporal_neighbors
+                    .get(&event_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            sentence_index: proposition.sentence_index,
+            clause_range: proposition.clause_range.map(|range| TextRange {
+                start: range.start,
+                end: range.end,
+            }),
+            polarity_negative: proposition_negative(proposition),
+            source_semantics,
+            modality_semantics,
+            realis: proposition_realis_label(proposition, source_semantics, modality_semantics),
+            event_fingerprint,
+            evidence_refs: proposition
+                .evidence
+                .iter()
+                .map(|reference| reference.label.to_string())
+                .collect(),
+        });
+    }
+
+    mention_seeds.sort_by(|left, right| {
+        (
+            left.document_id.as_str(),
+            left.revision,
+            left.sentence_index,
+            left.mention_id.0.as_str(),
+        )
+            .cmp(&(
+                right.document_id.as_str(),
+                right.revision,
+                right.sentence_index,
+                right.mention_id.0.as_str(),
+            ))
+    });
+
+    DocumentEventIdentitySubstrate {
+        mention_seeds,
+        diagnostics,
+    }
+}
+
+fn semantic_node_id(node: &SemanticNodeRef) -> Option<String> {
+    match node {
+        SemanticNodeRef::Event(event_id) => Some(event_id.0.clone()),
+        SemanticNodeRef::State(state_id) => Some(state_id.0.clone()),
+        SemanticNodeRef::Claim(claim_id) => Some(claim_id.0.clone()),
+    }
+}
+
+fn proposition_source_semantics(proposition: &phoenix_types::Proposition) -> EventSourceSemantics {
+    if proposition.quote.is_some() {
+        EventSourceSemantics::ReportedSpeech
+    } else if proposition.attribution.is_some() {
+        EventSourceSemantics::AttributedClaim
+    } else {
+        EventSourceSemantics::WorldAssertion
+    }
+}
+
+fn proposition_modality_semantics(
+    proposition: &phoenix_types::Proposition,
+) -> EventModalitySemantics {
+    if proposition_negative(proposition) {
+        EventModalitySemantics::Negated
+    } else if proposition.conditional.is_some() {
+        EventModalitySemantics::Conditional
+    } else if proposition
+        .scope_ops
+        .iter()
+        .any(|operation| operation.kind.eq_ignore_ascii_case("planned"))
+    {
+        EventModalitySemantics::Planned
+    } else if proposition
+        .scope_ops
+        .iter()
+        .any(|operation| operation.kind.eq_ignore_ascii_case("hypothetical"))
+    {
+        EventModalitySemantics::Hypothetical
+    } else {
+        EventModalitySemantics::Asserted
+    }
+}
+
+fn proposition_negative(proposition: &phoenix_types::Proposition) -> bool {
+    proposition.scope_ops.iter().any(|operation| {
+        matches!(
+            operation.kind.to_ascii_lowercase().as_str(),
+            "negated" | "negative" | "not" | "never"
+        )
+    })
+}
+
+fn proposition_realis_label(
+    proposition: &phoenix_types::Proposition,
+    source: EventSourceSemantics,
+    modality: EventModalitySemantics,
+) -> String {
+    match modality {
+        EventModalitySemantics::Conditional => "conditional".to_owned(),
+        EventModalitySemantics::Planned => "planned".to_owned(),
+        EventModalitySemantics::Hypothetical => "hypothetical".to_owned(),
+        EventModalitySemantics::Negated => "negated".to_owned(),
+        EventModalitySemantics::Asserted => match source {
+            EventSourceSemantics::ReportedSpeech => "reported".to_owned(),
+            EventSourceSemantics::AttributedClaim => "attributed".to_owned(),
+            EventSourceSemantics::WorldAssertion => {
+                if proposition.quote.is_some() {
+                    "reported".to_owned()
+                } else {
+                    "asserted".to_owned()
+                }
+            }
+        },
+    }
+}
+
+fn is_place_role(role: &str) -> bool {
+    let normalized = role.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "location" | "place" | "destination" | "origin" | "site" | "where"
+    )
+}
+
+fn event_identity_fingerprint(
+    proposition: &phoenix_types::Proposition,
+    event_type: &str,
+    participant_slots: &[EventParticipantSlot],
+    place_labels: &[String],
+) -> String {
+    let participant_signature = participant_slots
+        .iter()
+        .map(|slot| {
+            format!(
+                "{}:{}:{}",
+                slot.role,
+                slot.entity_id
+                    .as_ref()
+                    .map(|entity_id| entity_id.0.as_str())
+                    .unwrap_or(""),
+                slot.label.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let place_signature = place_labels.join("|");
+    format!(
+        "{}:{}:{}:{}",
+        event_type,
+        proposition.predicate.predicate.to_ascii_lowercase(),
+        participant_signature,
+        place_signature
+    )
+}
+
+fn dedupe_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = FxHashSet::default();
+    let mut deduped = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
+fn ensure_temporal_axis(
+    axis_records: &mut Vec<TemporalAxisRecord>,
+    axis_by_kind: &mut FxHashMap<TemporalAxisKind, TemporalAxisId>,
+    document_id: &str,
+    kind: TemporalAxisKind,
+) -> TemporalAxisId {
+    if let Some(existing) = axis_by_kind.get(&kind) {
+        return existing.clone();
+    }
+    let label = match kind {
+        TemporalAxisKind::World => "world",
+        TemporalAxisKind::Reported => "reported",
+        TemporalAxisKind::Conditional => "conditional",
+        TemporalAxisKind::Hypothetical => "hypothetical",
+        TemporalAxisKind::Planned => "planned",
+    };
+    let axis_id = TemporalAxisId(format!("axis:{label}"));
+    axis_records.push(TemporalAxisRecord {
+        axis_id: axis_id.clone(),
+        document_id: document_id.to_owned(),
+        kind,
+        label: label.to_owned(),
+        evidence_refs: vec![label.to_owned()],
+    });
+    axis_by_kind.insert(kind, axis_id.clone());
+    axis_id
+}
+
+fn proposition_axis_kind(proposition: &phoenix_types::Proposition) -> TemporalAxisKind {
+    if proposition.conditional.is_some() {
+        return TemporalAxisKind::Conditional;
+    }
+    if proposition.quote.is_some() || proposition.attribution.is_some() {
+        return TemporalAxisKind::Reported;
+    }
+    for op in &proposition.scope_ops {
+        let modality = op
+            .modality
+            .as_ref()
+            .map(|value| value.as_str().to_ascii_lowercase())
+            .unwrap_or_default();
+        if modality.contains("plan") || modality.contains("future") || modality.contains("intend") {
+            return TemporalAxisKind::Planned;
+        }
+        if modality.contains("hyp") || modality.contains("possible") || modality.contains("maybe") {
+            return TemporalAxisKind::Hypothetical;
+        }
+    }
+    TemporalAxisKind::World
+}
+
+fn proposition_text_range(proposition: &phoenix_types::Proposition) -> Option<TextRange> {
+    proposition
+        .clause_range
+        .map(source_range_to_text_range)
+        .or_else(|| {
+            Some(source_range_to_text_range(
+                proposition.predicate.trigger_range,
+            ))
+        })
+}
+
+fn source_range_to_text_range(range: phoenix_types::SourceRange) -> TextRange {
+    TextRange {
+        start: range.start,
+        end: range.end,
+    }
+}
+
+fn proposition_snippet(
+    document: &IngestDocument,
+    proposition: &phoenix_types::Proposition,
+) -> String {
+    let range = proposition
+        .clause_range
+        .unwrap_or(proposition.predicate.trigger_range);
+    let bytes = document.text.as_bytes();
+    let start = usize::min(range.start as usize, bytes.len());
+    let end = usize::min(range.end as usize, bytes.len());
+    if start >= end {
+        return proposition.predicate.predicate.to_string();
+    }
+    String::from_utf8_lossy(&bytes[start..end]).into_owned()
+}
+
+fn temporal_cue_specs(
+    proposition: &phoenix_types::Proposition,
+    snippet_lower: &str,
+) -> Vec<(String, String)> {
+    let mut cues = Vec::new();
+    if proposition.quote.is_some() {
+        cues.push(("quote".to_owned(), "quoted_context".to_owned()));
+    }
+    if proposition.attribution.is_some() {
+        cues.push(("attribution".to_owned(), "attributed_context".to_owned()));
+    }
+    if proposition.conditional.is_some() {
+        cues.push(("conditional".to_owned(), "conditional_context".to_owned()));
+    }
+    for token in [
+        "before",
+        "after",
+        "during",
+        "while",
+        "then",
+        "later",
+        "earlier",
+        "today",
+        "yesterday",
+        "tomorrow",
+    ] {
+        if snippet_lower.contains(token) {
+            cues.push(("temporal_lexeme".to_owned(), token.to_owned()));
+        }
+    }
+    cues
+}
+
+fn detect_explicit_timex(
+    document_id: &str,
+    proposition: &phoenix_types::Proposition,
+    snippet_lower: &str,
+    range: Option<TextRange>,
+    axis_id: &TemporalAxisId,
+    created_at: i64,
+) -> Option<TemporalTimexRecord> {
+    const DAY_MS: i64 = 86_400_000;
+    let (label, normalized_value, valid_from, source_class) = if snippet_lower.contains("yesterday")
+    {
+        (
+            "yesterday".to_owned(),
+            Some("yesterday".to_owned()),
+            Some(created_at - DAY_MS),
+            "deictic_yesterday".to_owned(),
+        )
+    } else if snippet_lower.contains("tomorrow") {
+        (
+            "tomorrow".to_owned(),
+            Some("tomorrow".to_owned()),
+            Some(created_at + DAY_MS),
+            "deictic_tomorrow".to_owned(),
+        )
+    } else if snippet_lower.contains("today")
+        || snippet_lower.contains("now")
+        || snippet_lower.contains("currently")
+    {
+        (
+            "today".to_owned(),
+            Some("today".to_owned()),
+            Some(created_at),
+            "deictic_today".to_owned(),
+        )
+    } else if let Some(year) = snippet_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .find(|token| token.len() == 4 && token.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        (
+            year.to_owned(),
+            Some(year.to_owned()),
+            None,
+            "year_literal".to_owned(),
+        )
+    } else {
+        return None;
+    };
+
+    Some(TemporalTimexRecord {
+        timex_id: TemporalTimexId(format!(
+            "timex:{}:{}:{}",
+            document_id, proposition.proposition_id, label
+        )),
+        document_id: document_id.to_owned(),
+        proposition_id: Some(proposition.proposition_id.to_string()),
+        sentence_index: proposition.sentence_index,
+        label,
+        normalized_value,
+        range,
+        axis_id: axis_id.clone(),
+        temporal: temporal_window(valid_from, Some(created_at), None),
+        confidence_millis: if valid_from.is_some() { 880 } else { 620 },
+        source_class,
+        evidence_refs: vec![proposition.proposition_id.to_string()],
+    })
+}
+
+fn temporal_event_fingerprint(
+    document_id: &str,
+    proposition: &phoenix_types::Proposition,
+    event_id: &str,
+) -> String {
+    format!(
+        "{document_id}:{}:{}:{}",
+        proposition.proposition_id, proposition.sentence_index, event_id
+    )
+}
+
+fn temporal_window(
+    valid_from: Option<i64>,
+    recorded_from: Option<i64>,
+    valid_to: Option<i64>,
+) -> BiTemporalWindow {
+    BiTemporalWindow {
+        valid_from,
+        valid_to,
+        recorded_from,
+        recorded_to: None,
+    }
+}
+
+fn build_causal_structure_artifact(
+    document: &IngestDocument,
+    scan_bundle: &NativeScanBundle,
+) -> StructureArtifact {
     let mut sentence_frames = scan_bundle
         .scan
         .sentences
@@ -8875,7 +9836,8 @@ fn build_causal_structure_artifact(document: &IngestDocument, scan_bundle: &Nati
                 .chunks
                 .iter()
                 .filter(|chunk| {
-                    sentence.range.start <= chunk.range.start && sentence.range.end >= chunk.range.end
+                    sentence.range.start <= chunk.range.start
+                        && sentence.range.end >= chunk.range.end
                 })
                 .map(|chunk| ChunkSpan {
                     kind: None,
@@ -8894,12 +9856,9 @@ fn build_causal_structure_artifact(document: &IngestDocument, scan_bundle: &Nati
     let mut relations = Vec::new();
     let mut evidence_spans = Vec::new();
     for seed in &scan_bundle.structure.relation_seeds {
-        let Some(hit) = scan_bundle
-            .scan
-            .narrative_hits
-            .iter()
-            .find(|hit| hit.sentence_index == seed.sentence_index && hit.relation_type == seed.relation_type)
-        else {
+        let Some(hit) = scan_bundle.scan.narrative_hits.iter().find(|hit| {
+            hit.sentence_index == seed.sentence_index && hit.relation_type == seed.relation_type
+        }) else {
             continue;
         };
         let sentence = match scan_bundle.scan.sentences.get(seed.sentence_index) {

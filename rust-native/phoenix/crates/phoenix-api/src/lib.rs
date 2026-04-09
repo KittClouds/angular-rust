@@ -6,12 +6,18 @@ use serde::{Deserialize, Serialize};
 use phoenix_alex::{api as alex_api, AlexError, Lexicon};
 use phoenix_causal_post::api as causal_api;
 use phoenix_er_post::api as er_api;
+use phoenix_event_identity_post::api as event_identity_api;
+use phoenix_graph_post::api as graph_api;
 use phoenix_memory_post::api as memory_api;
 use phoenix_rel_post::api as rel_api;
+use phoenix_state_schema_post::api as state_schema_api;
 use phoenix_store_native_core::{
-    PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore, PhoenixMemoryPatchStore,
-    PhoenixRelationPatchStore, StoreError,
+    PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore,
+    PhoenixEventIdentityPatchStore, PhoenixGraphPatchStore, PhoenixMemoryPatchStore,
+    PhoenixRelationPatchStore, PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore,
+    PhoenixStateSchemaPatchStore, PhoenixTemporalPatchStore, StoreError,
 };
+use phoenix_temporal_post::api as temporal_api;
 use phoenix_types::{LexiconEntry, ScopeKey, SessionId};
 
 #[derive(Debug, thiserror::Error)]
@@ -30,9 +36,33 @@ pub struct PostIngestRunReport {
     pub relation_scope_count: usize,
     pub relation_case_count: usize,
     pub persisted_relation_edge_count: usize,
+    pub state_schema_scope_count: usize,
+    pub state_schema_active_definition_count: usize,
+    pub state_schema_candidate_count: usize,
     pub memory_scope_count: usize,
     pub memory_state_count: usize,
     pub memory_card_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateSchemaRunReport {
+    pub state_schema_scope_count: usize,
+    pub slot_family_count: usize,
+    pub slot_definition_count: usize,
+    pub active_definition_count: usize,
+    pub candidate_count: usize,
+    pub write_proposal_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventIdentityRunReport {
+    pub event_identity_scope_count: usize,
+    pub mention_packet_count: usize,
+    pub hypothesis_count: usize,
+    pub canonical_event_count: usize,
+    pub canonical_card_count: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +73,38 @@ pub struct CausalRunReport {
     pub causal_edge_count: usize,
     pub causal_chain_count: usize,
     pub causal_card_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemporalRunReport {
+    pub temporal_scope_count: usize,
+    pub temporal_review_case_count: usize,
+    pub temporal_interval_count: usize,
+    pub temporal_segment_count: usize,
+    pub temporal_gap_count: usize,
+    pub temporal_card_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphRunReport {
+    pub graph_scope_count: usize,
+    pub graph_projection_vertex_count: usize,
+    pub graph_projection_edge_count: usize,
+    pub graph_claim_node_count: usize,
+    pub graph_event_node_count: usize,
+    pub graph_state_node_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuityRunReport {
+    pub event_identity: EventIdentityRunReport,
+    pub temporal: TemporalRunReport,
+    pub causal: CausalRunReport,
+    pub state_schema: StateSchemaRunReport,
+    pub post_ingest: PostIngestRunReport,
 }
 
 pub struct PhoenixPipelineApi<S> {
@@ -70,8 +132,24 @@ impl<S> PhoenixPipelineApi<S> {
         ErStageApi { store: &self.store }
     }
 
+    pub fn event_identity(&self) -> EventIdentityStageApi<'_, S> {
+        EventIdentityStageApi { store: &self.store }
+    }
+
     pub fn causal(&self) -> CausalStageApi<'_, S> {
         CausalStageApi { store: &self.store }
+    }
+
+    pub fn state_schema(&self) -> StateSchemaStageApi<'_, S> {
+        StateSchemaStageApi { store: &self.store }
+    }
+
+    pub fn temporal(&self) -> TemporalStageApi<'_, S> {
+        TemporalStageApi { store: &self.store }
+    }
+
+    pub fn graph(&self) -> GraphStageApi<'_, S> {
+        GraphStageApi { store: &self.store }
     }
 
     pub fn rel(&self) -> RelStageApi<'_, S> {
@@ -87,9 +165,12 @@ impl<S> PhoenixPipelineApi<S>
 where
     S: PhoenixArchiveStoreV2
         + PhoenixErPatchStore
+        + PhoenixEventIdentityPatchStore
         + PhoenixRelationPatchStore
         + PhoenixMemoryPatchStore
-        + PhoenixCausalPatchStore,
+        + PhoenixCausalPatchStore
+        + PhoenixStateSchemaPatchStore
+        + PhoenixTemporalPatchStore,
 {
     pub fn run_post_ingest_scope(
         &self,
@@ -105,10 +186,35 @@ where
         for batch in &mut relation_batches {
             rel_api::run_glirel(batch, glirel_model, relation_specs)?;
             let decisions = rel_api::draft_decisions(batch, relation_specs);
-            let sidecar =
-                rel_api::persist_patch_sidecar(&self.store, batch, &decisions, relation_created_at)?;
+            let sidecar = rel_api::persist_patch_sidecar(
+                &self.store,
+                batch,
+                &decisions,
+                relation_created_at,
+            )?;
             relation_case_count += batch.review_cases.len();
             persisted_relation_edge_count += sidecar.edge_additions.len();
+        }
+
+        let mut state_schema_batches = state_schema_api::derive_batches(&self.store, session_id)?;
+        let mut state_schema_active_definition_count = 0usize;
+        let mut state_schema_candidate_count = 0usize;
+        for batch in &mut state_schema_batches {
+            state_schema_api::run_batch(batch, relation_created_at);
+            let sidecar =
+                state_schema_api::persist_patch_sidecar(&self.store, batch, relation_created_at)?;
+            state_schema_active_definition_count += sidecar
+                .slot_definitions
+                .iter()
+                .filter(|definition| {
+                    matches!(
+                        definition.lifecycle,
+                        phoenix_semantic_v2::StateSlotLifecycle::Active
+                            | phoenix_semantic_v2::StateSlotLifecycle::Stable
+                    )
+                })
+                .count();
+            state_schema_candidate_count += sidecar.slot_candidates.len();
         }
 
         let memory_batches = memory_api::derive_batches(&self.store, session_id)?;
@@ -124,6 +230,9 @@ where
             relation_scope_count: relation_batches.len(),
             relation_case_count,
             persisted_relation_edge_count,
+            state_schema_scope_count: state_schema_batches.len(),
+            state_schema_active_definition_count,
+            state_schema_candidate_count,
             memory_scope_count: memory_batches.len(),
             memory_state_count,
             memory_card_count,
@@ -154,6 +263,169 @@ where
             causal_edge_count,
             causal_chain_count,
             causal_card_count,
+        })
+    }
+
+    pub fn run_event_identity_scope(
+        &self,
+        session_id: Option<&SessionId>,
+        created_at: i64,
+    ) -> Result<EventIdentityRunReport, PipelineApiError> {
+        let mut batches = event_identity_api::derive_batches(&self.store, session_id)?;
+        let mut mention_packet_count = 0usize;
+        let mut hypothesis_count = 0usize;
+        let mut canonical_event_count = 0usize;
+        let mut canonical_card_count = 0usize;
+        for batch in &mut batches {
+            event_identity_api::run_batch(batch, created_at);
+            let sidecar =
+                event_identity_api::persist_patch_sidecar(&self.store, batch, created_at)?;
+            mention_packet_count += sidecar.mention_packets.len();
+            hypothesis_count += sidecar.identity_hypotheses.len();
+            canonical_event_count += sidecar.canonical_events.len();
+            canonical_card_count += sidecar.canonical_event_cards.len();
+        }
+        Ok(EventIdentityRunReport {
+            event_identity_scope_count: batches.len(),
+            mention_packet_count,
+            hypothesis_count,
+            canonical_event_count,
+            canonical_card_count,
+        })
+    }
+
+    pub fn run_temporal_scope(
+        &self,
+        session_id: Option<&SessionId>,
+        created_at: i64,
+    ) -> Result<TemporalRunReport, PipelineApiError> {
+        let mut batches = temporal_api::derive_batches(&self.store, session_id)?;
+        let mut temporal_review_case_count = 0usize;
+        let mut temporal_interval_count = 0usize;
+        let mut temporal_segment_count = 0usize;
+        let mut temporal_gap_count = 0usize;
+        let mut temporal_card_count = 0usize;
+        for batch in &mut batches {
+            temporal_api::run_batch(batch, created_at);
+            let sidecar = temporal_api::persist_patch_sidecar(&self.store, batch, created_at)?;
+            temporal_review_case_count += batch.review_cases.len();
+            temporal_interval_count += sidecar.intervals.len();
+            temporal_segment_count += sidecar.timeline_segments.len();
+            temporal_gap_count += sidecar.gaps.len();
+            temporal_card_count += sidecar.memory_cards.len();
+        }
+        Ok(TemporalRunReport {
+            temporal_scope_count: batches.len(),
+            temporal_review_case_count,
+            temporal_interval_count,
+            temporal_segment_count,
+            temporal_gap_count,
+            temporal_card_count,
+        })
+    }
+
+    pub fn run_graph_scope(
+        &self,
+        session_id: Option<&SessionId>,
+        created_at: i64,
+    ) -> Result<GraphRunReport, PipelineApiError>
+    where
+        S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore,
+    {
+        let batches = graph_api::derive_batches(&self.store, session_id)?;
+        let mut graph_projection_vertex_count = 0usize;
+        let mut graph_projection_edge_count = 0usize;
+        let mut graph_claim_node_count = 0usize;
+        let mut graph_event_node_count = 0usize;
+        let mut graph_state_node_count = 0usize;
+        for batch in &batches {
+            let sidecar = graph_api::persist_patch_sidecar(&self.store, batch, created_at)?;
+            graph_projection_vertex_count += sidecar.summary.projection_vertex_count;
+            graph_projection_edge_count += sidecar.summary.projection_edge_count;
+            graph_claim_node_count += sidecar.summary.claim_node_count;
+            graph_event_node_count += sidecar.summary.event_node_count;
+            graph_state_node_count += sidecar.summary.state_node_count;
+        }
+        Ok(GraphRunReport {
+            graph_scope_count: batches.len(),
+            graph_projection_vertex_count,
+            graph_projection_edge_count,
+            graph_claim_node_count,
+            graph_event_node_count,
+            graph_state_node_count,
+        })
+    }
+
+    pub fn run_state_schema_scope(
+        &self,
+        session_id: Option<&SessionId>,
+        created_at: i64,
+    ) -> Result<StateSchemaRunReport, PipelineApiError> {
+        let mut batches = state_schema_api::derive_batches(&self.store, session_id)?;
+        let mut slot_family_count = 0usize;
+        let mut slot_definition_count = 0usize;
+        let mut active_definition_count = 0usize;
+        let mut candidate_count = 0usize;
+        let mut write_proposal_count = 0usize;
+        for batch in &mut batches {
+            state_schema_api::run_batch(batch, created_at);
+            let sidecar = state_schema_api::persist_patch_sidecar(&self.store, batch, created_at)?;
+            slot_family_count += sidecar.slot_families.len();
+            slot_definition_count += sidecar.slot_definitions.len();
+            active_definition_count += sidecar
+                .slot_definitions
+                .iter()
+                .filter(|definition| {
+                    matches!(
+                        definition.lifecycle,
+                        phoenix_semantic_v2::StateSlotLifecycle::Active
+                            | phoenix_semantic_v2::StateSlotLifecycle::Stable
+                    )
+                })
+                .count();
+            candidate_count += sidecar.slot_candidates.len();
+            write_proposal_count += sidecar.write_proposals.len();
+        }
+        Ok(StateSchemaRunReport {
+            state_schema_scope_count: batches.len(),
+            slot_family_count,
+            slot_definition_count,
+            active_definition_count,
+            candidate_count,
+            write_proposal_count,
+        })
+    }
+
+    pub fn run_continuity_scope(
+        &self,
+        session_id: Option<&SessionId>,
+        event_identity_created_at: i64,
+        temporal_created_at: i64,
+        causal_created_at: i64,
+        glirel_model: &phoenix_rel_post::GlirelModel,
+        relation_specs: &[phoenix_rel_post::GlirelRelationTypeSpec],
+        relation_created_at: i64,
+        memory_created_at: i64,
+    ) -> Result<ContinuityRunReport, PipelineApiError> {
+        let event_identity =
+            self.run_event_identity_scope(session_id, event_identity_created_at)?;
+        let temporal = self.run_temporal_scope(session_id, temporal_created_at)?;
+        let causal = self.run_causal_scope(session_id, causal_created_at)?;
+        let state_schema = self.run_state_schema_scope(session_id, relation_created_at)?;
+        let post_ingest = self.run_post_ingest_scope(
+            session_id,
+            glirel_model,
+            relation_specs,
+            relation_created_at,
+            memory_created_at,
+        )?;
+
+        Ok(ContinuityRunReport {
+            event_identity,
+            temporal,
+            causal,
+            state_schema,
+            post_ingest,
         })
     }
 }
@@ -228,13 +500,40 @@ where
     }
 }
 
+pub struct EventIdentityStageApi<'a, S> {
+    store: &'a S,
+}
+
+impl<'a, S> EventIdentityStageApi<'a, S>
+where
+    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixEventIdentityPatchStore,
+{
+    pub fn derive_batches(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<phoenix_event_identity_post::EventIdentityScopeReviewBatch>, StoreError> {
+        event_identity_api::derive_batches(self.store, session_id)
+    }
+
+    pub fn run_scope(
+        &self,
+        batch: &mut phoenix_event_identity_post::EventIdentityScopeReviewBatch,
+        created_at: i64,
+    ) {
+        event_identity_api::run_batch(batch, created_at);
+    }
+}
+
 pub struct CausalStageApi<'a, S> {
     store: &'a S,
 }
 
 impl<'a, S> CausalStageApi<'a, S>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixCausalPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixCausalPatchStore
+        + PhoenixEventIdentityPatchStore,
 {
     pub fn derive_batches(
         &self,
@@ -249,6 +548,171 @@ where
         created_at: i64,
     ) {
         causal_api::run_batch(batch, created_at);
+    }
+}
+
+pub struct StateSchemaStageApi<'a, S> {
+    store: &'a S,
+}
+
+impl<'a, S> StateSchemaStageApi<'a, S>
+where
+    S: PhoenixArchiveStoreV2 + PhoenixRelationPatchStore + PhoenixStateSchemaPatchStore,
+{
+    pub fn derive_batches(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<phoenix_state_schema_post::StateSchemaScopeReviewBatch>, StoreError> {
+        state_schema_api::derive_batches(self.store, session_id)
+    }
+
+    pub fn run_scope(
+        &self,
+        batch: &mut phoenix_state_schema_post::StateSchemaScopeReviewBatch,
+        created_at: i64,
+    ) {
+        state_schema_api::run_batch(batch, created_at);
+    }
+}
+
+pub struct TemporalStageApi<'a, S> {
+    store: &'a S,
+}
+
+impl<'a, S> TemporalStageApi<'a, S>
+where
+    S: PhoenixArchiveStoreV2 + PhoenixTemporalPatchStore + PhoenixEventIdentityPatchStore,
+{
+    pub fn derive_batches(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<phoenix_temporal_post::TemporalScopeReviewBatch>, StoreError> {
+        temporal_api::derive_batches(self.store, session_id)
+    }
+
+    pub fn run_scope(
+        &self,
+        batch: &mut phoenix_temporal_post::TemporalScopeReviewBatch,
+        created_at: i64,
+    ) {
+        temporal_api::run_batch(batch, created_at);
+    }
+}
+
+pub struct GraphStageApi<'a, S> {
+    store: &'a S,
+}
+
+impl<'a, S> GraphStageApi<'a, S>
+where
+    S: PhoenixArchiveStoreV2
+        + PhoenixGraphPatchStore
+        + PhoenixSemanticGraphPatchStore
+        + PhoenixSemanticIndexStore
+        + PhoenixEventIdentityPatchStore
+        + PhoenixTemporalPatchStore
+        + PhoenixCausalPatchStore
+        + PhoenixMemoryPatchStore,
+{
+    pub fn derive_batches(
+        &self,
+        session_id: Option<&SessionId>,
+    ) -> Result<Vec<phoenix_graph_post::GraphScopeReviewBatch>, StoreError> {
+        graph_api::derive_batches(self.store, session_id)
+    }
+
+    pub fn current_slot(
+        &self,
+        scope: &ScopeKey,
+        entity_id: &str,
+        slot_key: &str,
+        recorded_at: Option<i64>,
+    ) -> Result<Option<graph_api::GraphRankedSlotAnswer>, graph_api::GraphQueryError> {
+        graph_api::current_slot(self.store, scope, entity_id, slot_key, recorded_at)
+    }
+
+    pub fn slot_at(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphWorldStateQueryRequest,
+    ) -> Result<Option<graph_api::GraphRankedSlotAnswer>, graph_api::GraphQueryError> {
+        graph_api::slot_at(self.store, scope, request)
+    }
+
+    pub fn what_is_unresolved(
+        &self,
+        scope: &ScopeKey,
+        request: &phoenix_graph_kernel::KernelUnresolvedQueryRequest,
+    ) -> Result<Option<Vec<phoenix_graph_kernel::KernelStateIssue>>, graph_api::GraphQueryError>
+    {
+        graph_api::what_is_unresolved(self.store, scope, request)
+    }
+
+    pub fn what_changed(
+        &self,
+        scope: &ScopeKey,
+        request: &phoenix_graph_kernel::KernelWhatChangedRequest,
+    ) -> Result<Option<Vec<phoenix_graph_kernel::KernelStateChange>>, graph_api::GraphQueryError>
+    {
+        graph_api::what_changed(self.store, scope, request)
+    }
+
+    pub fn history(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphHistoryQueryRequest,
+    ) -> Result<Option<graph_api::GraphRankedHistoryAnswer>, graph_api::GraphQueryError> {
+        graph_api::history(self.store, scope, request)
+    }
+
+    pub fn causal_explanation(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphCausalExplanationQueryRequest,
+    ) -> Result<Option<graph_api::GraphRankedCausalExplanationAnswer>, graph_api::GraphQueryError>
+    {
+        graph_api::causal_explanation(self.store, scope, request)
+    }
+
+    pub fn ranked_query(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphRankedQueryRequest,
+    ) -> Result<Option<graph_api::GraphRankedQueryAnswer>, graph_api::GraphQueryError> {
+        graph_api::ranked_query(self.store, scope, request)
+    }
+
+    pub fn retrieved_world_state(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphRetrievedWorldStateQueryRequest,
+    ) -> Result<Option<graph_api::GraphRetrievedWorldStateAnswer>, graph_api::GraphQueryError> {
+        graph_api::retrieved_world_state(self.store, scope, request)
+    }
+
+    pub fn retrieved_history(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphRetrievedHistoryQueryRequest,
+    ) -> Result<Option<graph_api::GraphRetrievedHistoryAnswer>, graph_api::GraphQueryError> {
+        graph_api::retrieved_history(self.store, scope, request)
+    }
+
+    pub fn retrieved_causal_explanation(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphRetrievedCausalExplanationQueryRequest,
+    ) -> Result<Option<graph_api::GraphRetrievedCausalExplanationAnswer>, graph_api::GraphQueryError>
+    {
+        graph_api::retrieved_causal_explanation(self.store, scope, request)
+    }
+
+    pub fn retrieved_query(
+        &self,
+        scope: &ScopeKey,
+        request: &graph_api::GraphRetrievedQueryRequest,
+    ) -> Result<Option<graph_api::GraphRetrievedQueryAnswer>, graph_api::GraphQueryError> {
+        graph_api::retrieved_query(self.store, scope, request)
     }
 }
 
@@ -274,7 +738,12 @@ pub struct MemoryStageApi<'a, S> {
 
 impl<'a, S> MemoryStageApi<'a, S>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixRelationPatchStore + PhoenixMemoryPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixRelationPatchStore
+        + PhoenixMemoryPatchStore
+        + PhoenixEventIdentityPatchStore
+        + PhoenixStateSchemaPatchStore,
 {
     pub fn derive_batches(
         &self,
@@ -295,6 +764,7 @@ mod tests {
         let chunker = api.chunker();
         let alex = api.alex();
         let _causal = api.causal();
+        let _temporal = api.temporal();
         let text = "Alice works for Dynamis. Dynamis is in New Rome.";
         let sentences = chunker.sentence_ranges(text);
         assert_eq!(sentences.len(), 2);

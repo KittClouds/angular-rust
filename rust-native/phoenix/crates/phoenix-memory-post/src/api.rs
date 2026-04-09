@@ -7,8 +7,8 @@
 //! orchestration code.
 
 use phoenix_store_native_core::{
-    PhoenixArchiveStoreV2, PhoenixErPatchStore, PhoenixMemoryPatchStore, PhoenixRelationPatchStore,
-    StoreError,
+    PhoenixArchiveStoreV2, PhoenixErPatchStore, PhoenixEventIdentityPatchStore,
+    PhoenixMemoryPatchStore, PhoenixRelationPatchStore, PhoenixStateSchemaPatchStore, StoreError,
 };
 use phoenix_types::SessionId;
 
@@ -23,7 +23,12 @@ pub fn derive_batches<S>(
     session_id: Option<&SessionId>,
 ) -> Result<Vec<MemoryScopeReviewBatch>, StoreError>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixRelationPatchStore + PhoenixMemoryPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixRelationPatchStore
+        + PhoenixMemoryPatchStore
+        + PhoenixEventIdentityPatchStore
+        + PhoenixStateSchemaPatchStore,
 {
     derive_dirty_scope_review_batches(store, session_id)
 }
@@ -35,8 +40,17 @@ pub fn derive_batch(
     lexical: Option<&phoenix_semantic_v2::ScopeLexSidecar>,
     er_sidecar: Option<&phoenix_semantic_v2::ErScopePatchSidecar>,
     relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&phoenix_semantic_v2::StateSchemaScopeSidecar>,
 ) -> MemoryScopeReviewBatch {
-    derive_scope_review_batch(archives, session, dirty, lexical, er_sidecar, relation_sidecar)
+    derive_scope_review_batch(
+        archives,
+        session,
+        dirty,
+        lexical,
+        er_sidecar,
+        relation_sidecar,
+        state_schema_sidecar,
+    )
 }
 
 pub fn compile_from_inputs(
@@ -45,8 +59,16 @@ pub fn compile_from_inputs(
     lexical: Option<&phoenix_semantic_v2::ScopeLexSidecar>,
     er_sidecar: Option<&phoenix_semantic_v2::ErScopePatchSidecar>,
     relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&phoenix_semantic_v2::StateSchemaScopeSidecar>,
 ) -> CompiledMemory {
-    let normalized = normalize_memory_inputs(archives, session, lexical, er_sidecar, relation_sidecar);
+    let normalized = normalize_memory_inputs(
+        archives,
+        session,
+        lexical,
+        er_sidecar,
+        relation_sidecar,
+        state_schema_sidecar,
+    );
     compile_memory(&normalized)
 }
 

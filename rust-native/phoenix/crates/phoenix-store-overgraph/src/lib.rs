@@ -10,8 +10,8 @@ use overgraph::{
     WalSyncMode,
 };
 use phoenix_hyperbolic::{
-    Candidate as HnswCandidate, HnswBuildParams, HyperbolicDiskHnsw, HyperbolicHnswBuilder,
-    PackedHnswGraph, PackedHnswMetadata, PoincareMetric,
+    AnnMetric, Candidate as HnswCandidate, HnswBuildParams, HyperbolicDiskHnsw,
+    HyperbolicHnswBuilder, PackedHnswGraph, PackedHnswMetadata,
 };
 use phoenix_kernel::{
     DeterministicKernel, KernelCheckpointData, KernelCheckpointMeta, KernelGraphLayer,
@@ -19,22 +19,23 @@ use phoenix_kernel::{
 };
 use phoenix_semantic_v2::{
     scope_storage_key, AliasEntry, AliasPosting, CausalScopeSidecar, DirtyScopeRecord,
-    DocumentArchive, DocumentManifest, DocumentOrd, DocumentOrdinalAssignment,
-    DocumentRevisionRef, DocumentSegmentKind, ErScopePatchSidecar, LexicalPostingsSegment,
-    MemoryScopeSidecar, PreparedDocument, PreparedDocumentSegment,
+    DocumentArchive, DocumentManifest, DocumentOrd, DocumentOrdinalAssignment, DocumentRevisionRef,
+    DocumentSegmentKind, ErScopePatchSidecar, EventIdentityScopeSidecar, GraphScopeSidecar,
+    LexicalPostingsSegment, MemoryScopeSidecar, PreparedDocument, PreparedDocumentSegment,
     RelationMentionSeedScopeSidecar, RelationScopePatchSidecar, ScopeLexSidecar, ScopeOrd,
-    SessionArchive, SessionOrd,
+    SemanticGraphScopeSidecar, SessionArchive, SessionOrd, StateSchemaScopeSidecar,
+    TemporalScopeSidecar,
 };
 use phoenix_store_native_core::{
     AnnGenerationId, AnnIndexFamily, AnnIndexKey, AnnManifest, AnnPackedSegments, BundleHeader,
     BundleKey, BundleKind, IngestMode, NativeSemanticDocumentVectorRecord,
     NativeSemanticLeafVectorRecord, NativeSemanticNodeVectorRecord, PhoenixArchiveStoreV2,
     PhoenixBundleStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore,
-    PhoenixGraphKernelStoreV2, PhoenixMemoryPatchStore, PhoenixRelationMentionSeedStore,
-    PhoenixRelationPatchStore, PhoenixSemanticIndexStore, PreparedIngestContext,
-    SemanticDocumentNeighbor,
-    SemanticNeighbor, SemanticNodeNeighbor, StoreError,
-    SEMANTIC_MODEL_ID, SEMANTIC_VECTOR_DIM,
+    PhoenixEventIdentityPatchStore, PhoenixGraphKernelStoreV2, PhoenixGraphPatchStore,
+    PhoenixMemoryPatchStore, PhoenixRelationMentionSeedStore, PhoenixRelationPatchStore,
+    PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore, PhoenixStateSchemaPatchStore,
+    PhoenixTemporalPatchStore, PreparedIngestContext, SemanticDocumentNeighbor, SemanticNeighbor,
+    SemanticNodeNeighbor, StoreError, SEMANTIC_MODEL_ID, SEMANTIC_VECTOR_DIM,
 };
 use phoenix_types::{IndexedSpan, IngestDocument, ScopeKey, SessionId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -66,6 +67,11 @@ const TYPE_RELATION_PATCH_SIDECAR: u32 = 24;
 const TYPE_MEMORY_PATCH_SIDECAR: u32 = 25;
 const TYPE_RELATION_MENTION_SEED_SIDECAR: u32 = 26;
 const TYPE_CAUSAL_PATCH_SIDECAR: u32 = 27;
+const TYPE_TEMPORAL_PATCH_SIDECAR: u32 = 28;
+const TYPE_EVENT_IDENTITY_PATCH_SIDECAR: u32 = 29;
+const TYPE_STATE_SCHEMA_PATCH_SIDECAR: u32 = 30;
+const TYPE_GRAPH_PATCH_SIDECAR: u32 = 31;
+const TYPE_SEMANTIC_GRAPH_PATCH_SIDECAR: u32 = 32;
 
 const COUNTER_SCOPE: &str = "scope";
 const COUNTER_SESSION: &str = "session";
@@ -387,11 +393,9 @@ impl PhoenixOvergraphStore {
             return Ok(());
         }
 
-        let mut builder = HyperbolicHnswBuilder::new(
-            SEMANTIC_VECTOR_DIM,
-            PoincareMetric { curvature: 1.0 },
-            HnswBuildParams::default(),
-        );
+        let metric = AnnMetric::default();
+        let mut builder =
+            HyperbolicHnswBuilder::new(SEMANTIC_VECTOR_DIM, metric, HnswBuildParams::default());
         for vector in vectors {
             builder.insert(vector.clone());
         }
@@ -417,7 +421,7 @@ impl PhoenixOvergraphStore {
             m0: HnswBuildParams::default().m0,
             ef_construction: HnswBuildParams::default().ef_construction,
             level_mult: HnswBuildParams::default().level_mult,
-            metric: "hyperbolic:poincare".to_owned(),
+            metric: metric.label().to_owned(),
         };
         let segments = AnnPackedSegments {
             vectors: packed.vectors,
@@ -656,19 +660,24 @@ impl PhoenixOvergraphStore {
         Ok(path)
     }
 
+    pub fn load_ann_manifest(
+        &self,
+        scope: &ScopeKey,
+        family: AnnIndexFamily,
+        kind: Option<&str>,
+    ) -> Result<Option<AnnManifest>, StoreError> {
+        Ok(self
+            .load_ann_query_state(scope, family, kind)?
+            .map(|(manifest, _, _)| manifest))
+    }
+
     fn load_ann_query_state(
         &self,
         scope: &ScopeKey,
         family: AnnIndexFamily,
         kind: Option<&str>,
-    ) -> Result<
-        Option<(
-            AnnManifest,
-            HyperbolicDiskHnsw<PoincareMetric>,
-            Vec<AnnPayload>,
-        )>,
-        StoreError,
-    > {
+    ) -> Result<Option<(AnnManifest, HyperbolicDiskHnsw<AnnMetric>, Vec<AnnPayload>)>, StoreError>
+    {
         let Some((manifest, payloads, cache_path)) = self.with_engine(|engine| {
             let Some(scope_ord) = self.lookup_scope_ord_with_engine(engine, scope)? else {
                 return Ok(None);
@@ -718,11 +727,9 @@ impl PhoenixOvergraphStore {
             return Ok(None);
         };
 
-        let index = HyperbolicDiskHnsw::open(
-            &cache_path.to_string_lossy(),
-            PoincareMetric { curvature: 1.0 },
-        )
-        .map_err(|error| StoreError::Query(error.to_string()))?;
+        let metric = AnnMetric::from_label_or_default(manifest.metric.as_str());
+        let index = HyperbolicDiskHnsw::open(&cache_path.to_string_lossy(), metric)
+            .map_err(|error| StoreError::Query(error.to_string()))?;
         Ok(Some((manifest, index, payloads)))
     }
 
@@ -1137,6 +1144,12 @@ impl PhoenixOvergraphStore {
                 DocumentSegmentKind::CausalSubstrateTable => {
                     archive.causal_substrate = Some(decode_segment_payload(&payload)?);
                 }
+                DocumentSegmentKind::TemporalSubstrateTable => {
+                    archive.temporal_substrate = Some(decode_segment_payload(&payload)?);
+                }
+                DocumentSegmentKind::EventIdentitySubstrateTable => {
+                    archive.event_identity_substrate = Some(decode_segment_payload(&payload)?);
+                }
                 DocumentSegmentKind::ChunkTable => {
                     archive.chunks = decode_segment_payload(&payload)?;
                 }
@@ -1249,6 +1262,38 @@ impl PhoenixOvergraphStore {
         decode_archive(&payload).map(Some)
     }
 
+    fn load_native_graph_patch_sidecar_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        scope: &ScopeKey,
+    ) -> Result<Option<GraphScopeSidecar>, StoreError> {
+        let scope_key = scope_storage_key(scope);
+        let Some(node) = engine
+            .get_node_by_key(TYPE_GRAPH_PATCH_SIDECAR, &scope_key)
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let payload = required_bytes_prop(&node, PROP_PAYLOAD)?;
+        decode_archive(&payload).map(Some)
+    }
+
+    fn load_native_semantic_graph_patch_sidecar_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        scope: &ScopeKey,
+    ) -> Result<Option<SemanticGraphScopeSidecar>, StoreError> {
+        let scope_key = scope_storage_key(scope);
+        let Some(node) = engine
+            .get_node_by_key(TYPE_SEMANTIC_GRAPH_PATCH_SIDECAR, &scope_key)
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let payload = required_bytes_prop(&node, PROP_PAYLOAD)?;
+        decode_archive(&payload).map(Some)
+    }
+
     fn load_native_causal_patch_sidecar_with_engine(
         &self,
         engine: &mut DatabaseEngine,
@@ -1257,6 +1302,54 @@ impl PhoenixOvergraphStore {
         let scope_key = scope_storage_key(scope);
         let Some(node) = engine
             .get_node_by_key(TYPE_CAUSAL_PATCH_SIDECAR, &scope_key)
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let payload = required_bytes_prop(&node, PROP_PAYLOAD)?;
+        decode_archive(&payload).map(Some)
+    }
+
+    fn load_native_temporal_patch_sidecar_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        scope: &ScopeKey,
+    ) -> Result<Option<TemporalScopeSidecar>, StoreError> {
+        let scope_key = scope_storage_key(scope);
+        let Some(node) = engine
+            .get_node_by_key(TYPE_TEMPORAL_PATCH_SIDECAR, &scope_key)
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let payload = required_bytes_prop(&node, PROP_PAYLOAD)?;
+        decode_archive(&payload).map(Some)
+    }
+
+    fn load_native_event_identity_patch_sidecar_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        scope: &ScopeKey,
+    ) -> Result<Option<EventIdentityScopeSidecar>, StoreError> {
+        let scope_key = scope_storage_key(scope);
+        let Some(node) = engine
+            .get_node_by_key(TYPE_EVENT_IDENTITY_PATCH_SIDECAR, &scope_key)
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let payload = required_bytes_prop(&node, PROP_PAYLOAD)?;
+        decode_archive(&payload).map(Some)
+    }
+
+    fn load_native_state_schema_patch_sidecar_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        scope: &ScopeKey,
+    ) -> Result<Option<StateSchemaScopeSidecar>, StoreError> {
+        let scope_key = scope_storage_key(scope);
+        let Some(node) = engine
+            .get_node_by_key(TYPE_STATE_SCHEMA_PATCH_SIDECAR, &scope_key)
             .map_err(store_query_error)?
         else {
             return Ok(None);
@@ -1693,6 +1786,86 @@ impl PhoenixOvergraphStore {
         Ok(())
     }
 
+    fn persist_graph_patch_sidecar_native_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        sidecar: &GraphScopeSidecar,
+    ) -> Result<(), StoreError> {
+        let payload = encode_archive(sidecar)?;
+        engine
+            .upsert_node(
+                TYPE_GRAPH_PATCH_SIDECAR,
+                &sidecar.scope_key,
+                UpsertNodeOptions {
+                    props: btree_props([
+                        (PROP_SCOPE_KEY, PropValue::String(sidecar.scope_key.clone())),
+                        (
+                            PROP_SCOPE_ORD,
+                            sidecar
+                                .scope_ord
+                                .map(|scope_ord| PropValue::UInt(scope_ord.0))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (
+                            PROP_SESSION_ID,
+                            sidecar
+                                .session_id
+                                .as_ref()
+                                .map(|session_id| PropValue::String(session_id.0.clone()))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (PROP_REVISION, PropValue::UInt(sidecar.generation)),
+                        (PROP_UPDATED_AT, PropValue::Int(sidecar.updated_at)),
+                        (PROP_BYTE_LEN, PropValue::UInt(payload.len() as u64)),
+                        (PROP_PAYLOAD, PropValue::Bytes(payload)),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .map_err(store_query_error)?;
+        Ok(())
+    }
+
+    fn persist_semantic_graph_patch_sidecar_native_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        sidecar: &SemanticGraphScopeSidecar,
+    ) -> Result<(), StoreError> {
+        let payload = encode_archive(sidecar)?;
+        engine
+            .upsert_node(
+                TYPE_SEMANTIC_GRAPH_PATCH_SIDECAR,
+                &sidecar.scope_key,
+                UpsertNodeOptions {
+                    props: btree_props([
+                        (PROP_SCOPE_KEY, PropValue::String(sidecar.scope_key.clone())),
+                        (
+                            PROP_SCOPE_ORD,
+                            sidecar
+                                .scope_ord
+                                .map(|scope_ord| PropValue::UInt(scope_ord.0))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (
+                            PROP_SESSION_ID,
+                            sidecar
+                                .session_id
+                                .as_ref()
+                                .map(|session_id| PropValue::String(session_id.0.clone()))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (PROP_REVISION, PropValue::UInt(sidecar.generation)),
+                        (PROP_UPDATED_AT, PropValue::Int(sidecar.updated_at)),
+                        (PROP_BYTE_LEN, PropValue::UInt(payload.len() as u64)),
+                        (PROP_PAYLOAD, PropValue::Bytes(payload)),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .map_err(store_query_error)?;
+        Ok(())
+    }
+
     fn persist_causal_patch_sidecar_native_with_engine(
         &self,
         engine: &mut DatabaseEngine,
@@ -1702,6 +1875,126 @@ impl PhoenixOvergraphStore {
         engine
             .upsert_node(
                 TYPE_CAUSAL_PATCH_SIDECAR,
+                &sidecar.scope_key,
+                UpsertNodeOptions {
+                    props: btree_props([
+                        (PROP_SCOPE_KEY, PropValue::String(sidecar.scope_key.clone())),
+                        (
+                            PROP_SCOPE_ORD,
+                            sidecar
+                                .scope_ord
+                                .map(|scope_ord| PropValue::UInt(scope_ord.0))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (
+                            PROP_SESSION_ID,
+                            sidecar
+                                .session_id
+                                .as_ref()
+                                .map(|session_id| PropValue::String(session_id.0.clone()))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (PROP_REVISION, PropValue::UInt(sidecar.generation)),
+                        (PROP_UPDATED_AT, PropValue::Int(sidecar.updated_at)),
+                        (PROP_BYTE_LEN, PropValue::UInt(payload.len() as u64)),
+                        (PROP_PAYLOAD, PropValue::Bytes(payload)),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .map_err(store_query_error)?;
+        Ok(())
+    }
+
+    fn persist_temporal_patch_sidecar_native_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        sidecar: &TemporalScopeSidecar,
+    ) -> Result<(), StoreError> {
+        let payload = encode_archive(sidecar)?;
+        engine
+            .upsert_node(
+                TYPE_TEMPORAL_PATCH_SIDECAR,
+                &sidecar.scope_key,
+                UpsertNodeOptions {
+                    props: btree_props([
+                        (PROP_SCOPE_KEY, PropValue::String(sidecar.scope_key.clone())),
+                        (
+                            PROP_SCOPE_ORD,
+                            sidecar
+                                .scope_ord
+                                .map(|scope_ord| PropValue::UInt(scope_ord.0))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (
+                            PROP_SESSION_ID,
+                            sidecar
+                                .session_id
+                                .as_ref()
+                                .map(|session_id| PropValue::String(session_id.0.clone()))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (PROP_REVISION, PropValue::UInt(sidecar.generation)),
+                        (PROP_UPDATED_AT, PropValue::Int(sidecar.updated_at)),
+                        (PROP_BYTE_LEN, PropValue::UInt(payload.len() as u64)),
+                        (PROP_PAYLOAD, PropValue::Bytes(payload)),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .map_err(store_query_error)?;
+        Ok(())
+    }
+
+    fn persist_event_identity_patch_sidecar_native_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        sidecar: &EventIdentityScopeSidecar,
+    ) -> Result<(), StoreError> {
+        let payload = encode_archive(sidecar)?;
+        engine
+            .upsert_node(
+                TYPE_EVENT_IDENTITY_PATCH_SIDECAR,
+                &sidecar.scope_key,
+                UpsertNodeOptions {
+                    props: btree_props([
+                        (PROP_SCOPE_KEY, PropValue::String(sidecar.scope_key.clone())),
+                        (
+                            PROP_SCOPE_ORD,
+                            sidecar
+                                .scope_ord
+                                .map(|scope_ord| PropValue::UInt(scope_ord.0))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (
+                            PROP_SESSION_ID,
+                            sidecar
+                                .session_id
+                                .as_ref()
+                                .map(|session_id| PropValue::String(session_id.0.clone()))
+                                .unwrap_or(PropValue::Null),
+                        ),
+                        (PROP_REVISION, PropValue::UInt(sidecar.generation)),
+                        (PROP_UPDATED_AT, PropValue::Int(sidecar.updated_at)),
+                        (PROP_BYTE_LEN, PropValue::UInt(payload.len() as u64)),
+                        (PROP_PAYLOAD, PropValue::Bytes(payload)),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .map_err(store_query_error)?;
+        Ok(())
+    }
+
+    fn persist_state_schema_patch_sidecar_native_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        sidecar: &StateSchemaScopeSidecar,
+    ) -> Result<(), StoreError> {
+        let payload = encode_archive(sidecar)?;
+        engine
+            .upsert_node(
+                TYPE_STATE_SCHEMA_PATCH_SIDECAR,
                 &sidecar.scope_key,
                 UpsertNodeOptions {
                     props: btree_props([
@@ -2585,7 +2878,9 @@ impl PhoenixRelationPatchStore for PhoenixOvergraphStore {
         &self,
         scope: &ScopeKey,
     ) -> Result<Option<RelationScopePatchSidecar>, StoreError> {
-        self.with_engine(|engine| self.load_native_relation_patch_sidecar_with_engine(engine, scope))
+        self.with_engine(|engine| {
+            self.load_native_relation_patch_sidecar_with_engine(engine, scope)
+        })
     }
 }
 
@@ -2595,7 +2890,9 @@ impl PhoenixMemoryPatchStore for PhoenixOvergraphStore {
     }
 
     fn persist_memory_patch_sidecar(&self, sidecar: &MemoryScopeSidecar) -> Result<(), StoreError> {
-        self.with_engine(|engine| self.persist_memory_patch_sidecar_native_with_engine(engine, sidecar))
+        self.with_engine(|engine| {
+            self.persist_memory_patch_sidecar_native_with_engine(engine, sidecar)
+        })
     }
 
     fn load_memory_patch_sidecar(
@@ -2606,13 +2903,58 @@ impl PhoenixMemoryPatchStore for PhoenixOvergraphStore {
     }
 }
 
+impl PhoenixGraphPatchStore for PhoenixOvergraphStore {
+    fn init_graph_patch_schema(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn persist_graph_patch_sidecar(&self, sidecar: &GraphScopeSidecar) -> Result<(), StoreError> {
+        self.with_engine(|engine| {
+            self.persist_graph_patch_sidecar_native_with_engine(engine, sidecar)
+        })
+    }
+
+    fn load_graph_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<GraphScopeSidecar>, StoreError> {
+        self.with_engine(|engine| self.load_native_graph_patch_sidecar_with_engine(engine, scope))
+    }
+}
+
+impl PhoenixSemanticGraphPatchStore for PhoenixOvergraphStore {
+    fn init_semantic_graph_patch_schema(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn persist_semantic_graph_patch_sidecar(
+        &self,
+        sidecar: &SemanticGraphScopeSidecar,
+    ) -> Result<(), StoreError> {
+        self.with_engine(|engine| {
+            self.persist_semantic_graph_patch_sidecar_native_with_engine(engine, sidecar)
+        })
+    }
+
+    fn load_semantic_graph_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<SemanticGraphScopeSidecar>, StoreError> {
+        self.with_engine(|engine| {
+            self.load_native_semantic_graph_patch_sidecar_with_engine(engine, scope)
+        })
+    }
+}
+
 impl PhoenixCausalPatchStore for PhoenixOvergraphStore {
     fn init_causal_patch_schema(&self) -> Result<(), StoreError> {
         Ok(())
     }
 
     fn persist_causal_patch_sidecar(&self, sidecar: &CausalScopeSidecar) -> Result<(), StoreError> {
-        self.with_engine(|engine| self.persist_causal_patch_sidecar_native_with_engine(engine, sidecar))
+        self.with_engine(|engine| {
+            self.persist_causal_patch_sidecar_native_with_engine(engine, sidecar)
+        })
     }
 
     fn load_causal_patch_sidecar(
@@ -2620,6 +2962,78 @@ impl PhoenixCausalPatchStore for PhoenixOvergraphStore {
         scope: &ScopeKey,
     ) -> Result<Option<CausalScopeSidecar>, StoreError> {
         self.with_engine(|engine| self.load_native_causal_patch_sidecar_with_engine(engine, scope))
+    }
+}
+
+impl PhoenixTemporalPatchStore for PhoenixOvergraphStore {
+    fn init_temporal_patch_schema(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn persist_temporal_patch_sidecar(
+        &self,
+        sidecar: &TemporalScopeSidecar,
+    ) -> Result<(), StoreError> {
+        self.with_engine(|engine| {
+            self.persist_temporal_patch_sidecar_native_with_engine(engine, sidecar)
+        })
+    }
+
+    fn load_temporal_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<TemporalScopeSidecar>, StoreError> {
+        self.with_engine(|engine| {
+            self.load_native_temporal_patch_sidecar_with_engine(engine, scope)
+        })
+    }
+}
+
+impl PhoenixEventIdentityPatchStore for PhoenixOvergraphStore {
+    fn init_event_identity_patch_schema(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn persist_event_identity_patch_sidecar(
+        &self,
+        sidecar: &EventIdentityScopeSidecar,
+    ) -> Result<(), StoreError> {
+        self.with_engine(|engine| {
+            self.persist_event_identity_patch_sidecar_native_with_engine(engine, sidecar)
+        })
+    }
+
+    fn load_event_identity_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<EventIdentityScopeSidecar>, StoreError> {
+        self.with_engine(|engine| {
+            self.load_native_event_identity_patch_sidecar_with_engine(engine, scope)
+        })
+    }
+}
+
+impl PhoenixStateSchemaPatchStore for PhoenixOvergraphStore {
+    fn init_state_schema_patch_schema(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn persist_state_schema_patch_sidecar(
+        &self,
+        sidecar: &StateSchemaScopeSidecar,
+    ) -> Result<(), StoreError> {
+        self.with_engine(|engine| {
+            self.persist_state_schema_patch_sidecar_native_with_engine(engine, sidecar)
+        })
+    }
+
+    fn load_state_schema_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<StateSchemaScopeSidecar>, StoreError> {
+        self.with_engine(|engine| {
+            self.load_native_state_schema_patch_sidecar_with_engine(engine, scope)
+        })
     }
 }
 
@@ -3382,6 +3796,8 @@ fn segment_kind_name(kind: DocumentSegmentKind) -> &'static str {
         DocumentSegmentKind::AliasConfirmationTable => "alias-confirmation-table",
         DocumentSegmentKind::CorefClusterTable => "coref-cluster-table",
         DocumentSegmentKind::CausalSubstrateTable => "causal-substrate-table",
+        DocumentSegmentKind::TemporalSubstrateTable => "temporal-substrate-table",
+        DocumentSegmentKind::EventIdentitySubstrateTable => "event-identity-substrate-table",
     }
 }
 
@@ -3693,6 +4109,11 @@ mod tests {
             doc_hits.first().map(|hit| hit.document_id.as_str()),
             Some("doc-a")
         );
+        let (manifest, _, _) = store
+            .load_ann_query_state(&scope, AnnIndexFamily::Document, None)
+            .expect("ann query state")
+            .expect("document ann state");
+        assert_eq!(manifest.metric, AnnMetric::LABEL_SPHERE_GEODESIC);
 
         let leaf_hits = store
             .query_semantic_neighbors_in_documents(

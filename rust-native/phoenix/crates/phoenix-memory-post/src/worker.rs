@@ -1,15 +1,16 @@
 use phoenix_semantic_v2::{
-    scope_storage_key, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef, EntityMemoryCard,
-    MemoryClaimAtom, MemoryCompilerSummary, MemoryConflictRecord, MemoryContinuityGapRecord,
-    MemoryDeltaRecord, MemoryEventRecord, MemoryScopeSidecar, MemoryStateRecord,
-    RelationScopePatchSidecar, RelationshipMemoryLedger, ScopeLexSidecar, ScopeOrd,
-    SessionArchive, ErScopePatchSidecar,
+    scope_storage_key, CanonicalEventId, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef,
+    EntityMemoryCard, ErScopePatchSidecar, EventIdentityScopeSidecar, MemoryClaimAtom,
+    MemoryCompilerSummary, MemoryConflictRecord, MemoryContinuityGapRecord, MemoryDeltaRecord,
+    MemoryEventRecord, MemoryScopeSidecar, MemoryStateRecord, RelationScopePatchSidecar,
+    RelationshipMemoryLedger, ScopeLexSidecar, ScopeOrd, SessionArchive, StateSchemaScopeSidecar,
 };
 use phoenix_store_native_core::{
-    PhoenixArchiveStoreV2, PhoenixErPatchStore, PhoenixMemoryPatchStore, PhoenixRelationPatchStore,
-    StoreError,
+    PhoenixArchiveStoreV2, PhoenixErPatchStore, PhoenixEventIdentityPatchStore,
+    PhoenixMemoryPatchStore, PhoenixRelationPatchStore, PhoenixStateSchemaPatchStore, StoreError,
 };
 use phoenix_types::{ScopeKey, SessionId};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::compile::compile_memory;
@@ -46,6 +47,7 @@ pub struct MemoryScopeReviewBatch {
     pub lexical_generation: Option<u64>,
     pub er_generation: Option<u64>,
     pub relation_generation: Option<u64>,
+    pub state_schema_generation: Option<u64>,
     pub memory_generation: Option<u64>,
     pub summary: MemoryCompilerSummary,
 }
@@ -57,6 +59,7 @@ pub fn derive_scope_review_batch(
     lexical: Option<&ScopeLexSidecar>,
     er_sidecar: Option<&ErScopePatchSidecar>,
     relation_sidecar: Option<&RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&StateSchemaScopeSidecar>,
 ) -> MemoryScopeReviewBatch {
     let scope = archives
         .first()
@@ -91,7 +94,14 @@ pub fn derive_scope_review_batch(
         })
         .unwrap_or_default();
 
-    let normalized = normalize_memory_inputs(archives, session, lexical, er_sidecar, relation_sidecar);
+    let normalized = normalize_memory_inputs(
+        archives,
+        session,
+        lexical,
+        er_sidecar,
+        relation_sidecar,
+        state_schema_sidecar,
+    );
     let compiled = compile_memory(&normalized);
 
     MemoryScopeReviewBatch {
@@ -113,6 +123,7 @@ pub fn derive_scope_review_batch(
         lexical_generation: lexical.map(|value| value.generation),
         er_generation: er_sidecar.map(|value| value.generation),
         relation_generation: relation_sidecar.map(|value| value.generation),
+        state_schema_generation: state_schema_sidecar.map(|value| value.generation),
         memory_generation: None,
         summary: compiled.summary,
     }
@@ -124,12 +135,19 @@ pub fn derive_scope_review_batch_from_store<S>(
     session: Option<&SessionArchive>,
 ) -> Result<MemoryScopeReviewBatch, StoreError>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixRelationPatchStore + PhoenixMemoryPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixRelationPatchStore
+        + PhoenixMemoryPatchStore
+        + PhoenixEventIdentityPatchStore
+        + PhoenixStateSchemaPatchStore,
 {
     let archives = store.load_latest_document_archives(Some(&dirty.scope))?;
     let lexical = store.load_scope_sidecar(&dirty.scope)?;
     let er_sidecar = store.load_er_patch_sidecar(&dirty.scope)?;
     let relation_sidecar = store.load_relation_patch_sidecar(&dirty.scope)?;
+    let state_schema_sidecar = store.load_state_schema_patch_sidecar(&dirty.scope)?;
+    let event_identity_sidecar = store.load_event_identity_patch_sidecar(&dirty.scope)?;
     let mut batch = derive_scope_review_batch(
         &archives,
         session,
@@ -137,9 +155,16 @@ where
         lexical.as_ref(),
         er_sidecar.as_ref(),
         relation_sidecar.as_ref(),
+        state_schema_sidecar.as_ref(),
     );
+    if let Some(sidecar) = event_identity_sidecar.as_ref() {
+        annotate_memory_batch_with_event_identity(&mut batch, sidecar);
+    }
     if let Some(memory_sidecar) = store.load_memory_patch_sidecar(&dirty.scope)? {
         apply_memory_patch_sidecar(&mut batch, &memory_sidecar);
+        if let Some(event_identity_sidecar) = event_identity_sidecar.as_ref() {
+            annotate_memory_batch_with_event_identity(&mut batch, event_identity_sidecar);
+        }
     }
     Ok(batch)
 }
@@ -149,7 +174,12 @@ pub fn derive_dirty_scope_review_batches<S>(
     session_id: Option<&SessionId>,
 ) -> Result<Vec<MemoryScopeReviewBatch>, StoreError>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixRelationPatchStore + PhoenixMemoryPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixRelationPatchStore
+        + PhoenixMemoryPatchStore
+        + PhoenixEventIdentityPatchStore
+        + PhoenixStateSchemaPatchStore,
 {
     let session = match session_id {
         Some(value) => store.load_latest_session_archive(value)?,
@@ -203,7 +233,10 @@ where
     Ok(merged)
 }
 
-pub fn apply_memory_patch_sidecar(batch: &mut MemoryScopeReviewBatch, sidecar: &MemoryScopeSidecar) {
+pub fn apply_memory_patch_sidecar(
+    batch: &mut MemoryScopeReviewBatch,
+    sidecar: &MemoryScopeSidecar,
+) {
     batch.claims = sidecar.claims.clone();
     batch.events = sidecar.events.clone();
     batch.states = sidecar.states.clone();
@@ -214,6 +247,67 @@ pub fn apply_memory_patch_sidecar(batch: &mut MemoryScopeReviewBatch, sidecar: &
     batch.relationship_ledgers = sidecar.relationship_ledgers.clone();
     batch.memory_generation = Some(sidecar.generation);
     batch.summary = sidecar.summary.clone();
+}
+
+pub(crate) fn annotate_memory_batch_with_event_identity(
+    batch: &mut MemoryScopeReviewBatch,
+    sidecar: &EventIdentityScopeSidecar,
+) {
+    let canonical_by_event = canonical_event_ids_by_event(sidecar);
+
+    for event in &mut batch.events {
+        event.canonical_event_id = canonical_for_event_id(
+            &canonical_by_event,
+            event.document_id.as_str(),
+            event.event_id.as_str(),
+        );
+    }
+
+    for delta in &mut batch.deltas {
+        delta.canonical_caused_by_event_id = delta
+            .caused_by_event_id
+            .as_deref()
+            .and_then(|event_id| canonical_for_event_id(&canonical_by_event, "", event_id));
+    }
+}
+
+fn canonical_event_ids_by_event(
+    sidecar: &EventIdentityScopeSidecar,
+) -> FxHashMap<(String, String), CanonicalEventId> {
+    let mention_by_id = sidecar
+        .mention_packets
+        .iter()
+        .map(|packet| (packet.mention_id.0.clone(), packet))
+        .collect::<FxHashMap<_, _>>();
+    let mut rows = FxHashMap::<(String, String), CanonicalEventId>::default();
+    for membership in &sidecar.memberships {
+        if let Some(packet) = mention_by_id.get(membership.mention_id.0.as_str()) {
+            rows.entry((packet.document_id.clone(), packet.event_id.clone()))
+                .or_insert_with(|| membership.canonical_event_id.clone());
+        }
+    }
+    rows
+}
+
+fn canonical_for_event_id(
+    mapping: &FxHashMap<(String, String), CanonicalEventId>,
+    document_id: &str,
+    event_id: &str,
+) -> Option<CanonicalEventId> {
+    mapping
+        .get(&(document_id.to_owned(), event_id.to_owned()))
+        .cloned()
+        .or_else(|| {
+            mapping
+                .iter()
+                .find_map(|((_, candidate_event_id), canonical_event_id)| {
+                    if candidate_event_id == event_id {
+                        Some(canonical_event_id.clone())
+                    } else {
+                        None
+                    }
+                })
+        })
 }
 
 fn merge_memory_patch_sidecars(

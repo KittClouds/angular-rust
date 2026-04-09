@@ -111,10 +111,7 @@ impl NliModel {
     pub fn score(&self, premise: &str, hypothesis: &str) -> Result<NliScores, NliError> {
         let mut encoding = self
             .tokenizer
-            .encode(
-                EncodeInput::Dual(premise.into(), hypothesis.into()),
-                true,
-            )
+            .encode(EncodeInput::Dual(premise.into(), hypothesis.into()), true)
             .map_err(|error| NliError::Inference(error.to_string()))?;
         if encoding.len() > self.max_length {
             encoding.truncate(self.max_length, 0, TruncationDirection::Right);

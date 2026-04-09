@@ -3,11 +3,12 @@ use crate::{
     normalize_memory_inputs, persist_memory_patch_sidecar,
 };
 use phoenix_semantic_v2::{
-    scope_storage_key, DocumentArchive, DocumentManifest, ErAliasAddition, ErEntityLinkOverride,
-    ErScopePatchSidecar, ErTypeOverride, MemoryGapKind, NativeCorefSummary, NativeErSummary,
-    RelationDecisionOutcome, RelationDecisionRecord, RelationEdgeAddition, RelationJudgmentKind,
-    RelationJudgmentRecord, RelationScopePatchSidecar, ScopeLexSidecar, SemanticEntityRecord,
-    SemanticRelationRecord, SessionArchive,
+    default_state_slot_definitions, scope_storage_key, DocumentArchive, DocumentManifest,
+    ErAliasAddition, ErEntityLinkOverride, ErScopePatchSidecar, ErTypeOverride, MemoryGapKind,
+    NativeCorefSummary, NativeErSummary, RelationDecisionOutcome, RelationDecisionRecord,
+    RelationEdgeAddition, RelationJudgmentKind, RelationJudgmentRecord, RelationScopePatchSidecar,
+    ScopeLexSidecar, SemanticEntityRecord, SemanticRelationRecord, SessionArchive,
+    StateSchemaScopeSidecar, StateSlotLifecycle,
 };
 use phoenix_store_native_core::PhoenixMemoryPatchStore;
 use phoenix_store_overgraph::PhoenixOvergraphStore;
@@ -255,11 +256,13 @@ fn normalizes_claims_from_relation_and_er_inputs() {
         Some(&ScopeLexSidecar::default()),
         Some(&sample_er_sidecar()),
         Some(&sample_relation_sidecar()),
+        None,
     );
     assert!(normalized
         .claims
         .iter()
-        .any(|claim| claim.source_class == "relation_edge_addition" && claim.slot_key == "entity.location"));
+        .any(|claim| claim.source_class == "relation_edge_addition"
+            && claim.slot_key == "entity.location"));
     assert!(normalized
         .claims
         .iter()
@@ -284,6 +287,7 @@ fn derives_states_deltas_conflicts_and_gaps() {
         None,
         Some(&sample_er_sidecar()),
         Some(&sample_relation_sidecar()),
+        None,
     );
     assert!(batch
         .states
@@ -296,7 +300,9 @@ fn derives_states_deltas_conflicts_and_gaps() {
     assert!(batch
         .deltas
         .iter()
-        .any(|delta| delta.slot_key == "entity.location" && delta.old_value.as_deref() == Some("New Rome") && delta.new_value.as_deref() == Some("Old Rome")));
+        .any(|delta| delta.slot_key == "entity.location"
+            && delta.old_value.as_deref() == Some("New Rome")
+            && delta.new_value.as_deref() == Some("Old Rome")));
     assert!(batch
         .conflicts
         .iter()
@@ -304,7 +310,8 @@ fn derives_states_deltas_conflicts_and_gaps() {
     assert!(batch
         .gaps
         .iter()
-        .any(|gap| gap.kind == MemoryGapKind::BrokenContinuity || gap.kind == MemoryGapKind::UnresolvedConflict));
+        .any(|gap| gap.kind == MemoryGapKind::BrokenContinuity
+            || gap.kind == MemoryGapKind::UnresolvedConflict));
     assert!(batch
         .relationship_ledgers
         .iter()
@@ -320,6 +327,7 @@ fn cards_include_identity_state_and_relationship_views() {
         None,
         Some(&sample_er_sidecar()),
         Some(&sample_relation_sidecar()),
+        None,
     );
     let card = batch
         .entity_cards
@@ -328,8 +336,14 @@ fn cards_include_identity_state_and_relationship_views() {
         .expect("alice card");
     assert_eq!(card.identity.canonical_name, "Alice");
     assert!(card.identity.aliases.iter().any(|value| value == "Ace"));
-    assert!(card.current_state.iter().any(|state| state.slot_key == "entity.location"));
-    assert!(card.active_relationships.iter().any(|row| row.relation_family == "commands"));
+    assert!(card
+        .current_state
+        .iter()
+        .any(|state| state.slot_key == "entity.location"));
+    assert!(card
+        .active_relationships
+        .iter()
+        .any(|row| row.relation_family == "commands"));
 }
 
 #[test]
@@ -341,6 +355,7 @@ fn build_and_apply_sidecar_is_idempotent() {
         None,
         Some(&sample_er_sidecar()),
         Some(&sample_relation_sidecar()),
+        None,
     );
     let sidecar = build_memory_patch_sidecar(&batch, 999);
     let mut replayed = batch.clone();
@@ -364,6 +379,7 @@ fn persists_memory_sidecar_in_overgraph_store() {
         None,
         Some(&sample_er_sidecar()),
         Some(&sample_relation_sidecar()),
+        None,
     );
     let persisted = persist_memory_patch_sidecar(&store, &batch, 1234).expect("persist");
     let loaded = store
@@ -373,4 +389,86 @@ fn persists_memory_sidecar_in_overgraph_store() {
     assert_eq!(persisted.summary, loaded.summary);
     assert_eq!(persisted.entity_cards, loaded.entity_cards);
     let _ = std::fs::remove_dir_all(&store_path);
+}
+
+#[test]
+fn dynamic_state_schema_slots_compile_into_memory_states() {
+    let scope = sample_scope();
+    let archive = DocumentArchive {
+        manifest: sample_manifest("doc-task", 500),
+        entities: vec![
+            SemanticEntityRecord {
+                entity_id: EntityId("task-1".to_owned()),
+                canonical_name: "Find the vault".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Other),
+                mention_count: 1,
+                chunk_ids: Vec::new(),
+            },
+            SemanticEntityRecord {
+                entity_id: EntityId("e1".to_owned()),
+                canonical_name: "Alice".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Character),
+                mention_count: 1,
+                chunk_ids: Vec::new(),
+            },
+        ],
+        ..Default::default()
+    };
+    let relation_sidecar = RelationScopePatchSidecar {
+        scope: scope.clone(),
+        scope_key: scope_storage_key(&scope),
+        scope_ord: Some(phoenix_semantic_v2::ScopeOrd(7)),
+        updated_at: 510,
+        generation: 510,
+        edge_additions: vec![RelationEdgeAddition {
+            case_id: "case-assigned".to_owned(),
+            document_id: "doc-task".to_owned(),
+            window_id: "window-task".to_owned(),
+            source_entity_id: EntityId("task-1".to_owned()),
+            target_entity_id: EntityId("e1".to_owned()),
+            edge_type: "assigned_to".to_owned(),
+            confidence_millis: 910,
+            evidence_refs: vec!["ev:assigned".to_owned()],
+            created_at: 510,
+        }],
+        ..Default::default()
+    };
+    let mut slot_definitions = default_state_slot_definitions();
+    let task_owner = slot_definitions
+        .iter_mut()
+        .find(|definition| definition.slot_key == "task.owner")
+        .expect("task.owner definition");
+    task_owner.lifecycle = StateSlotLifecycle::Active;
+    if !task_owner
+        .relation_families
+        .iter()
+        .any(|family| family == "assigned_to")
+    {
+        task_owner.relation_families.push("assigned_to".to_owned());
+    }
+    let state_schema_sidecar = StateSchemaScopeSidecar {
+        scope: scope.clone(),
+        scope_key: scope_storage_key(&scope),
+        scope_ord: Some(phoenix_semantic_v2::ScopeOrd(7)),
+        updated_at: 520,
+        generation: 1,
+        slot_definitions,
+        ..Default::default()
+    };
+
+    let batch = derive_scope_review_batch(
+        &[archive],
+        None,
+        None,
+        None,
+        None,
+        Some(&relation_sidecar),
+        Some(&state_schema_sidecar),
+    );
+    assert!(batch
+        .states
+        .iter()
+        .any(|state| state.slot_key == "task.owner" && state.value == "Alice"));
 }

@@ -9,7 +9,6 @@ authors.workspace = true
 compact_str.workspace = true
 phoenix-automata = { path = "../phoenix-automata" }
 phoenix-machine = { path = "../phoenix-machine" }
-phoenix-semantics = { path = "../phoenix-semantics" }
 phoenix-time = { path = "../phoenix-time" }
 phoenix-types = { path = "../phoenix-types" }
 rustc-hash.workspace = true

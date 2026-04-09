@@ -165,14 +165,17 @@ impl SurfaceCompiler {
 
     pub fn build_structure_parts(&self, text: &str, scan: &ScanArtifact) -> StructureArtifact {
         let sentence_mention_ranges =
-            sentence_item_ranges(scan.sentences.len(), &scan.mentions, |mention| mention.sentence_index);
+            sentence_item_ranges(scan.sentences.len(), &scan.mentions, |mention| {
+                mention.sentence_index
+            });
         let sentence_chunk_ranges =
-            sentence_item_ranges(scan.sentences.len(), &scan.chunks, |chunk| chunk.sentence_index);
-        let sentence_hit_ranges = sentence_item_ranges(
-            scan.sentences.len(),
-            &scan.narrative_hits,
-            |hit| hit.sentence_index,
-        );
+            sentence_item_ranges(scan.sentences.len(), &scan.chunks, |chunk| {
+                chunk.sentence_index
+            });
+        let sentence_hit_ranges =
+            sentence_item_ranges(scan.sentences.len(), &scan.narrative_hits, |hit| {
+                hit.sentence_index
+            });
 
         let mut sentence_frames = Vec::with_capacity(scan.sentences.len());
         let mut relations = Vec::new();
@@ -180,16 +183,12 @@ impl SurfaceCompiler {
 
         for sentence in &scan.sentences {
             let index = sentence.index;
-            let mention_slice = &scan.mentions[sentence_mention_ranges
-                .get(index)
-                .cloned()
-                .unwrap_or(0..0)];
+            let mention_slice =
+                &scan.mentions[sentence_mention_ranges.get(index).cloned().unwrap_or(0..0)];
             let chunk_slice =
                 &scan.chunks[sentence_chunk_ranges.get(index).cloned().unwrap_or(0..0)];
-            let hit_slice = &scan.narrative_hits[sentence_hit_ranges
-                .get(index)
-                .cloned()
-                .unwrap_or(0..0)];
+            let hit_slice =
+                &scan.narrative_hits[sentence_hit_ranges.get(index).cloned().unwrap_or(0..0)];
             let mut diagnostics = Vec::new();
             let mut verb_frames = Vec::with_capacity(hit_slice.len());
 
@@ -411,7 +410,10 @@ fn surface_from_artifacts(
         .map(|token| Token {
             range: SourceRange::from(token.range),
             surface: CompactString::from(slice_or_empty(text, token.range)),
-            normalized: CompactString::from(normalize_token_surface(slice_or_empty(text, token.range))),
+            normalized: CompactString::from(normalize_token_surface(slice_or_empty(
+                text,
+                token.range,
+            ))),
             class: token.token_class.clone(),
             pos: token.pos.clone(),
         })
@@ -447,7 +449,12 @@ fn surface_from_artifacts(
             },
             range: SourceRange::from(chunk.range),
             head: Some(SourceRange::from(chunk.head)),
-            modifiers: chunk.modifiers.iter().copied().map(SourceRange::from).collect(),
+            modifiers: chunk
+                .modifiers
+                .iter()
+                .copied()
+                .map(SourceRange::from)
+                .collect(),
             sentence_index: chunk.sentence_index,
         })
         .collect::<Vec<_>>();
@@ -511,7 +518,11 @@ fn tokenize(text: &str) -> TokenizedDocument {
                 Some(PosTag::Pronoun)
             } else if is_verb_token(&normalized) {
                 Some(PosTag::Verb)
-            } else if token.chars().next().is_some_and(|value| value.is_uppercase()) {
+            } else if token
+                .chars()
+                .next()
+                .is_some_and(|value| value.is_uppercase())
+            {
                 Some(PosTag::ProperNoun)
             } else {
                 Some(PosTag::Noun)
@@ -525,7 +536,10 @@ fn tokenize(text: &str) -> TokenizedDocument {
                 }),
                 pos,
                 masked: false,
-                capitalized: token.chars().next().is_some_and(|value| value.is_uppercase()),
+                capitalized: token
+                    .chars()
+                    .next()
+                    .is_some_and(|value| value.is_uppercase()),
             });
             normalized_tokens.push(normalized);
         } else {
@@ -667,9 +681,7 @@ fn infer_seed_kind(surface: &str, seeds: &[ResolverEntitySeed]) -> Option<Entity
     })
 }
 
-fn build_seed_gazetteer(
-    resolver_seed: &[ResolverEntitySeed],
-) -> SeedGazetteer {
+fn build_seed_gazetteer(resolver_seed: &[ResolverEntitySeed]) -> SeedGazetteer {
     let mut by_first_token = FxHashMap::<String, SmallVec<[GazetteerEntry; 4]>>::default();
     for seed in resolver_seed {
         let forms = std::iter::once(seed.canonical_name.as_str())
@@ -862,7 +874,10 @@ fn scirs2_pattern_mentions(text: &str, sentences: &[SentenceSpan]) -> Vec<Detect
 }
 
 fn connective_token(value: &str) -> bool {
-    matches!(value.to_ascii_lowercase().as_str(), "of" | "the" | "and" | "&")
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "of" | "the" | "and" | "&"
+    )
 }
 
 fn looks_like_entity_token(value: &str) -> bool {
@@ -877,8 +892,7 @@ fn looks_like_entity_token(value: &str) -> bool {
 fn title_token(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().trim_end_matches('.'),
-        "mr"
-            | "mrs"
+        "mr" | "mrs"
             | "ms"
             | "dr"
             | "prof"
@@ -932,12 +946,18 @@ fn native_refinement_mentions(
     while index < tokens.len() {
         let token = &tokens[index];
         let range = token.range;
-        if observed_ranges.iter().any(|existing| range_overlaps(*existing, range)) {
+        if observed_ranges
+            .iter()
+            .any(|existing| range_overlaps(*existing, range))
+        {
             index += 1;
             continue;
         }
         let token_text = slice_or_empty(text, token.range);
-        let normalized_token = normalized_tokens.get(index).map(String::as_str).unwrap_or_default();
+        let normalized_token = normalized_tokens
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or_default();
         let sentence_index = locate_sentence_cursor(sentences, &mut sentence_cursor, token.range);
 
         if matches!(token.pos, Some(PosTag::Pronoun)) {
@@ -981,8 +1001,9 @@ fn native_refinement_mentions(
                     mention_kind: DetectedMentionKind::Named,
                     type_hint: infer_seed_kind(&surface, resolver_seed)
                         .or(Some(EntityKind::Character)),
-                    entity_ref: infer_seed_entity_ref(&surface, resolver_seed)
-                        .or_else(|| Some(MentionEntityRef::Speculative(normalize_surface(&surface)))),
+                    entity_ref: infer_seed_entity_ref(&surface, resolver_seed).or_else(|| {
+                        Some(MentionEntityRef::Speculative(normalize_surface(&surface)))
+                    }),
                     source: DetectedMentionSourceKind::NativeHeuristic,
                     confidence: 0.8,
                     sentence_index,
@@ -1214,7 +1235,10 @@ fn detect_mentions(
         sentences,
         &seed_resources.gazetteer,
     );
-    let mut observed_ranges = detected.iter().map(|mention| mention.range).collect::<Vec<_>>();
+    let mut observed_ranges = detected
+        .iter()
+        .map(|mention| mention.range)
+        .collect::<Vec<_>>();
 
     if config.enable_scirs2_rule_ner {
         extend_detected_mentions_without_overlaps(
@@ -1304,7 +1328,10 @@ fn detect_mentions_hot_path(
     )
 }
 
-fn build_resolver_links(mentions: &[MentionSpan], normalized_surfaces: &[String]) -> Vec<ResolverLink> {
+fn build_resolver_links(
+    mentions: &[MentionSpan],
+    normalized_surfaces: &[String],
+) -> Vec<ResolverLink> {
     let mut links = Vec::new();
     let mut last_entity_by_surface = FxHashMap::<&str, usize>::default();
     let mut antecedent = None::<usize>;
@@ -1357,7 +1384,10 @@ fn discover_narrative_hits(
         if !matches!(token.pos, Some(PosTag::Verb)) {
             continue;
         }
-        let normalized = normalized_tokens.get(index).map(String::as_str).unwrap_or_default();
+        let normalized = normalized_tokens
+            .get(index)
+            .map(String::as_str)
+            .unwrap_or_default();
         let (lemma, event_class, relation_type, transitivity) = classify_verb(&normalized);
         hits.push(NarrativeVerbHit {
             range: token.range,
@@ -1455,11 +1485,44 @@ fn is_pronoun(value: &str) -> bool {
 fn is_verb_token(value: &str) -> bool {
     matches!(
         value,
-        "attack" | "attacked" | "attacks" | "met" | "meet" | "meets" | "rose" | "rise"
-            | "rises" | "woke" | "wake" | "wakes" | "wrote" | "write" | "writes"
-            | "mapped" | "map" | "maps" | "gave" | "give" | "gives" | "waited" | "wait"
-            | "waits" | "saw" | "see" | "sees" | "found" | "find" | "finds" | "fought"
-            | "fight" | "fights" | "moved" | "move" | "moves" | "crossed" | "cross"
+        "attack"
+            | "attacked"
+            | "attacks"
+            | "met"
+            | "meet"
+            | "meets"
+            | "rose"
+            | "rise"
+            | "rises"
+            | "woke"
+            | "wake"
+            | "wakes"
+            | "wrote"
+            | "write"
+            | "writes"
+            | "mapped"
+            | "map"
+            | "maps"
+            | "gave"
+            | "give"
+            | "gives"
+            | "waited"
+            | "wait"
+            | "waits"
+            | "saw"
+            | "see"
+            | "sees"
+            | "found"
+            | "find"
+            | "finds"
+            | "fought"
+            | "fight"
+            | "fights"
+            | "moved"
+            | "move"
+            | "moves"
+            | "crossed"
+            | "cross"
             | "crosses"
     ) || value.ends_with("ed")
 }
@@ -1485,13 +1548,19 @@ fn classify_verb(value: &str) -> (String, String, String, Option<NarrativeTransi
             Some(NarrativeTransitivity::Ditransitive),
         ),
         "wrote" | "write" | "writes" | "mapped" | "map" | "maps" => (
-            value.trim_end_matches("ed").trim_end_matches('s').to_owned(),
+            value
+                .trim_end_matches("ed")
+                .trim_end_matches('s')
+                .to_owned(),
             "creation".to_owned(),
             "writes".to_owned(),
             Some(NarrativeTransitivity::Transitive),
         ),
         other => (
-            other.trim_end_matches("ed").trim_end_matches('s').to_owned(),
+            other
+                .trim_end_matches("ed")
+                .trim_end_matches('s')
+                .to_owned(),
             "action".to_owned(),
             "relates_to".to_owned(),
             Some(NarrativeTransitivity::Transitive),

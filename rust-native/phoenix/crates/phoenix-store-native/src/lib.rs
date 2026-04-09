@@ -201,7 +201,9 @@ pub enum AnnIndexFamily {
     NodePrototype,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct AnnGenerationId(pub u64);
 
@@ -494,7 +496,10 @@ pub trait PhoenixDirectGraphStoreV2 {
         commit_id: &str,
         created_at: i64,
     ) -> Result<(), StoreError>;
-    fn direct_graph_generation_for_commit(&self, commit_id: &str) -> Result<Option<u64>, StoreError>;
+    fn direct_graph_generation_for_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<Option<u64>, StoreError>;
     fn direct_graph_current_generation(&self) -> Result<u64, StoreError>;
     fn direct_graph_journal_len(&self) -> Result<usize, StoreError>;
 }

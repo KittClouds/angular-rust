@@ -1,20 +1,64 @@
 use std::collections::BTreeMap;
 
 use phoenix_semantic_v2::{
-    CausalClaimAtom, CausalClaimId, CausalClaimPolarity, CausalClaimSourceKind,
-    CausalEdgeId, CausalRelationKind, DocumentArchive, DocumentCausalSubstrate, ErScopePatchSidecar,
+    CanonicalEventId, CausalClaimAtom, CausalClaimId, CausalClaimPolarity, CausalClaimSourceKind,
+    CausalEdgeId, CausalEvidenceClass, CausalRelationKind, DocumentArchive,
+    DocumentCausalSubstrate, ErScopePatchSidecar,
 };
 use phoenix_types::{
-    BiTemporalWindow, CausalCandidate, CausalKind, EntityId, Polarity, Proposition,
-    ProvenanceRef, SemanticNodeRef, TruthStatus,
+    BiTemporalWindow, CausalCandidate, CausalKind, EntityId, Polarity, Proposition, ProvenanceRef,
+    SemanticNodeRef, SourceRange, TruthStatus,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CausalSourceSemantics {
+    #[default]
+    WorldAssertion,
+    ReportedSpeech,
+    AttributedClaim,
+}
+
+impl CausalSourceSemantics {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorldAssertion => "world_assertion",
+            Self::ReportedSpeech => "reported_speech",
+            Self::AttributedClaim => "attributed_claim",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CausalModalitySemantics {
+    #[default]
+    Asserted,
+    Conditional,
+    Planned,
+    Hypothetical,
+    Negated,
+}
+
+impl CausalModalitySemantics {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asserted => "asserted",
+            Self::Conditional => "conditional",
+            Self::Planned => "planned",
+            Self::Hypothetical => "hypothetical",
+            Self::Negated => "negated",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CausalEventProfile {
     pub node: SemanticNodeRef,
+    pub canonical_event_id: Option<CanonicalEventId>,
     pub document_id: String,
     pub proposition_id: String,
     pub label: String,
@@ -26,6 +70,14 @@ pub struct CausalEventProfile {
     pub quoted: bool,
     pub negative: bool,
     #[serde(default)]
+    pub source_semantics: CausalSourceSemantics,
+    #[serde(default)]
+    pub modality_semantics: CausalModalitySemantics,
+    #[serde(default)]
+    pub normalized_predicate: String,
+    #[serde(default)]
+    pub event_fingerprint: String,
+    #[serde(default)]
     pub evidence_refs: Vec<String>,
 }
 
@@ -36,7 +88,9 @@ pub struct CausalReviewCase {
     pub document_id: String,
     pub revision: u64,
     pub source: SemanticNodeRef,
+    pub canonical_cause_event_id: Option<CanonicalEventId>,
     pub target: SemanticNodeRef,
+    pub canonical_effect_event_id: Option<CanonicalEventId>,
     pub kind: CausalKind,
     pub relation_kind: CausalRelationKind,
     pub base_confidence_millis: u32,
@@ -49,7 +103,13 @@ pub struct CausalReviewCase {
     pub target_sentence_index: usize,
     pub sentence_distance: usize,
     pub temporal_legal: bool,
+    pub quoted_evidence: bool,
+    pub attributed_evidence: bool,
     pub quoted_or_attributed: bool,
+    #[serde(default)]
+    pub source_semantics: CausalSourceSemantics,
+    #[serde(default)]
+    pub modality_semantics: CausalModalitySemantics,
     pub shared_participant_count: usize,
     pub source_degree: usize,
     pub target_degree: usize,
@@ -70,6 +130,10 @@ pub struct CausalNormalizedInputs {
     #[serde(default)]
     pub claim_atoms: Vec<CausalClaimAtom>,
     #[serde(default)]
+    pub shadow_local_pair_cases: Vec<CausalReviewCase>,
+    #[serde(default)]
+    pub shadow_local_pair_claim_atoms: Vec<CausalClaimAtom>,
+    #[serde(default)]
     pub diagnostics: BTreeMap<String, usize>,
 }
 
@@ -79,6 +143,7 @@ pub fn normalize_causal_inputs(
 ) -> CausalNormalizedInputs {
     let mut event_profiles = Vec::new();
     let mut raw_cases = Vec::new();
+    let mut shadow_local_pair_cases = Vec::new();
     let mut diagnostics = BTreeMap::<String, usize>::new();
 
     for archive in archives {
@@ -89,7 +154,7 @@ pub fn normalize_causal_inputs(
             continue;
         };
 
-        let profile_map = build_event_profile_map(archive, substrate, er_sidecar);
+        let profile_map = build_event_profile_map(archive, substrate, er_sidecar, &mut diagnostics);
         if profile_map.is_empty() {
             *diagnostics
                 .entry("empty_causal_profiles".to_owned())
@@ -100,7 +165,7 @@ pub fn normalize_causal_inputs(
 
         let graph_stats = build_degree_map(substrate);
         let mut seen_case_keys = FxHashSet::default();
-        let mut explicit_case_count = 0usize;
+        let mut seen_shadow_case_keys = FxHashSet::default();
 
         for link in &substrate.causal_links {
             if let Some(case) = build_review_case(
@@ -120,7 +185,6 @@ pub fn normalize_causal_inputs(
             ) {
                 let case_key = review_case_key(&case);
                 if seen_case_keys.insert(case_key) {
-                    explicit_case_count += 1;
                     raw_cases.push(case);
                 }
             } else {
@@ -131,7 +195,8 @@ pub fn normalize_causal_inputs(
         }
 
         for candidate in &substrate.causal_candidates {
-            if let Some(case) = build_candidate_case(archive, &profile_map, &graph_stats, candidate) {
+            if let Some(case) = build_candidate_case(archive, &profile_map, &graph_stats, candidate)
+            {
                 let case_key = review_case_key(&case);
                 if seen_case_keys.insert(case_key) {
                     raw_cases.push(case);
@@ -143,13 +208,14 @@ pub fn normalize_causal_inputs(
             }
         }
 
-        if explicit_case_count == 0 {
-            let local_cases = build_local_fallback_cases(archive, &profile_map, &graph_stats);
-            for case in local_cases {
-                let case_key = review_case_key(&case);
-                if seen_case_keys.insert(case_key) {
-                    raw_cases.push(case);
-                }
+        let local_cases = build_local_fallback_cases(archive, &profile_map, &graph_stats);
+        for case in local_cases {
+            let case_key = review_case_key(&case);
+            if seen_shadow_case_keys.insert(case_key) {
+                shadow_local_pair_cases.push(case);
+                *diagnostics
+                    .entry("shadow_local_pair_case_count".to_owned())
+                    .or_default() += 1;
             }
         }
     }
@@ -172,11 +238,14 @@ pub fn normalize_causal_inputs(
     });
 
     let claim_atoms = build_claim_atoms(&raw_cases);
+    let shadow_local_pair_claim_atoms = build_claim_atoms(&shadow_local_pair_cases);
 
     CausalNormalizedInputs {
         event_profiles,
         review_cases: raw_cases,
         claim_atoms,
+        shadow_local_pair_cases,
+        shadow_local_pair_claim_atoms,
         diagnostics,
     }
 }
@@ -185,6 +254,7 @@ fn build_event_profile_map(
     archive: &DocumentArchive,
     substrate: &DocumentCausalSubstrate,
     er_sidecar: Option<&ErScopePatchSidecar>,
+    diagnostics: &mut BTreeMap<String, usize>,
 ) -> FxHashMap<String, CausalEventProfile> {
     let proposition_by_id = substrate
         .propositions
@@ -199,7 +269,13 @@ fn build_event_profile_map(
             let temporal = substrate
                 .temporal_bindings
                 .get(index)
-                .map(|binding| binding.anchor.as_ref().map(|anchor| anchor.interval.clone()).unwrap_or_else(|| binding.recorded_window.clone()))
+                .map(|binding| {
+                    binding
+                        .anchor
+                        .as_ref()
+                        .map(|anchor| anchor.interval.clone())
+                        .unwrap_or_else(|| binding.recorded_window.clone())
+                })
                 .unwrap_or_else(|| BiTemporalWindow {
                     valid_from: Some(archive.manifest.created_at),
                     valid_to: None,
@@ -209,19 +285,41 @@ fn build_event_profile_map(
             (proposition.proposition_id.to_string(), temporal)
         })
         .collect::<FxHashMap<_, _>>();
+    let mention_ranges_by_id = archive
+        .resolved_mentions
+        .iter()
+        .map(|mention| {
+            (
+                mention.mention_id.0.clone(),
+                SourceRange::new(mention.range.start, mention.range.end),
+            )
+        })
+        .collect::<FxHashMap<String, SourceRange>>();
+    let mention_ranges_by_index = archive
+        .mentions
+        .iter()
+        .enumerate()
+        .map(|(index, mention)| {
+            (
+                index,
+                SourceRange::new(mention.range.start, mention.range.end),
+            )
+        })
+        .collect::<FxHashMap<usize, SourceRange>>();
     let mut profiles = FxHashMap::default();
 
     for event in &substrate.semantic_events {
         if let Some(profile) = build_profile_from_record(
             archive,
-            event.event_id
-                .clone()
-                .map(SemanticNodeRef::Event),
+            event.event_id.clone().map(SemanticNodeRef::Event),
             event.label.to_string(),
             event.proposition_id.to_string(),
             &proposition_by_id,
             &temporal_by_proposition,
             er_sidecar,
+            &mention_ranges_by_id,
+            &mention_ranges_by_index,
+            diagnostics,
         ) {
             profiles.insert(node_key(&profile.node), profile);
         }
@@ -229,14 +327,15 @@ fn build_event_profile_map(
     for state in &substrate.semantic_states {
         if let Some(profile) = build_profile_from_record(
             archive,
-            state.state_id
-                .clone()
-                .map(SemanticNodeRef::State),
+            state.state_id.clone().map(SemanticNodeRef::State),
             state.label.to_string(),
             state.proposition_id.to_string(),
             &proposition_by_id,
             &temporal_by_proposition,
             er_sidecar,
+            &mention_ranges_by_id,
+            &mention_ranges_by_index,
+            diagnostics,
         ) {
             profiles.insert(node_key(&profile.node), profile);
         }
@@ -244,14 +343,15 @@ fn build_event_profile_map(
     for claim in &substrate.semantic_claims {
         if let Some(profile) = build_profile_from_record(
             archive,
-            claim.claim_id
-                .clone()
-                .map(SemanticNodeRef::Claim),
+            claim.claim_id.clone().map(SemanticNodeRef::Claim),
             claim.label.to_string(),
             claim.proposition_id.to_string(),
             &proposition_by_id,
             &temporal_by_proposition,
             er_sidecar,
+            &mention_ranges_by_id,
+            &mention_ranges_by_index,
+            diagnostics,
         ) {
             profiles.entry(node_key(&profile.node)).or_insert(profile);
         }
@@ -268,18 +368,50 @@ fn build_profile_from_record(
     proposition_by_id: &FxHashMap<String, &Proposition>,
     temporal_by_proposition: &FxHashMap<String, BiTemporalWindow>,
     er_sidecar: Option<&ErScopePatchSidecar>,
+    mention_ranges_by_id: &FxHashMap<String, SourceRange>,
+    mention_ranges_by_index: &FxHashMap<usize, SourceRange>,
+    diagnostics: &mut BTreeMap<String, usize>,
 ) -> Option<CausalEventProfile> {
     let node = node?;
     let proposition = proposition_by_id.get(&proposition_id)?;
+    let proposition_window = proposition_window(proposition, mention_ranges_by_index);
     let mut participants = proposition
         .arguments
         .iter()
-        .filter_map(|argument| argument.entity_id.clone())
+        .filter_map(|argument| {
+            let entity_id = argument.entity_id.clone()?;
+            *diagnostics
+                .entry("participant_source:argument".to_owned())
+                .or_default() += 1;
+            Some(entity_id)
+        })
         .collect::<Vec<_>>();
     if let Some(sidecar) = er_sidecar {
         for link in &sidecar.entity_links {
-            if link.document_id == archive.manifest.document_id {
+            if link.document_id != archive.manifest.document_id {
+                continue;
+            }
+            let Some(mention_id) = link.mention_id.as_ref() else {
+                *diagnostics
+                    .entry("participant_source:er_unscoped_skipped".to_owned())
+                    .or_default() += 1;
+                continue;
+            };
+            let Some(mention_range) = mention_ranges_by_id.get(&mention_id.0).copied() else {
+                *diagnostics
+                    .entry("participant_source:er_missing_mention_range".to_owned())
+                    .or_default() += 1;
+                continue;
+            };
+            if ranges_overlap(proposition_window, mention_range) {
                 participants.push(link.entity_id.clone());
+                *diagnostics
+                    .entry("participant_source:er_local_overlap".to_owned())
+                    .or_default() += 1;
+            } else {
+                *diagnostics
+                    .entry("participant_source:er_document_spill_rejected".to_owned())
+                    .or_default() += 1;
             }
         }
     }
@@ -291,9 +423,25 @@ fn build_profile_from_record(
         .scope_ops
         .iter()
         .any(|scope| scope.polarity.as_deref() == Some("negative"));
+    let source_semantics = source_semantics_for(proposition);
+    let modality_semantics = modality_semantics_for(proposition, negative);
+    let normalized_predicate = normalize_predicate_label(&proposition.predicate.predicate, &label);
+    let event_fingerprint = build_event_fingerprint(
+        &normalized_predicate,
+        &participants,
+        source_semantics,
+        modality_semantics,
+    );
+    *diagnostics
+        .entry(format!("profile_source:{}", source_semantics.as_str()))
+        .or_default() += 1;
+    *diagnostics
+        .entry(format!("profile_modality:{}", modality_semantics.as_str()))
+        .or_default() += 1;
 
     Some(CausalEventProfile {
         node,
+        canonical_event_id: None,
         document_id: archive.manifest.document_id.clone(),
         proposition_id,
         label,
@@ -314,6 +462,10 @@ fn build_profile_from_record(
             .and_then(|frame| frame.source_entity_id.clone()),
         quoted: proposition_is_quoted(proposition),
         negative,
+        source_semantics,
+        modality_semantics,
+        normalized_predicate,
+        event_fingerprint,
         evidence_refs,
     })
 }
@@ -364,7 +516,11 @@ fn build_review_case(
     let sentence_distance = source_profile
         .sentence_index
         .max(target_profile.sentence_index)
-        .saturating_sub(source_profile.sentence_index.min(target_profile.sentence_index));
+        .saturating_sub(
+            source_profile
+                .sentence_index
+                .min(target_profile.sentence_index),
+        );
     if sentence_distance > 1 {
         return None;
     }
@@ -377,12 +533,19 @@ fn build_review_case(
     let graph_support_count = source_degree.min(target_degree);
     let centrality_millis = ((source_degree + target_degree).min(6) as u32) * 110;
     let temporal_legal = temporal_precedes(&source_profile.temporal, &target_profile.temporal);
-    let quoted_or_attributed = review_case_needs_quote_caution(
-        seed_source,
-        source_profile,
-        target_profile,
-        attributed_to.as_ref(),
+    let source_semantics = merge_source_semantics(
+        source_profile.source_semantics,
+        target_profile.source_semantics,
+        attributed_to.is_some(),
     );
+    let modality_semantics = merge_modality_semantics(
+        source_profile.modality_semantics,
+        target_profile.modality_semantics,
+    );
+    let quoted_evidence = matches!(source_semantics, CausalSourceSemantics::ReportedSpeech);
+    let attributed_evidence = attributed_to.is_some()
+        || matches!(source_semantics, CausalSourceSemantics::AttributedClaim);
+    let quoted_or_attributed = quoted_evidence || attributed_evidence;
     let case_id = format!(
         "{}:{}:{}:{}:{:?}:r{}",
         archive.manifest.document_id,
@@ -398,7 +561,9 @@ fn build_review_case(
         document_id: archive.manifest.document_id.clone(),
         revision: archive.manifest.revision,
         source: source.clone(),
+        canonical_cause_event_id: source_profile.canonical_event_id.clone(),
         target: target.clone(),
+        canonical_effect_event_id: target_profile.canonical_event_id.clone(),
         kind,
         relation_kind: map_relation_kind(kind),
         base_confidence_millis,
@@ -411,7 +576,11 @@ fn build_review_case(
         target_sentence_index: target_profile.sentence_index,
         sentence_distance,
         temporal_legal,
+        quoted_evidence,
+        attributed_evidence,
         quoted_or_attributed,
+        source_semantics,
+        modality_semantics,
         shared_participant_count,
         source_degree,
         target_degree,
@@ -437,6 +606,13 @@ fn build_local_fallback_cases(
             if distance > 1 {
                 break;
             }
+            if left.quoted
+                || right.quoted
+                || left.attributed_to.is_some()
+                || right.attributed_to.is_some()
+            {
+                continue;
+            }
             let shared = count_shared_participants(
                 &left.participant_entity_ids,
                 &right.participant_entity_ids,
@@ -456,7 +632,12 @@ fn build_local_fallback_cases(
                 None,
                 Polarity::Positive,
                 None,
-                provenance_refs(left.evidence_refs.iter().chain(right.evidence_refs.iter()).cloned()),
+                provenance_refs(
+                    left.evidence_refs
+                        .iter()
+                        .chain(right.evidence_refs.iter())
+                        .cloned(),
+                ),
                 "local_pair",
             ) {
                 cases.push(case);
@@ -514,36 +695,13 @@ fn max_opt(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 
 fn count_shared_participants(left: &[EntityId], right: &[EntityId]) -> usize {
     let right_set = right.iter().collect::<FxHashSet<_>>();
-    left.iter().filter(|entity_id| right_set.contains(entity_id)).count()
+    left.iter()
+        .filter(|entity_id| right_set.contains(entity_id))
+        .count()
 }
 
 fn proposition_is_quoted(proposition: &Proposition) -> bool {
     proposition.quote.is_some()
-        || proposition
-            .attribution
-            .as_ref()
-            .and_then(|frame| frame.quote_range)
-            .is_some()
-}
-
-fn review_case_needs_quote_caution(
-    seed_source: &str,
-    source_profile: &CausalEventProfile,
-    target_profile: &CausalEventProfile,
-    attributed_to: Option<&EntityId>,
-) -> bool {
-    if attributed_to.is_some() {
-        return true;
-    }
-    match seed_source {
-        "link" | "candidate" => source_profile.quoted || target_profile.quoted,
-        _ => {
-            source_profile.quoted
-                || target_profile.quoted
-                || source_profile.attributed_to.is_some()
-                || target_profile.attributed_to.is_some()
-        }
-    }
 }
 
 fn provenance_ref_label(value: &ProvenanceRef) -> String {
@@ -564,7 +722,10 @@ fn provenance_refs<I>(values: I) -> Vec<String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut refs = values.into_iter().filter(|value| !value.is_empty()).collect::<Vec<_>>();
+    let mut refs = values
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
     refs.sort();
     refs.dedup();
     refs
@@ -589,6 +750,14 @@ pub(crate) fn node_key(node: &SemanticNodeRef) -> String {
     }
 }
 
+pub(crate) fn semantic_node_id(node: &SemanticNodeRef) -> &str {
+    match node {
+        SemanticNodeRef::Event(id) => id.0.as_str(),
+        SemanticNodeRef::Claim(id) => id.0.as_str(),
+        SemanticNodeRef::State(id) => id.0.as_str(),
+    }
+}
+
 fn build_claim_atoms(cases: &[CausalReviewCase]) -> Vec<CausalClaimAtom> {
     let mut atoms = cases
         .iter()
@@ -600,11 +769,14 @@ fn build_claim_atoms(cases: &[CausalReviewCase]) -> Vec<CausalClaimAtom> {
                 edge_id,
                 document_id: case.document_id.clone(),
                 cause_event: case.source.clone(),
+                canonical_cause_event_id: case.canonical_cause_event_id.clone(),
                 effect_event: case.target.clone(),
+                canonical_effect_event_id: case.canonical_effect_event_id.clone(),
                 kind: case.kind,
                 relation_kind: case.relation_kind,
                 source_kind: source_kind_for(case),
                 polarity: polarity_for(case),
+                evidence_class: evidence_class_for(case),
                 strength_millis: case.base_confidence_millis,
                 temporal: case.temporal.clone(),
                 evidence_refs: case.evidence_refs.clone(),
@@ -655,15 +827,184 @@ fn source_kind_for(case: &CausalReviewCase) -> CausalClaimSourceKind {
 }
 
 fn polarity_for(case: &CausalReviewCase) -> CausalClaimPolarity {
-    if case.quoted_or_attributed
-        && matches!(case.seed_source.as_str(), "local_pair")
+    if !case.temporal_legal {
+        CausalClaimPolarity::Contradict
+    } else if !matches!(case.modality_semantics, CausalModalitySemantics::Asserted) {
+        CausalClaimPolarity::Underspecify
+    } else if case.seed_source == "local_pair"
+        && case.cue.is_none()
+        && case.shared_participant_count == 0
     {
         CausalClaimPolarity::Underspecify
-    } else if case.attributed_to.is_some() {
-        CausalClaimPolarity::Underspecify
-    } else if !case.temporal_legal {
-        CausalClaimPolarity::Contradict
     } else {
         CausalClaimPolarity::Support
     }
+}
+
+fn evidence_class_for(case: &CausalReviewCase) -> CausalEvidenceClass {
+    if case.quoted_evidence {
+        CausalEvidenceClass::ReportedSupport
+    } else if case.attributed_evidence {
+        CausalEvidenceClass::AttributedSupport
+    } else {
+        CausalEvidenceClass::WorldSupport
+    }
+}
+
+fn proposition_window(
+    proposition: &Proposition,
+    mention_ranges_by_index: &FxHashMap<usize, SourceRange>,
+) -> SourceRange {
+    let mut window = proposition
+        .clause_range
+        .unwrap_or(proposition.predicate.trigger_range);
+    window = extend_range(window, proposition.predicate.trigger_range);
+    for argument in &proposition.arguments {
+        if let Some(range) = argument.range.or_else(|| {
+            argument
+                .mention_index
+                .and_then(|index| mention_ranges_by_index.get(&index).copied())
+        }) {
+            window = extend_range(window, range);
+        }
+    }
+    if let Some(quote) = proposition.quote.as_ref() {
+        window = extend_range(window, quote.quote_range);
+    }
+    if let Some(attribution) = proposition
+        .attribution
+        .as_ref()
+        .and_then(|frame| frame.quote_range)
+    {
+        window = extend_range(window, attribution);
+    }
+    if let Some(condition) = proposition.conditional.as_ref() {
+        if let Some(range) = condition.condition_range {
+            window = extend_range(window, range);
+        }
+        if let Some(range) = condition.consequent_range {
+            window = extend_range(window, range);
+        }
+    }
+    window
+}
+
+fn extend_range(left: SourceRange, right: SourceRange) -> SourceRange {
+    SourceRange::new(left.start.min(right.start), left.end.max(right.end))
+}
+
+fn ranges_overlap(left: SourceRange, right: SourceRange) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn source_semantics_for(proposition: &Proposition) -> CausalSourceSemantics {
+    if proposition.quote.is_some() {
+        CausalSourceSemantics::ReportedSpeech
+    } else if proposition.attribution.is_some() {
+        CausalSourceSemantics::AttributedClaim
+    } else {
+        CausalSourceSemantics::WorldAssertion
+    }
+}
+
+fn modality_semantics_for(proposition: &Proposition, negative: bool) -> CausalModalitySemantics {
+    if negative {
+        return CausalModalitySemantics::Negated;
+    }
+    if proposition.conditional.is_some()
+        || proposition
+            .scope_ops
+            .iter()
+            .any(|scope| scope.kind.eq_ignore_ascii_case("conditional"))
+    {
+        return CausalModalitySemantics::Conditional;
+    }
+    let modality_labels = proposition
+        .scope_ops
+        .iter()
+        .filter_map(|scope| scope.modality.as_deref())
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if modality_labels.iter().any(|value| {
+        matches!(
+            value.as_str(),
+            "planned" | "plan" | "future" | "intended" | "prospective" | "scheduled"
+        )
+    }) {
+        CausalModalitySemantics::Planned
+    } else if modality_labels.iter().any(|value| {
+        matches!(
+            value.as_str(),
+            "hypothetical" | "possible" | "counterfactual" | "imagined" | "speculative"
+        )
+    }) {
+        CausalModalitySemantics::Hypothetical
+    } else {
+        CausalModalitySemantics::Asserted
+    }
+}
+
+fn merge_source_semantics(
+    left: CausalSourceSemantics,
+    right: CausalSourceSemantics,
+    explicit_attribution: bool,
+) -> CausalSourceSemantics {
+    if matches!(left, CausalSourceSemantics::ReportedSpeech)
+        || matches!(right, CausalSourceSemantics::ReportedSpeech)
+    {
+        CausalSourceSemantics::ReportedSpeech
+    } else if explicit_attribution
+        || matches!(left, CausalSourceSemantics::AttributedClaim)
+        || matches!(right, CausalSourceSemantics::AttributedClaim)
+    {
+        CausalSourceSemantics::AttributedClaim
+    } else {
+        CausalSourceSemantics::WorldAssertion
+    }
+}
+
+fn merge_modality_semantics(
+    left: CausalModalitySemantics,
+    right: CausalModalitySemantics,
+) -> CausalModalitySemantics {
+    for candidate in [
+        CausalModalitySemantics::Negated,
+        CausalModalitySemantics::Conditional,
+        CausalModalitySemantics::Hypothetical,
+        CausalModalitySemantics::Planned,
+    ] {
+        if left == candidate || right == candidate {
+            return candidate;
+        }
+    }
+    CausalModalitySemantics::Asserted
+}
+
+fn normalize_predicate_label(predicate: &str, fallback: &str) -> String {
+    let raw = if predicate.trim().is_empty() {
+        fallback
+    } else {
+        predicate
+    };
+    raw.trim().to_ascii_lowercase()
+}
+
+fn build_event_fingerprint(
+    normalized_predicate: &str,
+    participants: &[EntityId],
+    source_semantics: CausalSourceSemantics,
+    modality_semantics: CausalModalitySemantics,
+) -> String {
+    let participant_key = participants
+        .iter()
+        .map(|entity_id| entity_id.0.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "{}::{}::{}::{}",
+        normalized_predicate,
+        participant_key,
+        source_semantics.as_str(),
+        modality_semantics.as_str()
+    )
 }

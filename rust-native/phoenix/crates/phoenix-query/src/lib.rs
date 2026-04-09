@@ -26,7 +26,10 @@ impl<'a> DeterministicQuery<'a> {
 
     pub fn lexical_recall(&self, request: &QueryRequest) -> LexicalSearchResult {
         let plan = Self::plan(request);
-        self.index
-            .search(plan.normalized_query.as_str(), &request.scope, plan.lexical_limit)
+        self.index.search(
+            plan.normalized_query.as_str(),
+            &request.scope,
+            plan.lexical_limit,
+        )
     }
 }

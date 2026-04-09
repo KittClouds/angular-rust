@@ -6,12 +6,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-candle-core = "0.10.2"
-candle-onnx = "0.10.2"
 serde.workspace = true
 serde_json.workspace = true
 rustc-hash.workspace = true
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+phoenix-embed = { path = "../phoenix-embed" }
 phoenix-ingest-overgraph = { path = "../phoenix-ingest-overgraph" }
 phoenix-kernel = { path = "../phoenix-kernel" }
 phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }

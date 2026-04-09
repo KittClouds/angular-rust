@@ -4,9 +4,17 @@
 //! single-file `mmap` structure. It is designed specifically for hyperbolic
 //! vectors (Poincaré ball) using `f32`.
 
+//! The disk/search core is now metric-agnostic for ANN use: persisted indexes can
+//! be reopened with either Poincare or hypersphere metrics via `AnnMetric`.
+pub mod ann_metric;
 pub mod poincare;
 pub mod shard;
+pub mod sphere;
+pub mod sphere_shard;
+pub mod sphere_tangent;
 pub mod tangent;
+
+pub use ann_metric::AnnMetric;
 
 use memmap2::{Mmap, MmapMut};
 use rand::{prelude::*, thread_rng};
@@ -61,7 +69,17 @@ impl Ord for Candidate {
 }
 
 pub trait MetricF32: Send + Sync + Clone + 'static {
+    /// Exact/public distance.
     fn eval(&self, a: &[f32], b: &[f32]) -> f32;
+
+    /// Cheap monotone ranking score for traversal and pruning.
+    /// Lower is better.
+    #[inline]
+    fn rank_eval(&self, a: &[f32], b: &[f32]) -> f32 {
+        self.eval(a, b)
+    }
+
+    /// Project a vector into the valid manifold domain.
     fn project_to_ball(&self, vector: &mut [f32]);
 }
 
@@ -93,6 +111,11 @@ impl MetricF32 for PoincareMetric {
         let delta = num / den.max(EPS);
 
         (1.0 + delta).acosh() / c.sqrt()
+    }
+
+    #[inline]
+    fn rank_eval(&self, a: &[f32], b: &[f32]) -> f32 {
+        self.eval(a, b)
     }
 
     fn project_to_ball(&self, vector: &mut [f32]) {
@@ -179,7 +202,7 @@ impl<M: MetricF32> HyperbolicHnswBuilder<M> {
             let mut curr = entry_id;
             let mut curr_dist = self
                 .metric
-                .eval(&new_node.vector, &self.nodes[curr as usize].vector);
+                .rank_eval(&new_node.vector, &self.nodes[curr as usize].vector);
 
             for l in (level + 1..=self.max_level).rev() {
                 let mut changed = true;
@@ -188,7 +211,7 @@ impl<M: MetricF32> HyperbolicHnswBuilder<M> {
                     for &nb in &self.nodes[curr as usize].connections[l as usize] {
                         let d = self
                             .metric
-                            .eval(&new_node.vector, &self.nodes[nb as usize].vector);
+                            .rank_eval(&new_node.vector, &self.nodes[nb as usize].vector);
                         if d < curr_dist {
                             curr_dist = d;
                             curr = nb;
@@ -219,7 +242,7 @@ impl<M: MetricF32> HyperbolicHnswBuilder<M> {
                         let mut nb_cands = Vec::with_capacity(nb_conn_len);
                         for &c_id in &self.nodes[nb_id as usize].connections[l as usize] {
                             if (c_id as usize) < self.nodes.len() {
-                                let dist = self.metric.eval(
+                                let dist = self.metric.rank_eval(
                                     &self.nodes[nb_id as usize].vector,
                                     &self.nodes[c_id as usize].vector,
                                 );
@@ -250,7 +273,9 @@ impl<M: MetricF32> HyperbolicHnswBuilder<M> {
     }
 
     fn search_layer(&self, query: &[f32], entry: u32, ef: usize, level: u32) -> Vec<Candidate> {
-        let entry_dist = self.metric.eval(query, &self.nodes[entry as usize].vector);
+        let entry_dist = self
+            .metric
+            .rank_eval(query, &self.nodes[entry as usize].vector);
 
         let mut visited = HashSet::new();
         visited.insert(entry);
@@ -274,7 +299,9 @@ impl<M: MetricF32> HyperbolicHnswBuilder<M> {
 
             for &nb in &self.nodes[cand.id as usize].connections[level as usize] {
                 if visited.insert(nb) {
-                    let d = self.metric.eval(query, &self.nodes[nb as usize].vector);
+                    let d = self
+                        .metric
+                        .rank_eval(query, &self.nodes[nb as usize].vector);
 
                     if results.len() < ef || d < results.peek().unwrap().dist {
                         candidates.push(std::cmp::Reverse(Candidate { id: nb, dist: d }));
@@ -313,7 +340,7 @@ impl<M: MetricF32> HyperbolicHnswBuilder<M> {
             let mut occluded = false;
             for &sel in &selected {
                 let d_q_c = cand.dist;
-                let d_c_sel = self.metric.eval(
+                let d_c_sel = self.metric.rank_eval(
                     &self.nodes[cand.id as usize].vector,
                     &self.nodes[sel as usize].vector,
                 );
@@ -706,14 +733,14 @@ impl<M: MetricF32> HyperbolicDiskHnsw<M> {
         self.metric.project_to_ball(&mut q_proj);
 
         let mut curr = self.entry_point;
-        let mut curr_dist = self.metric.eval(&q_proj, self.get_vector(curr));
+        let mut curr_dist = self.metric.rank_eval(&q_proj, self.get_vector(curr));
 
         for l in (1..=self.max_level).rev() {
             let mut changed = true;
             while changed {
                 changed = false;
                 for nb in self.get_neighbors(curr, l) {
-                    let d = self.metric.eval(&q_proj, self.get_vector(nb));
+                    let d = self.metric.rank_eval(&q_proj, self.get_vector(nb));
                     if d < curr_dist {
                         curr_dist = d;
                         curr = nb;
@@ -745,7 +772,7 @@ impl<M: MetricF32> HyperbolicDiskHnsw<M> {
 
             for nb in self.get_neighbors(cand.id, 0) {
                 if visited.insert(nb) {
-                    let d = self.metric.eval(&q_proj, self.get_vector(nb));
+                    let d = self.metric.rank_eval(&q_proj, self.get_vector(nb));
 
                     if results.len() < ef_search || d < results.peek().unwrap().dist {
                         candidates.push(std::cmp::Reverse(Candidate { id: nb, dist: d }));
@@ -760,11 +787,19 @@ impl<M: MetricF32> HyperbolicDiskHnsw<M> {
         }
 
         let mut final_cands = results.into_vec();
+
+        for cand in &mut final_cands {
+            cand.dist = self.metric.eval(&q_proj, self.get_vector(cand.id));
+        }
+
         final_cands.sort_unstable();
         final_cands.truncate(k);
         final_cands
     }
 }
+
+#[cfg(test)]
+mod sphere_hnsw_tests;
 
 #[cfg(test)]
 mod tests {

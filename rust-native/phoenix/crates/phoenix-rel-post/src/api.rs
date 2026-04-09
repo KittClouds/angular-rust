@@ -14,11 +14,10 @@ use phoenix_types::SessionId;
 
 use crate::{
     adjudicate_relation_decisions_with_nli, build_relation_hypotheses,
-    build_relation_patch_sidecar, default_relation_type_specs,
-    derive_dirty_scope_review_batches, derive_dirty_scope_review_batches_with_seeder,
-    draft_relation_decisions, persist_relation_patch_sidecar, run_glirel_over_batch,
-    GlirelModel, GlirelRelationTypeSpec, GlirelWorkerError, NliModel, RelationDecision,
-    RelationMentionSeeder, RelationScopeReviewBatch,
+    build_relation_patch_sidecar, default_relation_type_specs, derive_dirty_scope_review_batches,
+    derive_dirty_scope_review_batches_with_seeder, draft_relation_decisions,
+    persist_relation_patch_sidecar, run_glirel_over_batch, GlirelModel, GlirelRelationTypeSpec,
+    GlirelWorkerError, NliModel, RelationDecision, RelationMentionSeeder, RelationScopeReviewBatch,
 };
 
 /// Canonical Alex-first relation batch derivation. This path does not invoke

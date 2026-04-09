@@ -140,10 +140,7 @@ fn main() -> Result<(), String> {
     };
     let nli = if let Some(model_root) = config.nli_model_root.as_ref() {
         Some(NliModel::load(model_root).map_err(|error| {
-            format!(
-                "failed to load nli model {}: {error}",
-                model_root.display()
-            )
+            format!("failed to load nli model {}: {error}", model_root.display())
         })?)
     } else {
         None
@@ -157,7 +154,9 @@ fn main() -> Result<(), String> {
         let mut decisions = draft_relation_decisions(batch, &specs);
         if let Some(nli) = nli.as_ref() {
             decisions = adjudicate_relation_decisions_with_nli(batch, &decisions, &specs, nli)
-                .map_err(|error| format!("nli adjudication failed for {}: {error}", batch.scope_key))?;
+                .map_err(|error| {
+                    format!("nli adjudication failed for {}: {error}", batch.scope_key)
+                })?;
         }
         if config.persist_patches {
             let sidecar = persist_relation_patch_sidecar(&store, batch, &decisions, now_ms())
@@ -279,7 +278,10 @@ fn main() -> Result<(), String> {
             window_source_counts: batch.window_build_stats.window_source_counts.clone(),
             anchor_evidence_counts: batch.window_build_stats.anchor_evidence_counts.clone(),
             families_per_window: batch.window_build_stats.families_per_window.clone(),
-            rejected_window_reason_counts: batch.window_build_stats.rejected_window_reason_counts.clone(),
+            rejected_window_reason_counts: batch
+                .window_build_stats
+                .rejected_window_reason_counts
+                .clone(),
             archives,
             windows,
             cases,

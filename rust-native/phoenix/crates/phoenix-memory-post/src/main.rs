@@ -91,7 +91,11 @@ fn main() -> Result<(), String> {
                 entity_id: card.entity_id.0.clone(),
                 canonical_name: card.identity.canonical_name.clone(),
                 aliases: card.identity.aliases.clone(),
-                effective_kind: card.identity.effective_kind.as_ref().map(|kind| format!("{kind:?}")),
+                effective_kind: card
+                    .identity
+                    .effective_kind
+                    .as_ref()
+                    .map(|kind| format!("{kind:?}")),
                 current_state: card
                     .current_state
                     .iter()
@@ -138,7 +142,10 @@ fn main() -> Result<(), String> {
             println!("- conflicts: {}", report.conflict_count);
             println!("- gaps: {}", report.gap_count);
             println!("- entity cards: {}", report.entity_card_count);
-            println!("- relationship ledgers: {}", report.relationship_ledger_count);
+            println!(
+                "- relationship ledgers: {}",
+                report.relationship_ledger_count
+            );
             for (slot, count) in report.active_slot_counts {
                 println!("- active slot {slot}: {count}");
             }

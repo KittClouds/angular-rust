@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use phoenix_causal_post::{derive_dirty_scope_review_batches, persist_causal_patch_sidecar, run_causal_scope};
+use phoenix_causal_post::{
+    derive_dirty_scope_review_batches, persist_causal_patch_sidecar, run_causal_scope,
+};
 use phoenix_store_overgraph::PhoenixOvergraphStore;
 use phoenix_types::SessionId;
 use serde::Serialize;

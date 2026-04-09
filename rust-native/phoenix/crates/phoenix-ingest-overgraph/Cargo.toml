@@ -27,7 +27,6 @@ phoenix-graph = { path = "../phoenix-graph" }
 phoenix-kernel = { path = "../phoenix-kernel" }
 phoenix-machine = { path = "../phoenix-machine" }
 phoenix-proposition = { path = "../phoenix-proposition" }
-phoenix-semantics = { path = "../phoenix-semantics" }
 phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
 phoenix-store-native-core = { path = "../phoenix-store-native-core" }
 phoenix-time = { path = "../phoenix-time" }

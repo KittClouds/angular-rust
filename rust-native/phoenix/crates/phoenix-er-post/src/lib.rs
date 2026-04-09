@@ -1,11 +1,10 @@
 pub mod api;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::env;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use candle_core::{Device, IndexOp, Tensor};
-use candle_onnx::{read_file, simple_eval};
+pub use phoenix_embed::{default_embedding_model_root, TextEmbeddingProfile};
+use phoenix_embed::{OrtTextEmbedConfig, OrtTextEmbedder};
 use phoenix_semantic_v2::{
     scope_storage_key, CompactResolutionKind, CorefClusterRecord, DirtyScopeRecord,
     DocumentArchive, DocumentRevisionRef, ErAliasAddition, ErDecisionOutcome, ErDecisionRecord,
@@ -16,7 +15,6 @@ use phoenix_store_native_core::{PhoenixArchiveStoreV2, PhoenixErPatchStore, Stor
 use phoenix_types::{EntityId, EntityKind, MentionSpan, ScopeKey, SessionId, TextRange};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use tokenizers::Tokenizer;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -599,7 +597,9 @@ pub fn apply_er_patch_sidecar(batch: &mut ErScopeReviewBatch, sidecar: &ErScopeP
 pub struct ErEmbeddingConfig {
     pub model_root: PathBuf,
     pub batch_size: usize,
+    pub max_length: usize,
     pub min_score_millis: i32,
+    pub profile: TextEmbeddingProfile,
 }
 
 impl Default for ErEmbeddingConfig {
@@ -607,38 +607,35 @@ impl Default for ErEmbeddingConfig {
         Self {
             model_root: default_embedding_model_root(),
             batch_size: 16,
+            max_length: 512,
             min_score_millis: 240,
+            profile: TextEmbeddingProfile::Native384,
         }
     }
 }
 
 pub struct ErEmbeddingModel {
-    tokenizer: Tokenizer,
-    model: candle_onnx::onnx::ModelProto,
-    device: Device,
+    embedder: OrtTextEmbedder,
 }
 
 impl ErEmbeddingModel {
     pub fn load(model_root: &Path) -> Result<Self, String> {
-        let tokenizer_path = model_root.join("tokenizer.json");
-        let model_path = model_root.join("onnx").join("model.onnx");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
-            format!(
-                "failed to load tokenizer {}: {error}",
-                tokenizer_path.display()
-            )
-        })?;
-        let model = read_file(&model_path).map_err(|error| {
-            format!(
-                "failed to load ONNX model {}: {error}",
-                model_path.display()
-            )
-        })?;
-        Ok(Self {
-            tokenizer,
-            model,
-            device: Device::Cpu,
+        Self::load_with_config(&ErEmbeddingConfig {
+            model_root: model_root.to_path_buf(),
+            ..Default::default()
         })
+    }
+
+    pub fn load_with_config(config: &ErEmbeddingConfig) -> Result<Self, String> {
+        let embedder = OrtTextEmbedder::load(&OrtTextEmbedConfig {
+            model_root: config.model_root.clone(),
+            batch_size: config.batch_size,
+            max_length: config.max_length,
+            profile: config.profile,
+            prefix_passage: false,
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(Self { embedder })
     }
 
     pub fn embed_batched(
@@ -646,105 +643,10 @@ impl ErEmbeddingModel {
         texts: &[String],
         batch_size: usize,
     ) -> Result<Vec<Vec<f32>>, String> {
-        let batch_size = batch_size.max(1);
-        let mut rows = Vec::with_capacity(texts.len());
-        for chunk in texts.chunks(batch_size) {
-            rows.extend(self.embed(chunk)?);
-        }
-        Ok(rows)
+        self.embedder
+            .embed_batched(texts, batch_size)
+            .map_err(|error| error.to_string())
     }
-
-    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let encodings = texts
-            .iter()
-            .map(|text| {
-                self.tokenizer
-                    .encode(text.as_str(), true)
-                    .map_err(|error| format!("failed to encode input: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let max_len = encodings
-            .iter()
-            .map(|encoding| encoding.len())
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let batch = encodings.len();
-
-        let mut input_ids = vec![0i64; batch * max_len];
-        let mut attention_mask = vec![0i64; batch * max_len];
-        let mut token_type_ids = vec![0i64; batch * max_len];
-
-        for (row, encoding) in encodings.iter().enumerate() {
-            let row_offset = row * max_len;
-            for (col, token_id) in encoding.get_ids().iter().enumerate() {
-                input_ids[row_offset + col] = *token_id as i64;
-            }
-            for (col, mask) in encoding.get_attention_mask().iter().enumerate() {
-                attention_mask[row_offset + col] = *mask as i64;
-            }
-            for (col, token_type) in encoding.get_type_ids().iter().enumerate() {
-                token_type_ids[row_offset + col] = *token_type as i64;
-            }
-        }
-
-        let input_shape = (batch, max_len);
-        let mut inputs = HashMap::<String, Tensor>::new();
-        inputs.insert(
-            "input_ids".to_owned(),
-            Tensor::from_vec(input_ids, input_shape, &self.device)
-                .map_err(|error| format!("failed to build input_ids tensor: {error}"))?,
-        );
-        inputs.insert(
-            "attention_mask".to_owned(),
-            Tensor::from_vec(attention_mask, input_shape, &self.device)
-                .map_err(|error| format!("failed to build attention_mask tensor: {error}"))?,
-        );
-        if graph_has_input(&self.model, "token_type_ids") {
-            inputs.insert(
-                "token_type_ids".to_owned(),
-                Tensor::from_vec(token_type_ids, input_shape, &self.device)
-                    .map_err(|error| format!("failed to build token_type_ids tensor: {error}"))?,
-            );
-        }
-
-        let outputs = simple_eval(&self.model, inputs)
-            .map_err(|error| format!("failed to evaluate ONNX graph: {error}"))?;
-        let hidden = select_hidden_output(&self.model, outputs)?;
-        let cls = hidden
-            .i((.., 0, ..))
-            .map_err(|error| format!("failed to select CLS embedding: {error}"))?;
-        let squared = cls
-            .sqr()
-            .map_err(|error| format!("failed to square embeddings: {error}"))?;
-        let summed = squared
-            .sum_keepdim(1)
-            .map_err(|error| format!("failed to sum embeddings: {error}"))?;
-        let norms = summed
-            .sqrt()
-            .map_err(|error| format!("failed to compute embedding norm: {error}"))?;
-        let normalized = cls
-            .broadcast_div(&norms)
-            .map_err(|error| format!("failed to normalize embeddings: {error}"))?;
-        normalized
-            .to_vec2::<f32>()
-            .map_err(|error| format!("failed to extract embedding rows: {error}"))
-    }
-}
-
-pub fn default_embedding_model_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(4)
-        .expect("workspace root")
-        .join("rust-native")
-        .join("phoenix-hnsw-smoke")
-        .join("models")
-        .join("snowflake-arctic-embed-xs")
 }
 
 pub fn generate_lexical_candidates(
@@ -2244,46 +2146,6 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
         .zip(right.iter())
         .map(|(lhs, rhs)| lhs * rhs)
         .sum()
-}
-
-fn graph_has_input(model: &candle_onnx::onnx::ModelProto, name: &str) -> bool {
-    model
-        .graph
-        .as_ref()
-        .map(|graph| graph.input.iter().any(|input| input.name == name))
-        .unwrap_or(false)
-}
-
-fn select_hidden_output(
-    model: &candle_onnx::onnx::ModelProto,
-    outputs: HashMap<String, Tensor>,
-) -> Result<Tensor, String> {
-    let output_names = model
-        .graph
-        .as_ref()
-        .map(|graph| {
-            graph
-                .output
-                .iter()
-                .map(|output| output.name.as_str())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for name in ["last_hidden_state", "token_embeddings"] {
-        if let Some(tensor) = outputs.get(name) {
-            return Ok(tensor.clone());
-        }
-    }
-    for name in output_names {
-        if let Some(tensor) = outputs.get(name) {
-            return Ok(tensor.clone());
-        }
-    }
-    outputs
-        .into_iter()
-        .next()
-        .map(|(_, tensor)| tensor)
-        .ok_or_else(|| "embedding model returned no outputs".to_owned())
 }
 
 fn decision_outcome_from_kind(kind: &ErDecisionKind) -> ErDecisionOutcome {

@@ -4,9 +4,10 @@ use phoenix_graph_kernel::{
 };
 use phoenix_semantic_v2::{
     AliasPosting, CausalScopeSidecar, DirtyScopeRecord, DocumentArchive, DocumentManifest,
-    DocumentOrdinalAssignment, DocumentRevisionRef, ErScopePatchSidecar, MemoryScopeSidecar,
-    PreparedDocument, RelationMentionSeedScopeSidecar, RelationScopePatchSidecar,
-    ScopeLexSidecar, ScopeOrd, SessionArchive, SessionOrd,
+    DocumentOrdinalAssignment, DocumentRevisionRef, ErScopePatchSidecar, EventIdentityScopeSidecar,
+    GraphScopeSidecar, MemoryScopeSidecar, PreparedDocument, RelationMentionSeedScopeSidecar,
+    RelationScopePatchSidecar, ScopeLexSidecar, ScopeOrd, SemanticGraphScopeSidecar,
+    SessionArchive, SessionOrd, StateSchemaScopeSidecar, TemporalScopeSidecar,
 };
 use phoenix_types::{IndexedSpan, IngestDocument, ScopeKey, SessionId};
 use serde::{Deserialize, Serialize};
@@ -503,6 +504,27 @@ pub trait PhoenixMemoryPatchStore {
     ) -> Result<Option<MemoryScopeSidecar>, StoreError>;
 }
 
+pub trait PhoenixGraphPatchStore {
+    fn init_graph_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_graph_patch_sidecar(&self, sidecar: &GraphScopeSidecar) -> Result<(), StoreError>;
+    fn load_graph_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<GraphScopeSidecar>, StoreError>;
+}
+
+pub trait PhoenixSemanticGraphPatchStore {
+    fn init_semantic_graph_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_semantic_graph_patch_sidecar(
+        &self,
+        sidecar: &SemanticGraphScopeSidecar,
+    ) -> Result<(), StoreError>;
+    fn load_semantic_graph_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<SemanticGraphScopeSidecar>, StoreError>;
+}
+
 pub trait PhoenixCausalPatchStore {
     fn init_causal_patch_schema(&self) -> Result<(), StoreError>;
     fn persist_causal_patch_sidecar(&self, sidecar: &CausalScopeSidecar) -> Result<(), StoreError>;
@@ -510,6 +532,42 @@ pub trait PhoenixCausalPatchStore {
         &self,
         scope: &ScopeKey,
     ) -> Result<Option<CausalScopeSidecar>, StoreError>;
+}
+
+pub trait PhoenixTemporalPatchStore {
+    fn init_temporal_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_temporal_patch_sidecar(
+        &self,
+        sidecar: &TemporalScopeSidecar,
+    ) -> Result<(), StoreError>;
+    fn load_temporal_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<TemporalScopeSidecar>, StoreError>;
+}
+
+pub trait PhoenixEventIdentityPatchStore {
+    fn init_event_identity_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_event_identity_patch_sidecar(
+        &self,
+        sidecar: &EventIdentityScopeSidecar,
+    ) -> Result<(), StoreError>;
+    fn load_event_identity_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<EventIdentityScopeSidecar>, StoreError>;
+}
+
+pub trait PhoenixStateSchemaPatchStore {
+    fn init_state_schema_patch_schema(&self) -> Result<(), StoreError>;
+    fn persist_state_schema_patch_sidecar(
+        &self,
+        sidecar: &StateSchemaScopeSidecar,
+    ) -> Result<(), StoreError>;
+    fn load_state_schema_patch_sidecar(
+        &self,
+        scope: &ScopeKey,
+    ) -> Result<Option<StateSchemaScopeSidecar>, StoreError>;
 }
 
 pub trait PhoenixRelationMentionSeedStore {

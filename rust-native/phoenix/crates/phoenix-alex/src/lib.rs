@@ -1,7 +1,7 @@
+pub mod api;
 mod fuzzy;
 mod normalize;
 mod sentence;
-pub mod api;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

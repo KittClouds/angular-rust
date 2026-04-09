@@ -134,7 +134,11 @@ impl OmNativeBridge {
             .filter(|row| row.kind == KIND_OBSERVATION || row.kind == KIND_REFLECTION)
             .map(|row| row.document_id.clone())
             .collect::<Vec<_>>();
-        let message_rows = self.load_entity_rows(store, thread_id, &message_docs.keys().cloned().collect::<Vec<_>>())?;
+        let message_rows = self.load_entity_rows(
+            store,
+            thread_id,
+            &message_docs.keys().cloned().collect::<Vec<_>>(),
+        )?;
         if message_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -149,16 +153,17 @@ impl OmNativeBridge {
 
         let mut by_entity = BTreeMap::<String, AggregatedEntity>::new();
         for row in message_rows {
-            let entry = by_entity
-                .entry(row.entity_id.clone())
-                .or_insert_with(|| AggregatedEntity {
-                    entity_id: row.entity_id.clone(),
-                    label: row.label.clone(),
-                    aliases: row.aliases.clone(),
-                    total_mentions: 0,
-                    snippet: row.snippet.clone(),
-                    documents: BTreeSet::new(),
-                });
+            let entry =
+                by_entity
+                    .entry(row.entity_id.clone())
+                    .or_insert_with(|| AggregatedEntity {
+                        entity_id: row.entity_id.clone(),
+                        label: row.label.clone(),
+                        aliases: row.aliases.clone(),
+                        total_mentions: 0,
+                        snippet: row.snippet.clone(),
+                        documents: BTreeSet::new(),
+                    });
             entry.total_mentions += row.mention_count;
             entry.documents.insert(row.document_id.clone());
             if entry.snippet.is_empty() && !row.snippet.is_empty() {
@@ -233,24 +238,28 @@ impl OmNativeBridge {
             .into_iter()
             .map(|row| (row.document_id, (row.kind, row.source_key)))
             .collect::<BTreeMap<_, _>>();
-        let entity_rows =
-            self.load_entity_rows(store, thread_id, &allowed_docs.keys().cloned().collect::<Vec<_>>())?;
+        let entity_rows = self.load_entity_rows(
+            store,
+            thread_id,
+            &allowed_docs.keys().cloned().collect::<Vec<_>>(),
+        )?;
         if entity_rows.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut by_entity = BTreeMap::<String, AggregatedEntity>::new();
         for row in entity_rows {
-            let entry = by_entity
-                .entry(row.entity_id.clone())
-                .or_insert_with(|| AggregatedEntity {
-                    entity_id: row.entity_id.clone(),
-                    label: row.label.clone(),
-                    aliases: row.aliases.clone(),
-                    total_mentions: 0,
-                    snippet: row.snippet.clone(),
-                    documents: BTreeSet::new(),
-                });
+            let entry =
+                by_entity
+                    .entry(row.entity_id.clone())
+                    .or_insert_with(|| AggregatedEntity {
+                        entity_id: row.entity_id.clone(),
+                        label: row.label.clone(),
+                        aliases: row.aliases.clone(),
+                        total_mentions: 0,
+                        snippet: row.snippet.clone(),
+                        documents: BTreeSet::new(),
+                    });
             entry.total_mentions += row.mention_count;
             entry.documents.insert(row.document_id.clone());
             if entry.snippet.is_empty() && !row.snippet.is_empty() {
@@ -392,7 +401,12 @@ impl OmNativeBridge {
         document_id: &str,
     ) -> Result<(), StoreError> {
         let index_keys = store
-            .fetch_compact_rows_where_str("om_graph_index", OM_GRAPH_INDEX_COLUMNS, "thread_id", thread_id)?
+            .fetch_compact_rows_where_str(
+                "om_graph_index",
+                OM_GRAPH_INDEX_COLUMNS,
+                "thread_id",
+                thread_id,
+            )?
             .into_iter()
             .filter(|row| {
                 let row = CompactRowView::new(OM_GRAPH_INDEX_COLUMNS, row);
@@ -621,7 +635,11 @@ fn build_document_draft(units: &[&str]) -> DocumentDraft {
 
         let labels = unit_entities
             .iter()
-            .filter_map(|entity_id| entities.get(entity_id).map(|entity| (entity_id, entity.label.clone())))
+            .filter_map(|entity_id| {
+                entities
+                    .get(entity_id)
+                    .map(|entity| (entity_id, entity.label.clone()))
+            })
             .collect::<Vec<_>>();
         for (entity_id, _) in &labels {
             for (other_id, other_label) in &labels {
@@ -629,7 +647,10 @@ fn build_document_draft(units: &[&str]) -> DocumentDraft {
                     continue;
                 }
                 *relation_counts
-                    .entry(((*entity_id).clone(), format!("co-mentioned with {other_label}")))
+                    .entry((
+                        (*entity_id).clone(),
+                        format!("co-mentioned with {other_label}"),
+                    ))
                     .or_default() += 1;
             }
         }
@@ -661,7 +682,10 @@ fn build_document_draft(units: &[&str]) -> DocumentDraft {
         .map(|(entity_id, summary, _)| OmRelationDraft { entity_id, summary })
         .collect::<Vec<_>>();
 
-    DocumentDraft { entities, relations }
+    DocumentDraft {
+        entities,
+        relations,
+    }
 }
 
 fn extract_mentions(text: &str) -> Vec<MentionRecord> {
@@ -770,8 +794,7 @@ fn strip_title_prefix(label: &str) -> Option<String> {
     let first = *parts.first()?;
     if !matches!(
         normalize_surface(first).as_str(),
-        "mr"
-            | "mrs"
+        "mr" | "mrs"
             | "ms"
             | "dr"
             | "prof"
@@ -795,7 +818,9 @@ fn acronym_for_label(label: &str) -> String {
         .filter_map(|part| part.chars().next())
         .filter(|ch| ch.is_alphabetic())
         .collect::<String>();
-    (letters.len() > 1).then(|| letters.to_ascii_uppercase()).unwrap_or_default()
+    (letters.len() > 1)
+        .then(|| letters.to_ascii_uppercase())
+        .unwrap_or_default()
 }
 
 fn is_uppercase_token(token: &str) -> bool {
@@ -883,8 +908,7 @@ fn clip_text(text: &str, limit: usize) -> String {
 }
 
 fn better_label(candidate: &str, current: &str) -> bool {
-    candidate.len() > current.len()
-        || (candidate.len() == current.len() && candidate < current)
+    candidate.len() > current.len() || (candidate.len() == current.len() && candidate < current)
 }
 
 fn now_ms() -> i64 {
@@ -976,6 +1000,8 @@ mod tests {
             .memory_graph_search(&store, "thread-1", "marines", 10)
             .expect("memory graph search");
         assert!(!hits.is_empty());
-        assert!(hits.iter().any(|hit| hit.label.contains("Luffy") || hit.label.contains("Nami")));
+        assert!(hits
+            .iter()
+            .any(|hit| hit.label.contains("Luffy") || hit.label.contains("Nami")));
     }
 }

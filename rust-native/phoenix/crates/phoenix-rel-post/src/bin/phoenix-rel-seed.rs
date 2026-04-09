@@ -108,8 +108,10 @@ fn main() -> Result<(), String> {
 }
 
 fn parse_args(args: &[String]) -> Result<SeedConfig, String> {
-    let store_path = parse_path_arg(args, "--store-path").ok_or_else(|| "--store-path is required".to_owned())?;
-    let model_root = parse_path_arg(args, "--model-root").ok_or_else(|| "--model-root is required".to_owned())?;
+    let store_path = parse_path_arg(args, "--store-path")
+        .ok_or_else(|| "--store-path is required".to_owned())?;
+    let model_root = parse_path_arg(args, "--model-root")
+        .ok_or_else(|| "--model-root is required".to_owned())?;
     Ok(SeedConfig {
         store_path,
         model_root,

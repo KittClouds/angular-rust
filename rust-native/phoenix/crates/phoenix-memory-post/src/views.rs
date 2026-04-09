@@ -12,7 +12,9 @@ pub fn count_card_slots(cards: &[EntityMemoryCard]) -> BTreeMap<String, usize> {
     counts
 }
 
-pub fn count_relationship_families(ledgers: &[RelationshipMemoryLedger]) -> BTreeMap<String, usize> {
+pub fn count_relationship_families(
+    ledgers: &[RelationshipMemoryLedger],
+) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::<String, usize>::new();
     for ledger in ledgers {
         *counts.entry(ledger.relation_family.clone()).or_default() += 1;

@@ -11,7 +11,9 @@ use phoenix_types::{BiTemporalWindow, EntityId};
 use serde::{Deserialize, Serialize};
 
 use crate::normalize::{MemoryEntityProfile, MemoryNormalizedBatch, MemoryPendingReview};
-use crate::registry::{active_scalar_slot_keys, slot_for_relation_family, source_class_priority};
+use crate::registry::{
+    active_scalar_slot_keys, slot_definition_for_relation_family, source_class_priority,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,20 +46,24 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
     let mut gaps = Vec::new();
 
     let claims_by_slot = group_claims_by_slot(&claims);
-    let scalar_slots = active_scalar_slot_keys();
+    let scalar_slots = active_scalar_slot_keys(&batch.slot_definitions);
 
     for ((entity_key, slot_key), claim_indices) in claims_by_slot {
-        if !scalar_slots.iter().any(|value| *value == slot_key.as_str()) {
+        if !scalar_slots.iter().any(|value| value == &slot_key) {
             continue;
         }
         let entity_id = EntityId(entity_key.clone());
         let mut positive = claim_indices
             .iter()
             .copied()
-            .filter(|index| matches!(
-                claims[*index].status,
-                MemoryClaimStatus::Active | MemoryClaimStatus::Supported | MemoryClaimStatus::Candidate
-            ))
+            .filter(|index| {
+                matches!(
+                    claims[*index].status,
+                    MemoryClaimStatus::Active
+                        | MemoryClaimStatus::Supported
+                        | MemoryClaimStatus::Candidate
+                )
+            })
             .collect::<Vec<_>>();
         let contradictory = claim_indices
             .iter()
@@ -186,12 +192,26 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
                 old_value_entity_id: old.object_entity_id.clone(),
                 new_value: Some(new.object_value.clone()),
                 new_value_entity_id: new.object_entity_id.clone(),
-                caused_by_event_id: Some(format!("event:state_changed:{}:{}", entity_key, new.claim_id)),
+                caused_by_event_id: Some(format!(
+                    "event:state_changed:{}:{}",
+                    entity_key, new.claim_id
+                )),
+                canonical_caused_by_event_id: None,
                 temporal: new.temporal.clone(),
                 claim_ids: vec![old.claim_id.clone(), new.claim_id.clone()],
             };
-            events.push(delta_event("state_ended", entity_id.clone(), &slot_key, old));
-            events.push(delta_event("state_changed", entity_id.clone(), &slot_key, new));
+            events.push(delta_event(
+                "state_ended",
+                entity_id.clone(),
+                &slot_key,
+                old,
+            ));
+            events.push(delta_event(
+                "state_changed",
+                entity_id.clone(),
+                &slot_key,
+                new,
+            ));
             deltas.push(delta);
         }
 
@@ -211,7 +231,10 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
             });
         }
 
-        if contradictory.iter().any(|index| claims[*index].status == MemoryClaimStatus::Contradicted) {
+        if contradictory
+            .iter()
+            .any(|index| claims[*index].status == MemoryClaimStatus::Contradicted)
+        {
             let contradiction_claim_ids = contradictory
                 .iter()
                 .map(|index| claims[*index].claim_id.clone())
@@ -248,9 +271,14 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
     }
 
     add_pending_review_gaps(&mut gaps, &batch.pending_reviews);
-    add_missing_current_value_gaps(&mut gaps, &batch.entity_profiles, &states);
+    add_missing_current_value_gaps(
+        &mut gaps,
+        &batch.entity_profiles,
+        &states,
+        &batch.slot_definitions,
+    );
 
-    let relationship_ledgers = build_relationship_ledgers(&claims);
+    let relationship_ledgers = build_relationship_ledgers(&claims, &batch.slot_definitions);
     let entity_cards = build_entity_cards(
         &batch.entity_profiles,
         &states,
@@ -308,7 +336,10 @@ fn group_claims_by_slot(claims: &[MemoryClaimAtom]) -> BTreeMap<(String, String)
 
 fn compare_claims(left: &MemoryClaimAtom, right: &MemoryClaimAtom) -> Ordering {
     compare_temporal(&left.temporal, &right.temporal)
-        .then_with(|| source_class_priority(&left.source_class).cmp(&source_class_priority(&right.source_class)))
+        .then_with(|| {
+            source_class_priority(&left.source_class)
+                .cmp(&source_class_priority(&right.source_class))
+        })
         .then_with(|| left.confidence_millis.cmp(&right.confidence_millis))
 }
 
@@ -354,6 +385,7 @@ fn max_opt(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 fn state_event(kind: &str, state: &MemoryStateRecord) -> MemoryEventRecord {
     MemoryEventRecord {
         event_id: format!("event:{}:{}", kind, state.state_id),
+        canonical_event_id: None,
         document_id: String::new(),
         kind: kind.to_owned(),
         slot_key: state.slot_key.clone(),
@@ -376,6 +408,7 @@ fn delta_event(
 ) -> MemoryEventRecord {
     MemoryEventRecord {
         event_id: format!("event:{}:{}:{}", kind, entity_id.0, claim.claim_id),
+        canonical_event_id: None,
         document_id: claim.document_id.clone(),
         kind: kind.to_owned(),
         slot_key: slot_key.to_owned(),
@@ -393,6 +426,7 @@ fn delta_event(
 fn conflict_event(kind: &str, conflict: &MemoryConflictRecord) -> MemoryEventRecord {
     MemoryEventRecord {
         event_id: format!("event:{}:{}", kind, conflict.conflict_id),
+        canonical_event_id: None,
         document_id: String::new(),
         kind: kind.to_owned(),
         slot_key: conflict.slot_key.clone(),
@@ -407,7 +441,10 @@ fn conflict_event(kind: &str, conflict: &MemoryConflictRecord) -> MemoryEventRec
     }
 }
 
-fn add_pending_review_gaps(gaps: &mut Vec<MemoryContinuityGapRecord>, pending: &[MemoryPendingReview]) {
+fn add_pending_review_gaps(
+    gaps: &mut Vec<MemoryContinuityGapRecord>,
+    pending: &[MemoryPendingReview],
+) {
     for review in pending {
         let Some(slot_key) = review.slot_key.clone() else {
             continue;
@@ -429,20 +466,21 @@ fn add_missing_current_value_gaps(
     gaps: &mut Vec<MemoryContinuityGapRecord>,
     entity_profiles: &[MemoryEntityProfile],
     states: &[MemoryStateRecord],
+    slot_definitions: &[phoenix_semantic_v2::StateSlotDefinitionRecord],
 ) {
     let state_keys = states
         .iter()
         .map(|state| (state.entity_id.0.clone(), state.slot_key.clone()))
         .collect::<std::collections::BTreeSet<_>>();
     for profile in entity_profiles {
-        for slot_key in active_scalar_slot_keys() {
-            if state_keys.contains(&(profile.entity_id.0.clone(), slot_key.to_owned())) {
+        for slot_key in active_scalar_slot_keys(slot_definitions) {
+            if state_keys.contains(&(profile.entity_id.0.clone(), slot_key.clone())) {
                 continue;
             }
             gaps.push(MemoryContinuityGapRecord {
                 gap_id: format!("gap:missing:{}:{}", profile.entity_id.0, slot_key),
                 entity_id: profile.entity_id.clone(),
-                slot_key: slot_key.to_owned(),
+                slot_key: slot_key.clone(),
                 kind: MemoryGapKind::MissingCurrentValue,
                 status: MemoryClaimStatus::Deferred,
                 detail: "no current compiled value for tracked slot".to_owned(),
@@ -453,21 +491,26 @@ fn add_missing_current_value_gaps(
     }
 }
 
-fn build_relationship_ledgers(claims: &[MemoryClaimAtom]) -> Vec<RelationshipMemoryLedger> {
+fn build_relationship_ledgers(
+    claims: &[MemoryClaimAtom],
+    slot_definitions: &[phoenix_semantic_v2::StateSlotDefinitionRecord],
+) -> Vec<RelationshipMemoryLedger> {
     let mut grouped = BTreeMap::<(String, String, String), Vec<&MemoryClaimAtom>>::new();
     for claim in claims {
         let Some(relation_family) = claim.relation_family.as_deref() else {
             continue;
         };
-        let Some(slot) = slot_for_relation_family(relation_family) else {
+        let Some(slot) = slot_definition_for_relation_family(relation_family, slot_definitions)
+        else {
             continue;
         };
         if !slot.relationship_only {
             continue;
         }
-        let (Some(source_entity_id), Some(target_entity_id)) =
-            (claim.source_entity_id.as_ref(), claim.target_entity_id.as_ref())
-        else {
+        let (Some(source_entity_id), Some(target_entity_id)) = (
+            claim.source_entity_id.as_ref(),
+            claim.target_entity_id.as_ref(),
+        ) else {
             continue;
         };
         grouped
@@ -487,7 +530,9 @@ fn build_relationship_ledgers(claims: &[MemoryClaimAtom]) -> Vec<RelationshipMem
             .filter(|claim| {
                 matches!(
                     claim.status,
-                    MemoryClaimStatus::Active | MemoryClaimStatus::Supported | MemoryClaimStatus::Candidate
+                    MemoryClaimStatus::Active
+                        | MemoryClaimStatus::Supported
+                        | MemoryClaimStatus::Candidate
                 )
             })
             .map(|claim| claim.claim_id.clone())
@@ -507,7 +552,10 @@ fn build_relationship_ledgers(claims: &[MemoryClaimAtom]) -> Vec<RelationshipMem
             MemoryClaimStatus::Candidate
         };
         ledgers.push(RelationshipMemoryLedger {
-            ledger_id: format!("relationship:{}:{}:{}", relation_family, source_entity_id, target_entity_id),
+            ledger_id: format!(
+                "relationship:{}:{}:{}",
+                relation_family, source_entity_id, target_entity_id
+            ),
             relation_family,
             source_entity_id: EntityId(source_entity_id),
             target_entity_id: EntityId(target_entity_id),
@@ -550,7 +598,8 @@ fn build_entity_cards(
             .filter(|delta| delta.entity_id == profile.entity_id)
             .cloned()
             .collect::<Vec<_>>();
-        recent_deltas.sort_by(|left, right| right.temporal.valid_from.cmp(&left.temporal.valid_from));
+        recent_deltas
+            .sort_by(|left, right| right.temporal.valid_from.cmp(&left.temporal.valid_from));
         recent_deltas.truncate(8);
 
         let mut active_relationships = ledgers
@@ -632,7 +681,9 @@ fn build_summary(
 ) -> MemoryCompilerSummary {
     let mut active_slot_counts = BTreeMap::<String, usize>::new();
     for state in states {
-        *active_slot_counts.entry(state.slot_key.clone()).or_default() += 1;
+        *active_slot_counts
+            .entry(state.slot_key.clone())
+            .or_default() += 1;
     }
     let mut unresolved_gap_counts = BTreeMap::<String, usize>::new();
     for gap in gaps {

@@ -4,10 +4,10 @@ use crate::{
     GlirelRelationTypeSpec, RelationDecision, RelationDecisionKind,
 };
 use phoenix_semantic_v2::{
-    scope_storage_key, AliasEntry, AliasPosting, CandidateEntity, DocumentArchive, DocumentManifest,
-    ErAliasAddition, ErScopePatchSidecar, NativeCorefSummary, NativeErSummary, ResolutionDecision,
-    RelationMentionSeedRecord, RelationMentionSeedScopeSidecar, ResolvedMention,
-    ScopeLexSidecar, SemanticRelationRecord,
+    scope_storage_key, AliasEntry, AliasPosting, CandidateEntity, DocumentArchive,
+    DocumentManifest, ErAliasAddition, ErScopePatchSidecar, NativeCorefSummary, NativeErSummary,
+    RelationMentionSeedRecord, RelationMentionSeedScopeSidecar, ResolutionDecision,
+    ResolvedMention, ScopeLexSidecar, SemanticRelationRecord,
 };
 use phoenix_store_native_core::{PhoenixRelationMentionSeedStore, PhoenixRelationPatchStore};
 use phoenix_store_overgraph::PhoenixOvergraphStore;
@@ -328,7 +328,9 @@ fn synthetic_sentence_split_handles_crlf_and_dialogue() {
             .to_owned(),
     };
     let sentences = crate::worker::split_chunk_into_synthetic_sentences(&chunk, 0);
-    assert!(sentences.iter().any(|row| row.text.contains("Alice works for Dynamis.")));
+    assert!(sentences
+        .iter()
+        .any(|row| row.text.contains("Alice works for Dynamis.")));
     assert!(sentences
         .iter()
         .any(|row| row.text.contains("Dynamis is in New Rome!")));
@@ -336,9 +338,8 @@ fn synthetic_sentence_split_handles_crlf_and_dialogue() {
 
 #[test]
 fn derive_scope_review_batch_rebuilds_windows_from_chunk_only_archive() {
-    let archive = chunk_only_archive(
-        "## Chapter 1\r\n\r\nAlice works for Dynamis. Dynamis is in New Rome.",
-    );
+    let archive =
+        chunk_only_archive("## Chapter 1\r\n\r\nAlice works for Dynamis. Dynamis is in New Rome.");
     let batch = derive_scope_review_batch(&[archive], None, None, None, None, None);
     assert!(!batch.windows.is_empty());
     assert!(!batch.review_cases.is_empty());
@@ -380,13 +381,10 @@ fn derive_scope_review_batch_uses_er_alias_additions_for_anchor_rebuild() {
                 .iter()
                 .any(|value| value == "candidate_relation_type:works_for")
     }));
-    assert!(batch
-        .windows
+    assert!(batch.windows.iter().any(|window| window
+        .evidence_labels
         .iter()
-        .any(|window| window
-            .evidence_labels
-            .iter()
-            .any(|value| value == "anchor_evidence:alex_exact_alias")));
+        .any(|value| value == "anchor_evidence:alex_exact_alias")));
 }
 
 #[test]
@@ -408,16 +406,14 @@ fn derive_scope_review_batch_uses_lexical_alias_postings_for_anchor_rebuild() {
         ..Default::default()
     };
     let batch = derive_scope_review_batch(&[archive], None, None, Some(&sidecar), None, None);
-    assert!(batch.review_cases.iter().any(|case| {
-        case.source_entity_id.0 == "e2" && case.target_entity_id.0 == "e3"
-    }));
     assert!(batch
-        .windows
+        .review_cases
         .iter()
-        .any(|window| window
-            .evidence_labels
-            .iter()
-            .any(|value| value == "anchor_evidence:alex_exact_alias")));
+        .any(|case| { case.source_entity_id.0 == "e2" && case.target_entity_id.0 == "e3" }));
+    assert!(batch.windows.iter().any(|window| window
+        .evidence_labels
+        .iter()
+        .any(|value| value == "anchor_evidence:alex_exact_alias")));
 }
 
 #[test]

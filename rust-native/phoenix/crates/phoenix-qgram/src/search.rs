@@ -98,7 +98,7 @@ impl QgramIndex {
                     code: "PX_QGRAM_EMPTY_QUERY".to_owned(),
                     message: "No searchable clauses were produced from the query.".to_owned(),
                 }],
-            }
+            };
         };
 
         let mut workspace = QueryWorkspace::new(self.catalog.len());
@@ -120,7 +120,9 @@ impl QgramIndex {
         let mut top_hits = TopHits::new(limit);
 
         for (ordinal, _) in candidate_ordinals {
-            let (matches, matched_count) = prepared.verifier.verify_span(&self.catalog, SpanOrdinal(ordinal));
+            let (matches, matched_count) = prepared
+                .verifier
+                .verify_span(&self.catalog, SpanOrdinal(ordinal));
             if matched_count == 0 {
                 continue;
             }
@@ -578,7 +580,7 @@ impl TopHits {
         let mut hits = self
             .hits
             .into_iter()
-            .map(|ranked| ranked.0.0)
+            .map(|ranked| ranked.0 .0)
             .collect::<Vec<_>>();
         hits.sort_by(compare_span_hits);
         hits

@@ -21,6 +21,7 @@ pub fn build_causal_memory_cards(
                 node_key(&profile.node),
                 CausalMemoryCard {
                     node: profile.node.clone(),
+                    canonical_event_id: profile.canonical_event_id.clone(),
                     document_id: profile.document_id.clone(),
                     label: profile.label.clone(),
                     sentence_index: profile.sentence_index,
@@ -98,12 +99,14 @@ pub fn build_causal_memory_cards(
 
     for review in reviews {
         if let Some(card) = cards.get_mut(&node_key(&review.source)) {
-            card.counterfactual_review_ids.push(review.review_id.clone());
+            card.counterfactual_review_ids
+                .push(review.review_id.clone());
             card.open_disputes.push(review.review_id.clone());
             extend_refs(&mut card.evidence_refs, &review.evidence_refs);
         }
         if let Some(card) = cards.get_mut(&node_key(&review.target)) {
-            card.counterfactual_review_ids.push(review.review_id.clone());
+            card.counterfactual_review_ids
+                .push(review.review_id.clone());
             card.open_disputes.push(review.review_id.clone());
             extend_refs(&mut card.evidence_refs, &review.evidence_refs);
         }
@@ -117,7 +120,8 @@ pub fn build_causal_memory_cards(
             card.most_fragile_downstream_effect = Some(edge.edge_id.clone());
         }
         card.why_this_event_matters = Some(describe_card(card));
-        card.open_disputes.sort_by(|left, right| left.0.cmp(&right.0));
+        card.open_disputes
+            .sort_by(|left, right| left.0.cmp(&right.0));
         card.open_disputes.dedup();
     }
 

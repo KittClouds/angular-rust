@@ -1,8 +1,6 @@
 use compact_str::CompactString;
 use phoenix_machine::SurfaceCompileArtifacts;
-use phoenix_types::{
-    Argument, PredicateFrame, Proposition, ProvenanceRef, QuoteFrame, ScopeOp, SourceRange,
-};
+use phoenix_types::{Argument, PredicateFrame, Proposition, ProvenanceRef, ScopeOp, SourceRange};
 
 pub struct PropositionLowerer;
 
@@ -59,10 +57,7 @@ impl PropositionLowerer {
                 .collect(),
                 attribution: None,
                 conditional: None,
-                quote: relation.evidence.first().map(|evidence| QuoteFrame {
-                    quote_range: SourceRange::from(evidence.range),
-                    speaker_entity_id: None,
-                }),
+                quote: None,
                 evidence: relation
                     .evidence
                     .iter()
@@ -70,7 +65,10 @@ impl PropositionLowerer {
                         document_id: evidence.document_id.clone(),
                         note_id: evidence.note_id.clone(),
                         label: CompactString::from(evidence.label.as_str()),
-                        kind: evidence.kind.as_ref().map(|kind| CompactString::from(kind.as_str())),
+                        kind: evidence
+                            .kind
+                            .as_ref()
+                            .map(|kind| CompactString::from(kind.as_str())),
                         range: SourceRange::from(evidence.range),
                     })
                     .collect(),

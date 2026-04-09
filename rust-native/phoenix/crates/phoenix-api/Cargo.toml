@@ -10,8 +10,14 @@ phoenix-alex = { path = "../phoenix-alex" }
 phoenix-causal-post = { path = "../phoenix-causal-post" }
 phoenix-chunker = { path = "../phoenix-chunker" }
 phoenix-er-post = { path = "../phoenix-er-post" }
+phoenix-event-identity-post = { path = "../phoenix-event-identity-post" }
+phoenix-graph-kernel = { path = "../phoenix-graph-kernel" }
+phoenix-graph-post = { path = "../phoenix-graph-post" }
 phoenix-memory-post = { path = "../phoenix-memory-post" }
 phoenix-rel-post = { path = "../phoenix-rel-post" }
+phoenix-state-schema-post = { path = "../phoenix-state-schema-post" }
+phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
+phoenix-temporal-post = { path = "../phoenix-temporal-post" }
 phoenix-store-native-core = { path = "../phoenix-store-native-core" }
 phoenix-types = { path = "../phoenix-types" }
 serde.workspace = true

@@ -33,7 +33,11 @@ impl ReferenceKernel {
             .into_iter()
             .map(|candidate| CandidateEntityRef {
                 entity_id: EntityId(candidate.entity_id),
-                source: CompactString::from(candidate.relation_type.unwrap_or_else(|| "kernel".to_owned())),
+                source: CompactString::from(
+                    candidate
+                        .relation_type
+                        .unwrap_or_else(|| "kernel".to_owned()),
+                ),
                 score_millis: (candidate.score * 1000.0) as i32,
             })
             .collect()

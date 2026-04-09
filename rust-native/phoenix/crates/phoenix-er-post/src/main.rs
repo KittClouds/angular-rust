@@ -10,7 +10,7 @@ use phoenix_er_post::{
     generate_embedding_candidates, generate_fused_candidates, generate_lexical_candidates,
     persist_er_patch_sidecar, summarize_review_cases, ErCaseSmokeSummary, ErDecision,
     ErEmbeddingCandidateSummary, ErEmbeddingConfig, ErEmbeddingModel, ErFusedCandidateSummary,
-    ErLexicalMetrics, ErRetrievalComparison,
+    ErLexicalMetrics, ErRetrievalComparison, TextEmbeddingProfile,
 };
 use phoenix_ingest_overgraph::PhoenixInvarantV3;
 use phoenix_kernel::KernelGraphSnapshot;
@@ -32,6 +32,8 @@ struct SmokeConfig {
     json: bool,
     embed: bool,
     embedding_model_root: Option<PathBuf>,
+    embedding_profile: Option<TextEmbeddingProfile>,
+    embedding_max_length: Option<usize>,
     persist_patches: bool,
     replay_patches: bool,
     keep_store: bool,
@@ -49,6 +51,8 @@ impl Default for SmokeConfig {
             json: false,
             embed: false,
             embedding_model_root: None,
+            embedding_profile: None,
+            embedding_max_length: None,
             persist_patches: false,
             replay_patches: false,
             keep_store: false,
@@ -182,6 +186,9 @@ fn parse_config(args: &[String]) -> SmokeConfig {
     config.json = args.iter().any(|arg| arg == "--json");
     config.embed = args.iter().any(|arg| arg == "--embed");
     config.embedding_model_root = parse_path_arg(args, "--embedding-model-root");
+    config.embedding_profile = parse_string_arg(args, "--embedding-profile")
+        .and_then(|value| TextEmbeddingProfile::parse(&value));
+    config.embedding_max_length = parse_usize_arg(args, "--embedding-max-length");
     config.persist_patches = args.iter().any(|arg| arg == "--persist-patches");
     config.replay_patches = args.iter().any(|arg| arg == "--replay-patches");
     config.keep_store = args.iter().any(|arg| arg == "--keep-store");
@@ -210,10 +217,14 @@ fn run_smoke(config: &SmokeConfig) -> Result<SmokeReport, String> {
             .embedding_model_root
             .clone()
             .unwrap_or_else(default_embedding_model_root),
+        max_length: config.embedding_max_length.unwrap_or(512),
+        profile: config
+            .embedding_profile
+            .unwrap_or(TextEmbeddingProfile::Native384),
         ..Default::default()
     });
     let embedding_model = if let Some(embedding_config) = embedding_config.as_ref() {
-        Some(ErEmbeddingModel::load(&embedding_config.model_root)?)
+        Some(ErEmbeddingModel::load_with_config(embedding_config)?)
     } else {
         None
     };

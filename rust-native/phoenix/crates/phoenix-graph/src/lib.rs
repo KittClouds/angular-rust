@@ -19,6 +19,7 @@ pub enum GraphMutationScope {
     Document { document_id: String },
     Session { session_id: String },
     Candidate { scope_key: String },
+    Projection { scope_key: String },
     Full,
 }
 
@@ -34,6 +35,7 @@ impl GraphMutationScope {
             Self::Document { document_id } => format!("document:{document_id}"),
             Self::Session { session_id } => format!("session:{session_id}"),
             Self::Candidate { scope_key } => format!("candidate:{scope_key}"),
+            Self::Projection { scope_key } => format!("projection:{scope_key}"),
             Self::Full => "__full__".to_owned(),
         }
     }

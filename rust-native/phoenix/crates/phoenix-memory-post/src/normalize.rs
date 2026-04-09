@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use phoenix_semantic_v2::{
     scope_storage_key, DocumentArchive, ErScopePatchSidecar, MemoryClaimAtom, MemoryClaimStatus,
     MemoryModality, RelationDecisionOutcome, RelationScopePatchSidecar, ScopeLexSidecar,
-    SemanticEntityRecord, SessionArchive,
+    SemanticEntityRecord, SessionArchive, StateSchemaScopeSidecar, StateSlotDefinitionRecord,
 };
 use phoenix_types::{BiTemporalWindow, EntityId, EntityKind, ScopeKey};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::registry::slot_for_relation_family;
+use crate::registry::{merged_slot_definitions, slot_definition_for_relation_family};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +48,8 @@ pub struct MemoryNormalizedBatch {
     #[serde(default)]
     pub entity_profiles: Vec<MemoryEntityProfile>,
     #[serde(default)]
+    pub slot_definitions: Vec<StateSlotDefinitionRecord>,
+    #[serde(default)]
     pub claims: Vec<MemoryClaimAtom>,
     #[serde(default)]
     pub pending_reviews: Vec<MemoryPendingReview>,
@@ -75,11 +77,20 @@ pub fn build_entity_profiles(
         for alias in &lexical.alias_entries {
             for posting in &alias.postings {
                 if let Some(profile) = by_entity.get_mut(&posting.entity_id) {
-                    if !profile.aliases.iter().any(|value| value == &alias.normalized) {
+                    if !profile
+                        .aliases
+                        .iter()
+                        .any(|value| value == &alias.normalized)
+                    {
                         profile.aliases.push(alias.normalized.clone());
                     }
-                    let continuity_ref = format!("lexical:{}:{}", alias.normalized, posting.document_id);
-                    if !profile.continuity_refs.iter().any(|value| value == &continuity_ref) {
+                    let continuity_ref =
+                        format!("lexical:{}:{}", alias.normalized, posting.document_id);
+                    if !profile
+                        .continuity_refs
+                        .iter()
+                        .any(|value| value == &continuity_ref)
+                    {
                         profile.continuity_refs.push(continuity_ref);
                     }
                 }
@@ -90,7 +101,11 @@ pub fn build_entity_profiles(
     if let Some(er_sidecar) = er_sidecar {
         for alias in &er_sidecar.alias_additions {
             if let Some(profile) = by_entity.get_mut(&alias.entity_id.0) {
-                if !profile.aliases.iter().any(|value| value == &alias.alias_surface) {
+                if !profile
+                    .aliases
+                    .iter()
+                    .any(|value| value == &alias.alias_surface)
+                {
                     profile.aliases.push(alias.alias_surface.clone());
                 }
                 profile
@@ -135,6 +150,7 @@ pub fn normalize_memory_inputs(
     lexical: Option<&ScopeLexSidecar>,
     er_sidecar: Option<&ErScopePatchSidecar>,
     relation_sidecar: Option<&RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&StateSchemaScopeSidecar>,
 ) -> MemoryNormalizedBatch {
     let entity_profiles = build_entity_profiles(archives, lexical, er_sidecar, session);
     let label_by_id = entity_profiles
@@ -143,18 +159,25 @@ pub fn normalize_memory_inputs(
         .collect::<FxHashMap<_, _>>();
     let document_created_at = archives
         .iter()
-        .map(|archive| (archive.manifest.document_id.clone(), archive.manifest.created_at))
+        .map(|archive| {
+            (
+                archive.manifest.document_id.clone(),
+                archive.manifest.created_at,
+            )
+        })
         .collect::<FxHashMap<_, _>>();
 
     let mut batch = MemoryNormalizedBatch {
         entity_profiles,
+        slot_definitions: merged_slot_definitions(state_schema_sidecar),
         ..Default::default()
     };
 
     if let Some(relation_sidecar) = relation_sidecar {
         for edge in &relation_sidecar.edge_additions {
             let temporal = temporal_at(edge.created_at);
-            let slot = slot_for_relation_family(&edge.edge_type);
+            let slot =
+                slot_definition_for_relation_family(&edge.edge_type, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:relation-edge:{}:{}:{}",
@@ -185,7 +208,8 @@ pub fn normalize_memory_inputs(
         }
 
         for judgment in &relation_sidecar.support_judgments {
-            let slot = slot_for_relation_family(&judgment.edge_type);
+            let slot =
+                slot_definition_for_relation_family(&judgment.edge_type, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:relation-support:{}:{}:{}",
@@ -216,7 +240,8 @@ pub fn normalize_memory_inputs(
         }
 
         for judgment in &relation_sidecar.contradiction_judgments {
-            let slot = slot_for_relation_family(&judgment.edge_type);
+            let slot =
+                slot_definition_for_relation_family(&judgment.edge_type, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:relation-contradiction:{}:{}:{}",
@@ -256,7 +281,9 @@ pub fn normalize_memory_inputs(
             let slot_key = decision
                 .edge_type
                 .as_deref()
-                .and_then(slot_for_relation_family)
+                .and_then(|edge_type| {
+                    slot_definition_for_relation_family(edge_type, &batch.slot_definitions)
+                })
                 .map(|slot| slot.slot_key.to_owned());
             let Some(entity_id) = decision.source_entity_id.clone() else {
                 continue;
@@ -305,7 +332,8 @@ pub fn normalize_memory_inputs(
             if archived_relation_keys.contains(&key) {
                 continue;
             }
-            let slot = slot_for_relation_family(&relation.edge_type);
+            let slot =
+                slot_definition_for_relation_family(&relation.edge_type, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:archive-relation:{}:{}:{}:{}",
@@ -432,8 +460,12 @@ pub fn normalize_memory_inputs(
         }
     }
 
-    batch.claims.sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
-    batch.pending_reviews.sort_by(|left, right| left.review_id.cmp(&right.review_id));
+    batch
+        .claims
+        .sort_by(|left, right| left.claim_id.cmp(&right.claim_id));
+    batch
+        .pending_reviews
+        .sort_by(|left, right| left.review_id.cmp(&right.review_id));
     batch
 }
 
@@ -473,7 +505,9 @@ fn merge_profile(
     }
     profile.mention_count += entity.mention_count;
     profile.aliases.extend(entity.aliases.clone());
-    profile.document_ids.push(archive.manifest.document_id.clone());
+    profile
+        .document_ids
+        .push(archive.manifest.document_id.clone());
 }
 
 fn entity_label(label_by_id: &FxHashMap<String, String>, entity_id: &EntityId) -> String {

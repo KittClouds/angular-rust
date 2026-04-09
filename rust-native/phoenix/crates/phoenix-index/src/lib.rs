@@ -8,7 +8,11 @@ pub struct DeterministicIndex {
 }
 
 impl DeterministicIndex {
-    pub fn build(spans: &[IndexedSpan], entries: &[LexiconEntry], config: QgramConfig) -> Result<Self, AlexError> {
+    pub fn build(
+        spans: &[IndexedSpan],
+        entries: &[LexiconEntry],
+        config: QgramConfig,
+    ) -> Result<Self, AlexError> {
         Ok(Self {
             lexical: QgramIndex::build(spans, config),
             alias_lexicon: Lexicon::from_entries(entries)?,

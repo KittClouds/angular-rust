@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use phoenix_alex::{api as alex_api, split_sentence_ranges as alex_sentence_ranges, AlexError, Lexicon};
+use phoenix_alex::{
+    api as alex_api, split_sentence_ranges as alex_sentence_ranges, AlexError, Lexicon,
+};
 use phoenix_semantic_v2::{
     scope_storage_key, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef, ErScopePatchSidecar,
     RelationDecisionOutcome, RelationDecisionRecord, RelationEdgeAddition, RelationJudgmentKind,
@@ -18,11 +20,11 @@ use phoenix_types::{
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::gliner_seed::RelationMentionSeeder;
 use crate::glirel::{
     extract_heuristic_relations, seed_relation_pairs, GlirelEntity, GlirelModel,
     GlirelProposalConfig, GlirelRelationPrediction, GlirelRelationTypeSpec,
 };
-use crate::gliner_seed::RelationMentionSeeder;
 use crate::nli::NliModel;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,10 +241,7 @@ pub fn default_relation_type_specs() -> Vec<GlirelRelationTypeSpec> {
         },
         GlirelRelationTypeSpec {
             label: "member_of".to_owned(),
-            head_types: vec![
-                "Character".to_owned(),
-                "Npc".to_owned(),
-            ],
+            head_types: vec!["Character".to_owned(), "Npc".to_owned()],
             tail_types: vec!["Faction".to_owned(), "Organization".to_owned()],
             cue_phrases: vec![
                 "member of".to_owned(),
@@ -493,7 +492,10 @@ pub fn derive_scope_review_batch_from_store_with_seeder<S>(
     mention_seeder: Option<&RelationMentionSeeder>,
 ) -> Result<RelationScopeReviewBatch, GlirelWorkerError>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixRelationMentionSeedStore + PhoenixRelationPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixRelationMentionSeedStore
+        + PhoenixRelationPatchStore,
 {
     let archives = store.load_latest_document_archives(Some(&dirty.scope))?;
     let sidecar = store.load_scope_sidecar(&dirty.scope)?;
@@ -537,7 +539,10 @@ pub fn derive_dirty_scope_review_batches_with_seeder<S>(
     mention_seeder: Option<&RelationMentionSeeder>,
 ) -> Result<Vec<RelationScopeReviewBatch>, GlirelWorkerError>
 where
-    S: PhoenixArchiveStoreV2 + PhoenixErPatchStore + PhoenixRelationMentionSeedStore + PhoenixRelationPatchStore,
+    S: PhoenixArchiveStoreV2
+        + PhoenixErPatchStore
+        + PhoenixRelationMentionSeedStore
+        + PhoenixRelationPatchStore,
 {
     let session = match session_id {
         Some(value) => store.load_latest_session_archive(value)?,
@@ -978,11 +983,7 @@ pub fn build_relation_hypotheses(edge_type: &str, head: &str, tail: &str) -> Vec
     };
     templates
         .iter()
-        .map(|template| {
-            template
-                .replace("{head}", head)
-                .replace("{tail}", tail)
-        })
+        .map(|template| template.replace("{head}", head).replace("{tail}", tail))
         .collect()
 }
 
@@ -1043,9 +1044,10 @@ pub fn build_relation_patch_sidecar(
             evidence: decision.evidence.clone(),
             reviewed_at: created_at,
         });
-        if let (Some(edge_type), Some(confidence_millis)) =
-            (decision.edge_type.clone(), decision.support_confidence_millis)
-        {
+        if let (Some(edge_type), Some(confidence_millis)) = (
+            decision.edge_type.clone(),
+            decision.support_confidence_millis,
+        ) {
             sidecar.support_judgments.push(RelationJudgmentRecord {
                 case_id: case.case_id.clone(),
                 document_id: case.document_id.clone(),
@@ -1059,21 +1061,24 @@ pub fn build_relation_patch_sidecar(
                 created_at,
             });
         }
-        if let (Some(edge_type), Some(confidence_millis)) =
-            (decision.edge_type.clone(), decision.contradiction_confidence_millis)
-        {
-            sidecar.contradiction_judgments.push(RelationJudgmentRecord {
-                case_id: case.case_id.clone(),
-                document_id: case.document_id.clone(),
-                window_id: case.window_id.clone(),
-                source_entity_id: source_entity_id.clone(),
-                target_entity_id: target_entity_id.clone(),
-                edge_type,
-                kind: RelationJudgmentKind::Contradict,
-                confidence_millis,
-                evidence_refs: decision.evidence.clone(),
-                created_at,
-            });
+        if let (Some(edge_type), Some(confidence_millis)) = (
+            decision.edge_type.clone(),
+            decision.contradiction_confidence_millis,
+        ) {
+            sidecar
+                .contradiction_judgments
+                .push(RelationJudgmentRecord {
+                    case_id: case.case_id.clone(),
+                    document_id: case.document_id.clone(),
+                    window_id: case.window_id.clone(),
+                    source_entity_id: source_entity_id.clone(),
+                    target_entity_id: target_entity_id.clone(),
+                    edge_type,
+                    kind: RelationJudgmentKind::Contradict,
+                    confidence_millis,
+                    evidence_refs: decision.evidence.clone(),
+                    created_at,
+                });
         }
 
         if decision.kind == RelationDecisionKind::Accept {
@@ -1438,8 +1443,7 @@ fn build_windows(
             dedupe_relation_mentions(&mut mentions);
         }
         if let Some(seeder) = mention_seeder {
-            if !archive.relations.is_empty()
-                && (archive.sentences.is_empty() || mentions.len() < 2)
+            if !archive.relations.is_empty() && (archive.sentences.is_empty() || mentions.len() < 2)
             {
                 let seeded_mentions = collect_gliner_seed_mentions(archive, profiles, seeder)?;
                 if !seeded_mentions.is_empty() {
@@ -1761,7 +1765,6 @@ fn continuity_relation_map(
     rows
 }
 
-
 fn append_synthetic_sentence_windows(
     windows: &mut Vec<RelationWindowRecord>,
     stats: &mut RelationWindowBuildStats,
@@ -1777,7 +1780,8 @@ fn append_synthetic_sentence_windows(
         let synthetic = split_chunk_into_synthetic_sentences(chunk, sentence_index);
         sentence_index += synthetic.len();
         let candidate_profiles = candidate_profiles_for_chunk(archive, chunk, profiles);
-        let mut sentence_mentions = Vec::<(RelationSyntheticSentence, Vec<RelationMention>, Vec<String>)>::new();
+        let mut sentence_mentions =
+            Vec::<(RelationSyntheticSentence, Vec<RelationMention>, Vec<String>)>::new();
         for sentence in synthetic {
             let (mentions, labels) = rebuild_sentence_mentions(
                 &sentence,
@@ -1911,7 +1915,10 @@ fn candidate_profiles_for_chunk<'a>(
     profiles
         .iter()
         .filter(|profile| {
-            profile.chunk_ids.iter().any(|value| value == &chunk.chunk_id.0)
+            profile
+                .chunk_ids
+                .iter()
+                .any(|value| value == &chunk.chunk_id.0)
                 || profile
                     .document_ids
                     .iter()
@@ -1933,7 +1940,8 @@ fn rebuild_sentence_mentions(
         .map(|profile| (profile.entity_id.0.as_str(), *profile))
         .collect::<FxHashMap<_, _>>();
     for known_match in alex_api::scan_text(alex_lexicon, &sentence.text, scope) {
-        let Some(profile) = choose_relation_match_profile(&known_match.entries, &profile_by_entity) else {
+        let Some(profile) = choose_relation_match_profile(&known_match.entries, &profile_by_entity)
+        else {
             continue;
         };
         if !is_relation_scan_surface(
@@ -2165,7 +2173,10 @@ fn relation_anchor_density_too_high(text: &str, entities: &[RelationMention]) ->
         || anchor_chars.saturating_mul(100) > text.len().max(1).saturating_mul(70)
 }
 
-fn clip_chunk_range(chunk: &phoenix_semantic_v2::ChunkRecord, mentions: &[RelationMention]) -> TextRange {
+fn clip_chunk_range(
+    chunk: &phoenix_semantic_v2::ChunkRecord,
+    mentions: &[RelationMention],
+) -> TextRange {
     let min_start = mentions
         .iter()
         .map(|mention| mention.span_start)
@@ -2176,9 +2187,7 @@ fn clip_chunk_range(chunk: &phoenix_semantic_v2::ChunkRecord, mentions: &[Relati
         .map(|mention| mention.span_end)
         .max()
         .unwrap_or(chunk.range.end as usize);
-    let start = min_start
-        .saturating_sub(64)
-        .max(chunk.range.start as usize) as u32;
+    let start = min_start.saturating_sub(64).max(chunk.range.start as usize) as u32;
     let end = (max_end + 64).min(chunk.range.end as usize) as u32;
     TextRange { start, end }
 }
@@ -2200,7 +2209,10 @@ fn find_word_boundary_match(text: &str, surface: &str) -> Option<(usize, usize)>
                 .next_back()
                 .is_some_and(relation_surface_char);
         let next_ok = end >= text.len()
-            || !text[end..].chars().next().is_some_and(relation_surface_char);
+            || !text[end..]
+                .chars()
+                .next()
+                .is_some_and(relation_surface_char);
         if prev_ok && next_ok {
             return Some((start, end));
         }
@@ -2312,8 +2324,13 @@ fn append_relation_candidate_windows(
         window
             .evidence_labels
             .push("window_source:relation_candidate".to_owned());
-        for relation in continuity_relation_types_from_entities(&window.entities, continuity_hints) {
-            if !window.candidate_relation_types.iter().any(|value| value == &relation) {
+        for relation in continuity_relation_types_from_entities(&window.entities, continuity_hints)
+        {
+            if !window
+                .candidate_relation_types
+                .iter()
+                .any(|value| value == &relation)
+            {
                 window.candidate_relation_types.push(relation.clone());
             }
             window
@@ -2324,9 +2341,10 @@ fn append_relation_candidate_windows(
             &mut stats.window_source_counts,
             "relation_candidate".to_owned(),
         );
-        stats
-            .families_per_window
-            .insert(window.window_id.clone(), window.candidate_relation_types.clone());
+        stats.families_per_window.insert(
+            window.window_id.clone(),
+            window.candidate_relation_types.clone(),
+        );
         windows.push(window);
     }
 }
@@ -2439,7 +2457,11 @@ fn append_archive_relation_windows(
             .evidence_labels
             .push(format!("archive_relation_hint:{}", relation.edge_type));
         for relation in continuity_relations {
-            if !window.candidate_relation_types.iter().any(|value| value == &relation) {
+            if !window
+                .candidate_relation_types
+                .iter()
+                .any(|value| value == &relation)
+            {
                 window.candidate_relation_types.push(relation.clone());
             }
             window
@@ -2450,9 +2472,10 @@ fn append_archive_relation_windows(
             &mut stats.window_source_counts,
             "archive_relation".to_owned(),
         );
-        stats
-            .families_per_window
-            .insert(window.window_id.clone(), window.candidate_relation_types.clone());
+        stats.families_per_window.insert(
+            window.window_id.clone(),
+            window.candidate_relation_types.clone(),
+        );
         windows.push(window);
     }
 }
@@ -2464,12 +2487,20 @@ fn build_archive_relation_window(
     mentions: &[RelationMention],
     profile_by_entity: &FxHashMap<String, &RelationEntityProfile>,
 ) -> Option<RelationWindowRecord> {
-    let source_profile = profile_by_entity.get(&relation.source_entity_id.0).copied()?;
-    let target_profile = profile_by_entity.get(&relation.target_entity_id.0).copied()?;
+    let source_profile = profile_by_entity
+        .get(&relation.source_entity_id.0)
+        .copied()?;
+    let target_profile = profile_by_entity
+        .get(&relation.target_entity_id.0)
+        .copied()?;
     let sentence_index = relation.sentence_index;
     let mut candidate_chunks = Vec::new();
     if let Some(chunk_id) = relation.chunk_id.as_ref() {
-        if let Some(chunk) = archive.chunks.iter().find(|chunk| chunk.chunk_id.0 == *chunk_id) {
+        if let Some(chunk) = archive
+            .chunks
+            .iter()
+            .find(|chunk| chunk.chunk_id.0 == *chunk_id)
+        {
             candidate_chunks.push(chunk);
         }
     }
@@ -2619,10 +2650,9 @@ fn best_chunk_relation_mention(
         })
         .cloned()
         .max_by(|left, right| {
-            left.surface
-                .len()
-                .cmp(&right.surface.len())
-                .then_with(|| std::cmp::Reverse(left.span_start).cmp(&std::cmp::Reverse(right.span_start)))
+            left.surface.len().cmp(&right.surface.len()).then_with(|| {
+                std::cmp::Reverse(left.span_start).cmp(&std::cmp::Reverse(right.span_start))
+            })
         })
 }
 
@@ -3017,7 +3047,8 @@ fn collect_relation_seed_mentions(
         .seeds
         .iter()
         .filter(|seed| {
-            seed.document_id == archive.manifest.document_id && seed.revision == archive.manifest.revision
+            seed.document_id == archive.manifest.document_id
+                && seed.revision == archive.manifest.revision
         })
         .filter(|seed| is_relation_salient_surface(&seed.surface, seed.kind.as_ref()))
         .map(|seed| RelationMention {
@@ -3286,10 +3317,7 @@ fn is_relation_anchor_surface(
     if generic.contains(&normalized.as_str()) {
         return false;
     }
-    if normalized.len() <= 2
-        && !allow_compact_alias
-        && kind != Some(&EntityKind::Item)
-    {
+    if normalized.len() <= 2 && !allow_compact_alias && kind != Some(&EntityKind::Item) {
         return false;
     }
     if kind == Some(&EntityKind::Location)
@@ -3615,10 +3643,9 @@ fn filter_relation_predictions(
         ) {
             continue;
         }
-        prediction.evidence.push(format!(
-            "family_threshold:{}",
-            spec.review_threshold_millis
-        ));
+        prediction
+            .evidence
+            .push(format!("family_threshold:{}", spec.review_threshold_millis));
         let key = (
             prediction.head_index,
             prediction.tail_index,
@@ -3850,7 +3877,13 @@ fn text_supports_relation(
             target_surface,
             source_span,
             target_span,
-            &[" protects ", " protected ", " defends ", " defended ", " guards "],
+            &[
+                " protects ",
+                " protected ",
+                " defends ",
+                " defended ",
+                " guards ",
+            ],
             false,
             96,
         ),
@@ -3879,17 +3912,16 @@ fn text_between_supports(
         target_span,
         cues,
         max_between_chars,
-    )
-        || (allow_reverse
-            && text_between_contains_cue(
-                &normalized_text,
-                &target,
-                &source,
-                target_span,
-                source_span,
-                cues,
-                max_between_chars,
-            ))
+    ) || (allow_reverse
+        && text_between_contains_cue(
+            &normalized_text,
+            &target,
+            &source,
+            target_span,
+            source_span,
+            cues,
+            max_between_chars,
+        ))
 }
 
 fn is_supported_relation_family(relation: &str) -> bool {
@@ -3981,17 +4013,17 @@ fn infer_window_relation_types_from_window_entities(
     continuity_relations: &[String],
 ) -> Vec<String> {
     let mut labels = BTreeSet::new();
-    for relation in ["works_for", "located_in", "member_of", "commands", "protects"] {
+    for relation in [
+        "works_for",
+        "located_in",
+        "member_of",
+        "commands",
+        "protects",
+    ] {
         let supported = entities.iter().enumerate().any(|(left_index, left)| {
             entities.iter().skip(left_index + 1).any(|right| {
                 relation_prediction_supported(text, relation, left, right, window_start)
-                    || relation_prediction_supported(
-                        text,
-                        relation,
-                        right,
-                        left,
-                        window_start,
-                    )
+                    || relation_prediction_supported(text, relation, right, left, window_start)
             })
         });
         if supported {

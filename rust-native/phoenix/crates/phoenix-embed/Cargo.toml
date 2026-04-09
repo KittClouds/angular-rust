@@ -1,0 +1,11 @@
+[package]
+name = "phoenix-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "load-dynamic"] }
+thiserror.workspace = true
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
