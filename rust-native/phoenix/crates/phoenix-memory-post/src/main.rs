@@ -40,6 +40,8 @@ struct BatchReport {
     entity_card_count: usize,
     relationship_ledger_count: usize,
     active_slot_counts: BTreeMap<String, usize>,
+    slot_claim_counts: BTreeMap<String, usize>,
+    relation_family_counts: BTreeMap<String, usize>,
     unresolved_gap_counts: BTreeMap<String, usize>,
     source_class_counts: BTreeMap<String, usize>,
     status_counts: BTreeMap<String, usize>,
@@ -119,6 +121,8 @@ fn main() -> Result<(), String> {
             entity_card_count: batch.summary.entity_card_count,
             relationship_ledger_count: batch.summary.relationship_ledger_count,
             active_slot_counts: batch.summary.active_slot_counts.clone(),
+            slot_claim_counts: count_slot_claims(&batch.claims),
+            relation_family_counts: count_relation_families(&batch.claims),
             unresolved_gap_counts: batch.summary.unresolved_gap_counts.clone(),
             source_class_counts: batch.summary.source_class_counts.clone(),
             status_counts: batch.summary.status_counts.clone(),
@@ -148,6 +152,12 @@ fn main() -> Result<(), String> {
             );
             for (slot, count) in report.active_slot_counts {
                 println!("- active slot {slot}: {count}");
+            }
+            for (slot, count) in report.slot_claim_counts {
+                println!("- slot claims {slot}: {count}");
+            }
+            for (relation_family, count) in report.relation_family_counts {
+                println!("- relation family {relation_family}: {count}");
             }
             for card in report.cards {
                 println!(
@@ -204,4 +214,24 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+fn count_slot_claims(claims: &[phoenix_semantic_v2::MemoryClaimAtom]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for claim in claims {
+        *counts.entry(claim.slot_key.clone()).or_default() += 1;
+    }
+    counts
+}
+
+fn count_relation_families(
+    claims: &[phoenix_semantic_v2::MemoryClaimAtom],
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for claim in claims {
+        if let Some(relation_family) = claim.relation_family.as_ref() {
+            *counts.entry(relation_family.clone()).or_default() += 1;
+        }
+    }
+    counts
 }

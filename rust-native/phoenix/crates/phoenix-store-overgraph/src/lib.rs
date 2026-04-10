@@ -566,6 +566,9 @@ impl PhoenixOvergraphStore {
                 decode_record_prop::<AnnSourceNodeRecord>(&node, PROP_RECORD).transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(latest_updated_at) = records.iter().map(|record| record.updated_at).max() {
+            records.retain(|record| record.updated_at == latest_updated_at);
+        }
         records.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let vectors = records
             .iter()
@@ -678,7 +681,34 @@ impl PhoenixOvergraphStore {
         kind: Option<&str>,
     ) -> Result<Option<(AnnManifest, HyperbolicDiskHnsw<AnnMetric>, Vec<AnnPayload>)>, StoreError>
     {
-        let Some((manifest, payloads, cache_path)) = self.with_engine(|engine| {
+        let Some((_, manifest, payloads, cache_path)) =
+            self.load_ann_query_components(scope, family, kind, false)?
+        else {
+            return Ok(None);
+        };
+
+        match self.open_ann_disk_index(&manifest, &cache_path) {
+            Ok(index_handle) => Ok(Some((manifest, index_handle, payloads))),
+            Err(_) => {
+                let Some((_, manifest, payloads, cache_path)) =
+                    self.load_ann_query_components(scope, family, kind, true)?
+                else {
+                    return Ok(None);
+                };
+                let index_handle = self.open_ann_disk_index(&manifest, &cache_path)?;
+                Ok(Some((manifest, index_handle, payloads)))
+            }
+        }
+    }
+
+    fn load_ann_query_components(
+        &self,
+        scope: &ScopeKey,
+        family: AnnIndexFamily,
+        kind: Option<&str>,
+        force_rebuild: bool,
+    ) -> Result<Option<(AnnIndexKey, AnnManifest, Vec<AnnPayload>, PathBuf)>, StoreError> {
+        self.with_engine(|engine| {
             let Some(scope_ord) = self.lookup_scope_ord_with_engine(engine, scope)? else {
                 return Ok(None);
             };
@@ -687,50 +717,84 @@ impl PhoenixOvergraphStore {
                 family,
                 kind: kind.map(str::to_owned),
             };
-            self.ensure_ann_index_ready_with_engine(engine, &index)?;
-            let Some(head) = engine
-                .get_node_by_key(TYPE_ANN_HEAD, &ann_index_storage_key(&index))
-                .map_err(store_query_error)?
-            else {
-                return Ok(None);
-            };
-            let Some(generation) = optional_u64_prop(&head, PROP_GENERATION).map(AnnGenerationId)
-            else {
-                return Ok(None);
-            };
-            let Some(node) = engine
-                .get_node_by_key(
-                    TYPE_ANN_GENERATION,
-                    &ann_generation_storage_key(&index, generation),
-                )
-                .map_err(store_query_error)?
-            else {
-                return Ok(None);
-            };
-            let manifest: AnnManifest = decode_record_prop_required(&node, PROP_RECORD)?;
-            let payloads: Vec<AnnPayload> =
-                decode_archive(&required_bytes_prop(&node, PROP_PAYLOAD)?)?;
-            if payloads.len() != manifest.count {
-                return Err(StoreError::Query(format!(
-                    "semantic payload count mismatch for generation {}: expected {}, got {}",
-                    manifest.generation_id.0,
-                    manifest.count,
-                    payloads.len()
-                )));
+            if force_rebuild {
+                self.rebuild_ann_index_with_engine(engine, &index, now_ms())?;
+            } else {
+                self.ensure_ann_index_ready_with_engine(engine, &index)?;
             }
-            let segments: AnnPackedSegments =
-                decode_archive(&required_bytes_prop(&node, PROP_SEGMENTS)?)?;
-            let cache_path = self.write_ann_generation_cache_file(&manifest, &segments)?;
-            Ok(Some((manifest, payloads, cache_path)))
-        })?
+            Ok(self
+                .load_ann_generation_components_with_engine(engine, &index)?
+                .map(|(manifest, payloads, cache_path)| (index, manifest, payloads, cache_path)))
+        })
+    }
+
+    fn load_ann_generation_components_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        index: &AnnIndexKey,
+    ) -> Result<Option<(AnnManifest, Vec<AnnPayload>, PathBuf)>, StoreError> {
+        let Some(head) = engine
+            .get_node_by_key(TYPE_ANN_HEAD, &ann_index_storage_key(index))
+            .map_err(store_query_error)?
         else {
             return Ok(None);
         };
+        let Some(generation) = optional_u64_prop(&head, PROP_GENERATION).map(AnnGenerationId)
+        else {
+            return Ok(None);
+        };
+        let Some(node) = engine
+            .get_node_by_key(
+                TYPE_ANN_GENERATION,
+                &ann_generation_storage_key(index, generation),
+            )
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let manifest: AnnManifest = decode_record_prop_required(&node, PROP_RECORD)?;
+        let payloads: Vec<AnnPayload> = decode_archive(&required_bytes_prop(&node, PROP_PAYLOAD)?)?;
+        if payloads.len() != manifest.count {
+            return Err(StoreError::Query(format!(
+                "semantic payload count mismatch for generation {}: expected {}, got {}",
+                manifest.generation_id.0,
+                manifest.count,
+                payloads.len()
+            )));
+        }
+        let segments: AnnPackedSegments =
+            decode_archive(&required_bytes_prop(&node, PROP_SEGMENTS)?)?;
+        let cache_path = self.write_ann_generation_cache_file(&manifest, &segments)?;
+        Ok(Some((manifest, payloads, cache_path)))
+    }
 
+    fn open_ann_disk_index(
+        &self,
+        manifest: &AnnManifest,
+        cache_path: &Path,
+    ) -> Result<HyperbolicDiskHnsw<AnnMetric>, StoreError> {
         let metric = AnnMetric::from_label_or_default(manifest.metric.as_str());
-        let index = HyperbolicDiskHnsw::open(&cache_path.to_string_lossy(), metric)
-            .map_err(|error| StoreError::Query(error.to_string()))?;
-        Ok(Some((manifest, index, payloads)))
+        HyperbolicDiskHnsw::open(&cache_path.to_string_lossy(), metric)
+            .map_err(|error| StoreError::Query(error.to_string()))
+    }
+
+    fn rebuild_ann_index_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        index: &AnnIndexKey,
+        built_at: i64,
+    ) -> Result<(), StoreError> {
+        match index.family {
+            AnnIndexFamily::Document => {
+                self.rebuild_document_ann_index_with_engine(engine, index, built_at)
+            }
+            AnnIndexFamily::Leaf => {
+                self.rebuild_leaf_ann_index_with_engine(engine, index, built_at)
+            }
+            AnnIndexFamily::NodePrototype => {
+                self.rebuild_node_ann_index_with_engine(engine, index, built_at)
+            }
+        }
     }
 
     fn search_ann_payloads(
@@ -1275,7 +1339,13 @@ impl PhoenixOvergraphStore {
             return Ok(None);
         };
         let payload = required_bytes_prop(&node, PROP_PAYLOAD)?;
-        decode_archive(&payload).map(Some)
+        match decode_archive(&payload) {
+            Ok(sidecar) => Ok(Some(sidecar)),
+            Err(_) => {
+                engine.delete_node(node.id).map_err(store_query_error)?;
+                Ok(None)
+            }
+        }
     }
 
     fn load_native_semantic_graph_patch_sidecar_with_engine(
@@ -3660,6 +3730,11 @@ fn required_u64_prop(node: &NodeRecord, key: &str) -> Result<u64, StoreError> {
 }
 
 fn required_bytes_prop(node: &NodeRecord, key: &str) -> Result<Vec<u8>, StoreError> {
+    if key == PROP_PAYLOAD && node.key.starts_with("ann-source:") {
+        if let Some(record) = optional_bytes_prop(node, PROP_RECORD) {
+            return Ok(record);
+        }
+    }
     optional_bytes_prop(node, key).ok_or_else(|| {
         StoreError::Query(format!(
             "missing bytes property '{key}' on node {}",
@@ -4178,6 +4253,142 @@ mod tests {
         assert_eq!(
             updated_hits.first().map(|hit| hit.document_id.as_str()),
             Some("doc-b")
+        );
+    }
+
+    #[test]
+    fn ann_source_payload_reads_fall_back_to_record_bytes() {
+        let record = AnnSourceNodeRecord {
+            scope: ScopeKey::default(),
+            scope_key: scope_storage_key(&ScopeKey::default()),
+            node_id: "chunk::a".to_owned(),
+            node_kind: "chunk".to_owned(),
+            document_id: Some("doc-a".to_owned()),
+            narrative_id: None,
+            folder_id: None,
+            values: semantic_test_vector(0),
+            evidence_refs: vec!["chunk:0".to_owned()],
+            updated_at: 1,
+        };
+        let record_bytes = encode_record(&record).expect("encode record");
+        let node = NodeRecord {
+            id: 1,
+            type_id: TYPE_ANN_SOURCE_NODE,
+            key: "ann-source:1:node:chunk:chunk::a".to_owned(),
+            props: btree_props([(PROP_RECORD, PropValue::Bytes(record_bytes.clone()))]),
+            weight: 1.0,
+            created_at: 0,
+            updated_at: 0,
+            last_write_seq: 0,
+            dense_vector: None,
+            sparse_vector: None,
+        };
+
+        let payload = required_bytes_prop(&node, PROP_PAYLOAD).expect("payload fallback");
+        assert_eq!(payload, record_bytes);
+    }
+
+    #[test]
+    fn semantic_node_ann_rebuild_prefers_latest_batch() {
+        let store = temp_store("semantic-node-latest-batch");
+        let scope = ScopeKey::default();
+
+        store
+            .upsert_semantic_node_vectors_native(&[
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "chunk::stale".to_owned(),
+                    node_kind: "chunk".to_owned(),
+                    document_id: Some("doc-a".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(1),
+                    evidence_refs: vec!["chunk:stale".to_owned()],
+                    updated_at: 1,
+                },
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "chunk::fresh-a".to_owned(),
+                    node_kind: "chunk".to_owned(),
+                    document_id: Some("doc-b".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(0),
+                    evidence_refs: vec!["chunk:fresh-a".to_owned()],
+                    updated_at: 2,
+                },
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "chunk::fresh-b".to_owned(),
+                    node_kind: "chunk".to_owned(),
+                    document_id: Some("doc-c".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(2),
+                    evidence_refs: vec!["chunk:fresh-b".to_owned()],
+                    updated_at: 2,
+                },
+            ])
+            .expect("upsert node vectors");
+
+        let hits = store
+            .query_semantic_node_neighbors(&semantic_test_vector(0), &scope, "chunk", None, 4, 8)
+            .expect("query node neighbors");
+        let hit_ids = hits
+            .iter()
+            .map(|hit| hit.node_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(hit_ids.contains(&"chunk::fresh-a"));
+        assert!(hit_ids.contains(&"chunk::fresh-b"));
+        assert!(!hit_ids.contains(&"chunk::stale"));
+    }
+
+    #[test]
+    fn corrupt_graph_sidecar_is_quarantined_on_load() {
+        let store = temp_store("corrupt-graph-sidecar");
+        let scope = ScopeKey::default();
+        let scope_key = scope_storage_key(&scope);
+
+        store
+            .with_engine(|engine| {
+                engine
+                    .upsert_node(
+                        TYPE_GRAPH_PATCH_SIDECAR,
+                        &scope_key,
+                        UpsertNodeOptions {
+                            props: btree_props([
+                                (PROP_SCOPE_KEY, PropValue::String(scope_key.clone())),
+                                (PROP_SCOPE_ORD, PropValue::Null),
+                                (PROP_SESSION_ID, PropValue::Null),
+                                (PROP_REVISION, PropValue::UInt(1)),
+                                (PROP_UPDATED_AT, PropValue::Int(1)),
+                                (PROP_BYTE_LEN, PropValue::UInt(4)),
+                                (PROP_PAYLOAD, PropValue::Bytes(vec![1, 2, 3, 4])),
+                            ]),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(store_query_error)?;
+                Ok(())
+            })
+            .expect("write corrupt sidecar");
+
+        let loaded = store
+            .load_graph_patch_sidecar(&scope)
+            .expect("load sidecar");
+        assert!(loaded.is_none(), "corrupt sidecar should be quarantined");
+
+        let still_present = store
+            .with_engine(|engine| {
+                engine
+                    .get_node_by_key(TYPE_GRAPH_PATCH_SIDECAR, &scope_key)
+                    .map_err(store_query_error)
+            })
+            .expect("query node");
+        assert!(
+            still_present.is_none(),
+            "corrupt sidecar node should be deleted"
         );
     }
 }

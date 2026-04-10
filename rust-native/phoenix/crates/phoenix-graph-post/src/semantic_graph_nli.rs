@@ -31,6 +31,7 @@ pub(crate) fn needs_nli_review(family: SemanticEdgeFamily) -> bool {
             | SemanticEdgeFamily::ClaimContradiction
             | SemanticEdgeFamily::StateSupport
             | SemanticEdgeFamily::StateContradiction
+            | SemanticEdgeFamily::ContradictorySupportRegion
     )
 }
 
@@ -86,6 +87,9 @@ fn adjudicate_family(
     contradiction_millis: u32,
     config: &SemanticNliConfig,
 ) -> (SemanticEdgeFamily, SemanticCandidateStatus) {
+    if family == SemanticEdgeFamily::ContradictorySupportRegion {
+        return adjudicate_contradiction_region(support_millis, contradiction_millis, config);
+    }
     if contradiction_millis >= config.contradiction_threshold_millis
         && contradiction_millis >= support_millis.saturating_add(60)
     {
@@ -114,6 +118,33 @@ fn adjudicate_family(
         return (support_variant(family), SemanticCandidateStatus::Deferred);
     }
     (family, SemanticCandidateStatus::Rejected)
+}
+
+fn adjudicate_contradiction_region(
+    support_millis: u32,
+    contradiction_millis: u32,
+    config: &SemanticNliConfig,
+) -> (SemanticEdgeFamily, SemanticCandidateStatus) {
+    if contradiction_millis >= config.contradiction_threshold_millis
+        && contradiction_millis >= support_millis.saturating_add(60)
+    {
+        return (
+            SemanticEdgeFamily::ContradictorySupportRegion,
+            SemanticCandidateStatus::ReviewedContradiction,
+        );
+    }
+    if contradiction_millis >= config.review_threshold_millis
+        && contradiction_millis > support_millis
+    {
+        return (
+            SemanticEdgeFamily::ContradictorySupportRegion,
+            SemanticCandidateStatus::Deferred,
+        );
+    }
+    (
+        SemanticEdgeFamily::ContradictorySupportRegion,
+        SemanticCandidateStatus::Rejected,
+    )
 }
 
 fn support_variant(family: SemanticEdgeFamily) -> SemanticEdgeFamily {
@@ -192,6 +223,29 @@ mod tests {
         let (_, status) = adjudicate_family(SemanticEdgeFamily::StateSupport, 320, 280, &config());
         assert_eq!(status, SemanticCandidateStatus::Rejected);
         assert!(needs_nli_review(SemanticEdgeFamily::ClaimSupport));
+        assert!(needs_nli_review(
+            SemanticEdgeFamily::ContradictorySupportRegion
+        ));
         assert!(!needs_nli_review(SemanticEdgeFamily::EntityEventSupport));
+    }
+
+    #[test]
+    fn contradiction_region_only_survives_contradiction_signal() {
+        let (family, status) = adjudicate_family(
+            SemanticEdgeFamily::ContradictorySupportRegion,
+            390,
+            812,
+            &config(),
+        );
+        assert_eq!(family, SemanticEdgeFamily::ContradictorySupportRegion);
+        assert_eq!(status, SemanticCandidateStatus::ReviewedContradiction);
+
+        let (_, weak_status) = adjudicate_family(
+            SemanticEdgeFamily::ContradictorySupportRegion,
+            780,
+            420,
+            &config(),
+        );
+        assert_eq!(weak_status, SemanticCandidateStatus::Rejected);
     }
 }

@@ -19,6 +19,8 @@ phoenix-state-schema-post = { path = "../phoenix-state-schema-post" }
 phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
 phoenix-temporal-post = { path = "../phoenix-temporal-post" }
 phoenix-store-native-core = { path = "../phoenix-store-native-core" }
+phoenix-store-overgraph = { path = "../phoenix-store-overgraph" }
 phoenix-types = { path = "../phoenix-types" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

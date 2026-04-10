@@ -9,7 +9,9 @@ use phoenix_types::{BiTemporalWindow, EntityId, EntityKind, ScopeKey};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{merged_slot_definitions, slot_definition_for_relation_family};
+use crate::registry::{
+    merged_slot_definitions, normalize_relation_family_key, slot_definition_for_relation_family,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,9 +177,10 @@ pub fn normalize_memory_inputs(
 
     if let Some(relation_sidecar) = relation_sidecar {
         for edge in &relation_sidecar.edge_additions {
+            let relation_family = normalize_relation_family_key(&edge.edge_type).into_owned();
             let temporal = temporal_at(edge.created_at);
             let slot =
-                slot_definition_for_relation_family(&edge.edge_type, &batch.slot_definitions);
+                slot_definition_for_relation_family(&relation_family, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:relation-edge:{}:{}:{}",
@@ -188,8 +191,8 @@ pub fn normalize_memory_inputs(
                 target_entity_id: Some(edge.target_entity_id.clone()),
                 slot_key: slot
                     .map(|slot| slot.slot_key.to_owned())
-                    .unwrap_or_else(|| format!("relation.{}", edge.edge_type)),
-                relation_family: Some(edge.edge_type.clone()),
+                    .unwrap_or_else(|| format!("relation.{relation_family}")),
+                relation_family: Some(relation_family),
                 subject_label: entity_label(&label_by_id, &edge.source_entity_id),
                 object_label: entity_label(&label_by_id, &edge.target_entity_id),
                 object_entity_id: Some(edge.target_entity_id.clone()),
@@ -208,8 +211,9 @@ pub fn normalize_memory_inputs(
         }
 
         for judgment in &relation_sidecar.support_judgments {
+            let relation_family = normalize_relation_family_key(&judgment.edge_type).into_owned();
             let slot =
-                slot_definition_for_relation_family(&judgment.edge_type, &batch.slot_definitions);
+                slot_definition_for_relation_family(&relation_family, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:relation-support:{}:{}:{}",
@@ -220,8 +224,8 @@ pub fn normalize_memory_inputs(
                 target_entity_id: Some(judgment.target_entity_id.clone()),
                 slot_key: slot
                     .map(|slot| slot.slot_key.to_owned())
-                    .unwrap_or_else(|| format!("relation.{}", judgment.edge_type)),
-                relation_family: Some(judgment.edge_type.clone()),
+                    .unwrap_or_else(|| format!("relation.{relation_family}")),
+                relation_family: Some(relation_family),
                 subject_label: entity_label(&label_by_id, &judgment.source_entity_id),
                 object_label: entity_label(&label_by_id, &judgment.target_entity_id),
                 object_entity_id: Some(judgment.target_entity_id.clone()),
@@ -240,8 +244,9 @@ pub fn normalize_memory_inputs(
         }
 
         for judgment in &relation_sidecar.contradiction_judgments {
+            let relation_family = normalize_relation_family_key(&judgment.edge_type).into_owned();
             let slot =
-                slot_definition_for_relation_family(&judgment.edge_type, &batch.slot_definitions);
+                slot_definition_for_relation_family(&relation_family, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:relation-contradiction:{}:{}:{}",
@@ -252,8 +257,8 @@ pub fn normalize_memory_inputs(
                 target_entity_id: Some(judgment.target_entity_id.clone()),
                 slot_key: slot
                     .map(|slot| slot.slot_key.to_owned())
-                    .unwrap_or_else(|| format!("relation.{}", judgment.edge_type)),
-                relation_family: Some(judgment.edge_type.clone()),
+                    .unwrap_or_else(|| format!("relation.{relation_family}")),
+                relation_family: Some(relation_family),
                 subject_label: entity_label(&label_by_id, &judgment.source_entity_id),
                 object_label: entity_label(&label_by_id, &judgment.target_entity_id),
                 object_entity_id: Some(judgment.target_entity_id.clone()),
@@ -292,7 +297,10 @@ pub fn normalize_memory_inputs(
                 review_id: decision.case_id.clone(),
                 entity_id,
                 slot_key,
-                relation_family: decision.edge_type.clone(),
+                relation_family: decision
+                    .edge_type
+                    .as_deref()
+                    .map(|edge_type| normalize_relation_family_key(edge_type).into_owned()),
                 outcome: format!("{:?}", decision.outcome).to_lowercase(),
                 detail: decision.rationale.clone(),
                 confidence_millis: decision.score_millis.max(0) as u32,
@@ -323,17 +331,18 @@ pub fn normalize_memory_inputs(
             .copied()
             .unwrap_or(archive.manifest.created_at);
         for relation in &archive.relations {
+            let relation_family = normalize_relation_family_key(&relation.edge_type).into_owned();
             let key = (
                 archive.manifest.document_id.clone(),
                 relation.source_entity_id.0.clone(),
                 relation.target_entity_id.0.clone(),
-                relation.edge_type.clone(),
+                relation_family.clone(),
             );
             if archived_relation_keys.contains(&key) {
                 continue;
             }
             let slot =
-                slot_definition_for_relation_family(&relation.edge_type, &batch.slot_definitions);
+                slot_definition_for_relation_family(&relation_family, &batch.slot_definitions);
             let claim = MemoryClaimAtom {
                 claim_id: format!(
                     "claim:archive-relation:{}:{}:{}:{}",
@@ -347,8 +356,8 @@ pub fn normalize_memory_inputs(
                 target_entity_id: Some(relation.target_entity_id.clone()),
                 slot_key: slot
                     .map(|slot| slot.slot_key.to_owned())
-                    .unwrap_or_else(|| format!("relation.{}", relation.edge_type)),
-                relation_family: Some(relation.edge_type.clone()),
+                    .unwrap_or_else(|| format!("relation.{relation_family}")),
+                relation_family: Some(relation_family),
                 subject_label: entity_label(&label_by_id, &relation.source_entity_id),
                 object_label: entity_label(&label_by_id, &relation.target_entity_id),
                 object_entity_id: Some(relation.target_entity_id.clone()),

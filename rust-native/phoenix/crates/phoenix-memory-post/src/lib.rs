@@ -15,4 +15,8 @@ pub use worker::{
 };
 
 #[cfg(test)]
+mod relationship_conflict_tests;
+#[cfg(test)]
+mod scalar_conflict_tests;
+#[cfg(test)]
 mod tests;

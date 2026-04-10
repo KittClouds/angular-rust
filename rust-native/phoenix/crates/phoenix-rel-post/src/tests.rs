@@ -1,7 +1,8 @@
+use crate::worker::merge_relation_prediction_lanes;
 use crate::{
     apply_relation_patch_sidecar, build_relation_patch_sidecar, derive_scope_review_batch,
-    draft_relation_decisions, persist_relation_patch_sidecar, GlirelRelationPrediction,
-    GlirelRelationTypeSpec, RelationDecision, RelationDecisionKind,
+    draft_relation_decisions, persist_relation_patch_sidecar, run_primary_relation_lane,
+    GlirelRelationPrediction, GlirelRelationTypeSpec, RelationDecision, RelationDecisionKind,
 };
 use phoenix_semantic_v2::{
     scope_storage_key, AliasEntry, AliasPosting, CandidateEntity, DocumentArchive,
@@ -498,6 +499,54 @@ fn draft_relation_decisions_uses_family_thresholds() {
     assert!(decisions
         .iter()
         .any(|decision| decision.kind == RelationDecisionKind::Accept));
+}
+
+#[test]
+fn merge_relation_prediction_lanes_keeps_best_score_and_both_engines() {
+    let merged = merge_relation_prediction_lanes(
+        vec![GlirelRelationPrediction {
+            head_index: 0,
+            tail_index: 1,
+            head: "Alice".to_owned(),
+            tail: "Dynamis".to_owned(),
+            relation: "works_for".to_owned(),
+            confidence: 0.61,
+            evidence: vec!["glirel_score:0.610".to_owned()],
+        }],
+        vec![GlirelRelationPrediction {
+            head_index: 0,
+            tail_index: 1,
+            head: "Alice".to_owned(),
+            tail: "Dynamis".to_owned(),
+            relation: "works_for".to_owned(),
+            confidence: 0.74,
+            evidence: vec!["cue:works for".to_owned()],
+        }],
+    );
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].relation, "works_for");
+    assert_eq!(merged[0].confidence, 0.74);
+    assert!(merged[0]
+        .evidence
+        .iter()
+        .any(|value| value == "proposal_engine:glirel"));
+    assert!(merged[0]
+        .evidence
+        .iter()
+        .any(|value| value == "proposal_engine:heuristic"));
+}
+
+#[test]
+fn run_primary_relation_lane_without_model_uses_heuristics() {
+    let archive = sample_archive();
+    let mut batch = derive_scope_review_batch(&[archive], None, None, None, None, None);
+    run_primary_relation_lane(&mut batch, None, &crate::default_relation_type_specs())
+        .expect("heuristic lane");
+    assert!(batch.review_cases.iter().any(|case| {
+        case.glirel_predictions
+            .iter()
+            .any(|prediction| prediction.relation == "works_for")
+    }));
 }
 
 #[test]

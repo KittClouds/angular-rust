@@ -230,7 +230,10 @@ pub fn default_relation_type_specs() -> Vec<GlirelRelationTypeSpec> {
                 "joins".to_owned(),
                 "served".to_owned(),
                 "serves".to_owned(),
+                "serving under".to_owned(),
                 "employed by".to_owned(),
+                "employee of".to_owned(),
+                "employees of".to_owned(),
             ],
             conflicts_with: vec!["member_of".to_owned()],
             priority_millis: 120,
@@ -247,6 +250,8 @@ pub fn default_relation_type_specs() -> Vec<GlirelRelationTypeSpec> {
                 "member of".to_owned(),
                 "part of".to_owned(),
                 "belongs to".to_owned(),
+                "belonged to".to_owned(),
+                "affiliated with".to_owned(),
                 "under".to_owned(),
             ],
             conflicts_with: vec!["works_for".to_owned()],
@@ -274,6 +279,11 @@ pub fn default_relation_type_specs() -> Vec<GlirelRelationTypeSpec> {
                 "commanded".to_owned(),
                 "commands".to_owned(),
                 "led".to_owned(),
+                "leads".to_owned(),
+                "headed".to_owned(),
+                "heads".to_owned(),
+                "managed".to_owned(),
+                "manages".to_owned(),
                 "orders".to_owned(),
             ],
             conflicts_with: Vec::new(),
@@ -614,15 +624,21 @@ pub fn run_glirel_over_batch(
                 entity_id: Some(entity.entity_id.0.clone()),
             })
             .collect::<Vec<_>>();
-        let predictions = model
+        let model_predictions = model
             .extract_with_schema(&window.text, &entities, relation_specs, min_threshold)
             .map_err(GlirelWorkerError::Model)?;
+        let heuristic_predictions = extract_heuristic_relations(
+            &window.text,
+            &entities,
+            relation_specs,
+            &GlirelProposalConfig::default(),
+        );
         let filtered_predictions = filter_relation_predictions(
             &window.text,
             &window.entities,
             window.range.start as usize,
             relation_specs,
-            predictions,
+            merge_relation_prediction_lanes(model_predictions, heuristic_predictions),
         );
 
         let predictions_by_pair = filtered_predictions.into_iter().fold(
@@ -659,6 +675,64 @@ pub fn run_glirel_over_batch(
     }
 
     Ok(())
+}
+
+pub(crate) fn merge_relation_prediction_lanes(
+    model_predictions: Vec<GlirelRelationPrediction>,
+    heuristic_predictions: Vec<GlirelRelationPrediction>,
+) -> Vec<GlirelRelationPrediction> {
+    let mut merged = FxHashMap::<(usize, usize, String), GlirelRelationPrediction>::default();
+
+    for mut prediction in model_predictions {
+        prediction
+            .evidence
+            .push("proposal_engine:glirel".to_owned());
+        merged.insert(
+            (
+                prediction.head_index,
+                prediction.tail_index,
+                prediction.relation.clone(),
+            ),
+            prediction,
+        );
+    }
+
+    for mut prediction in heuristic_predictions {
+        prediction
+            .evidence
+            .push("proposal_engine:heuristic".to_owned());
+        let key = (
+            prediction.head_index,
+            prediction.tail_index,
+            prediction.relation.clone(),
+        );
+        match merged.get_mut(&key) {
+            Some(existing) => {
+                if prediction.confidence > existing.confidence {
+                    existing.confidence = prediction.confidence;
+                    existing.head = prediction.head.clone();
+                    existing.tail = prediction.tail.clone();
+                }
+                for evidence in prediction.evidence {
+                    if !existing.evidence.iter().any(|value| value == &evidence) {
+                        existing.evidence.push(evidence);
+                    }
+                }
+            }
+            None => {
+                merged.insert(key, prediction);
+            }
+        }
+    }
+
+    let mut rows = merged.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .confidence
+            .partial_cmp(&left.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows
 }
 
 pub fn run_primary_relation_lane(
@@ -3652,7 +3726,15 @@ fn filter_relation_predictions(
             prediction.relation.clone(),
         );
         match best_by_key.get(&key) {
-            Some(existing) if existing.confidence >= prediction.confidence => {}
+            Some(existing) if existing.confidence >= prediction.confidence => {
+                let mut existing = existing.clone();
+                for evidence in prediction.evidence {
+                    if !existing.evidence.iter().any(|value| value == &evidence) {
+                        existing.evidence.push(evidence);
+                    }
+                }
+                best_by_key.insert(key, existing);
+            }
             _ => {
                 best_by_key.insert(key, prediction);
             }
@@ -3836,7 +3918,10 @@ fn text_supports_relation(
                 " serves ",
                 " served ",
                 " serving ",
+                " serving under ",
                 " employed by ",
+                " employee of ",
+                " employees of ",
             ],
             false,
             96,
@@ -3847,7 +3932,14 @@ fn text_supports_relation(
             target_surface,
             source_span,
             target_span,
-            &[" member of ", " part of ", " belongs to ", " under "],
+            &[
+                " member of ",
+                " part of ",
+                " belongs to ",
+                " belonged to ",
+                " affiliated with ",
+                " under ",
+            ],
             false,
             96,
         ),
@@ -3867,7 +3959,17 @@ fn text_supports_relation(
             target_surface,
             source_span,
             target_span,
-            &[" commands ", " commanded ", " led ", " orders "],
+            &[
+                " commands ",
+                " commanded ",
+                " led ",
+                " leads ",
+                " headed ",
+                " heads ",
+                " managed ",
+                " manages ",
+                " orders ",
+            ],
             false,
             96,
         ),

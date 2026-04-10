@@ -255,6 +255,59 @@ fn classify_relation_family(
         };
     }
 
+    if contains_any(
+        &normalized,
+        &[
+            "located_in",
+            "located_at",
+            "based_in",
+            "lives_in",
+            "resides_in",
+            "stays_in",
+        ],
+    ) {
+        return reserved_spec(
+            "entity.location",
+            "location",
+            StateSlotOwnerType::Entity,
+            StateSlotValueType::EntityRef,
+        );
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "works_for",
+            "work_for",
+            "works",
+            "worked",
+            "employed_by",
+            "employee_of",
+        ],
+    ) {
+        return reserved_spec(
+            "entity.employer",
+            "affiliation",
+            StateSlotOwnerType::Entity,
+            StateSlotValueType::EntityRef,
+        );
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "member_of",
+            "belongs_to",
+            "joined",
+            "joins",
+            "affiliated_with",
+        ],
+    ) {
+        return reserved_spec(
+            "entity.membership",
+            "affiliation",
+            StateSlotOwnerType::Entity,
+            StateSlotValueType::EntityRef,
+        );
+    }
     if contains_any(&normalized, &["status", "phase"]) {
         return reserved_spec(
             "project.status",
@@ -295,7 +348,20 @@ fn classify_relation_family(
             StateSlotValueType::RankedChoice,
         );
     }
-    if contains_any(&normalized, &["role", "acts_as", "serves_as"]) {
+    if contains_any(
+        &normalized,
+        &[
+            "role",
+            "acts_as",
+            "serves_as",
+            "has_role",
+            "holds_role",
+            "leads",
+            "heads",
+            "manages",
+            "captains",
+        ],
+    ) {
         return reserved_spec(
             "entity.role",
             "role_preference",
@@ -355,4 +421,31 @@ fn should_filter_discovered_relation(relation_family: &str, family_key: &str) ->
         normalize_relation_family(relation_family).as_str(),
         "relates_to" | "meets" | "gives" | "attacks" | "talks_to" | "looks_at"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_relation_family, seed_definitions_by_relation};
+    use phoenix_semantic_v2::default_state_slot_definitions;
+
+    #[test]
+    fn maps_work_family_to_employer_slot() {
+        let seed_by_relation = seed_definitions_by_relation(&default_state_slot_definitions());
+        let spec = classify_relation_family("works", &seed_by_relation);
+        assert_eq!(spec.slot_key, "entity.employer");
+    }
+
+    #[test]
+    fn maps_join_family_to_membership_slot() {
+        let seed_by_relation = seed_definitions_by_relation(&default_state_slot_definitions());
+        let spec = classify_relation_family("joined", &seed_by_relation);
+        assert_eq!(spec.slot_key, "entity.membership");
+    }
+
+    #[test]
+    fn maps_resides_family_to_location_slot() {
+        let seed_by_relation = seed_definitions_by_relation(&default_state_slot_definitions());
+        let spec = classify_relation_family("resides_in", &seed_by_relation);
+        assert_eq!(spec.slot_key, "entity.location");
+    }
 }

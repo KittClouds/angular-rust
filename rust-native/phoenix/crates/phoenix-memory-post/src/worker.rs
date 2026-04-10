@@ -161,9 +161,12 @@ where
         annotate_memory_batch_with_event_identity(&mut batch, sidecar);
     }
     if let Some(memory_sidecar) = store.load_memory_patch_sidecar(&dirty.scope)? {
-        apply_memory_patch_sidecar(&mut batch, &memory_sidecar);
-        if let Some(event_identity_sidecar) = event_identity_sidecar.as_ref() {
-            annotate_memory_batch_with_event_identity(&mut batch, event_identity_sidecar);
+        batch.memory_generation = Some(memory_sidecar.generation);
+        if batch.claims.is_empty() && batch.states.is_empty() && batch.events.is_empty() {
+            apply_memory_patch_sidecar(&mut batch, &memory_sidecar);
+            if let Some(event_identity_sidecar) = event_identity_sidecar.as_ref() {
+                annotate_memory_batch_with_event_identity(&mut batch, event_identity_sidecar);
+            }
         }
     }
     Ok(batch)

@@ -30,6 +30,8 @@ fn prototype(node_id: &str, ann_kind: &'static str, node_kind: SemanticGraphNode
         },
         slot_key: Some("entity.employer".to_owned()),
         value_key: Some("acme".to_owned()),
+        primary_entity_id: None,
+        secondary_entity_id: None,
     }
 }
 

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gliner::model::input::text::TextInput;
 use gliner::model::params::Parameters;
@@ -27,8 +27,17 @@ const RELATION_SEED_BATCH_SIZE: usize = 4;
 
 impl RelationMentionSeeder {
     pub fn load(model_root: &Path, threshold: f32) -> Result<Self, String> {
-        let tokenizer_path = model_root.join("tokenizer.json");
-        let model_path = model_root.join("onnx").join("model.onnx");
+        let tokenizer_path =
+            find_existing_asset(model_root, &["tokenizer.json", "onnx\\tokenizer.json"])?;
+        let model_path = find_existing_asset(
+            model_root,
+            &[
+                "model_quantized.onnx",
+                "onnx\\model_quantized.onnx",
+                "model.onnx",
+                "onnx\\model.onnx",
+            ],
+        )?;
         let model = GLiNER::<SpanMode>::new(
             Parameters::default().with_threshold(threshold),
             RuntimeParameters::default(),
@@ -81,6 +90,19 @@ impl RelationMentionSeeder {
         }
         Ok(seeded)
     }
+}
+
+fn find_existing_asset(model_root: &Path, candidates: &[&str]) -> Result<PathBuf, String> {
+    for candidate in candidates {
+        let path = model_root.join(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "missing required GLiNER asset under {}",
+        model_root.display()
+    ))
 }
 
 fn relation_seed_labels() -> Vec<&'static str> {
@@ -205,4 +227,39 @@ fn is_generic_relation_surface(surface: &str) -> bool {
             | "father"
             | "mother"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_prefers_root_quantized_model_layout() {
+        let root = unique_test_dir("gliner-seed-assets");
+        std::fs::create_dir_all(root.join("onnx")).expect("create asset tree");
+        std::fs::write(root.join("tokenizer.json"), b"tokenizer").expect("write tokenizer");
+        std::fs::write(root.join("model_quantized.onnx"), b"quantized").expect("write model");
+        std::fs::write(root.join("onnx").join("model.onnx"), b"nested")
+            .expect("write nested model");
+        let resolved = find_existing_asset(
+            &root,
+            &[
+                "model_quantized.onnx",
+                "onnx\\model_quantized.onnx",
+                "model.onnx",
+                "onnx\\model.onnx",
+            ],
+        )
+        .expect("resolve model asset");
+        assert_eq!(resolved, root.join("model_quantized.onnx"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("phoenix-rel-post-{label}-{stamp}"))
+    }
 }

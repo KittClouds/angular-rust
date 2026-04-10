@@ -1,4 +1,7 @@
-use phoenix_graph_kernel::{KernelEdge, KernelStateIssue, KernelVertex, KernelViewRequest};
+use phoenix_graph_kernel::{
+    entity_timeline_from_snapshot, what_changed_from_snapshot, KernelEdge, KernelQueryView,
+    KernelStateIssue, KernelVertex, KernelViewRequest, KernelWhatChangedRequest,
+};
 use phoenix_store_native_core::{
     PhoenixGraphPatchStore, PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore,
 };
@@ -7,11 +10,13 @@ use phoenix_types::ScopeKey;
 use crate::api::{
     load_projection_kernel, rank_history_answer, GraphHistoryQueryRequest, GraphQueryError,
 };
+use crate::phase4_graph_scoring::apply_graph_structural_history;
+use crate::phase4_scoring::apply_phase4_history;
 use crate::retrieval::{
     GraphRetrievedHistoryAnswer, GraphRetrievedHistoryQueryRequest, GraphRetrievedSeed,
 };
 use crate::retrieval_common::{
-    build_region_from_snapshot, kernel_from_snapshot, now_ms, retrieve_query_seeds,
+    build_region_from_snapshot, build_region_from_view, now_ms, retrieve_query_seeds,
 };
 
 const HISTORY_RETRIEVAL_KINDS: [&str; 5] = ["state", "claim", "event", "chunk", "entity"];
@@ -36,26 +41,29 @@ where
         request.oversample,
     )?;
     let until_valid_at = request.until_valid_at.unwrap_or_else(now_ms);
-    let snapshot = kernel.view_as_of(KernelViewRequest {
+    let view = kernel.query_view(KernelViewRequest {
         valid_at: Some(until_valid_at),
         recorded_at: request.recorded_at,
         include_candidate_graph: request.include_candidate_graph,
     });
-    let (region_snapshot, region) = build_history_region(&snapshot, request, &seeds);
-    let region_kernel = kernel_from_snapshot(scope, &region_snapshot)?;
-    let timeline = region_kernel.entity_timeline(
+    let (region_snapshot, region) = build_history_region_from_view(&view, request, &seeds);
+    let timeline = entity_timeline_from_snapshot(
+        &region_snapshot,
         &request.entity_id,
         Some((request.since_valid_at, until_valid_at)),
         request.recorded_at.or(Some(until_valid_at)),
     );
-    let changes = region_kernel.what_changed(phoenix_graph_kernel::KernelWhatChangedRequest {
-        entity_id: request.entity_id.clone(),
-        slot_key: request.slot_key.clone(),
-        since_valid_at: request.since_valid_at,
-        until_valid_at: Some(until_valid_at),
-        recorded_at: request.recorded_at,
-        include_candidate_graph: request.include_candidate_graph,
-    });
+    let changes = what_changed_from_snapshot(
+        &timeline,
+        &KernelWhatChangedRequest {
+            entity_id: request.entity_id.clone(),
+            slot_key: request.slot_key.clone(),
+            since_valid_at: request.since_valid_at,
+            until_valid_at: Some(until_valid_at),
+            recorded_at: request.recorded_at,
+            include_candidate_graph: request.include_candidate_graph,
+        },
+    );
     let query = GraphHistoryQueryRequest {
         entity_id: request.entity_id.clone(),
         slot_key: request.slot_key.clone(),
@@ -66,26 +74,34 @@ where
         truth_plane: request.truth_plane,
         limit: request.limit,
     };
+    let mut ranked = rank_history_answer(
+        &query,
+        until_valid_at,
+        &timeline.vertices,
+        &region_snapshot.candidate_edges,
+        &changes,
+        &timeline_issues(
+            &timeline.vertices,
+            "conflict",
+            &request.entity_id,
+            request.slot_key.as_deref(),
+        ),
+        &timeline_issues(
+            &timeline.vertices,
+            "gap",
+            &request.entity_id,
+            request.slot_key.as_deref(),
+        ),
+    );
+    apply_phase4_history(request.query_text.as_str(), &mut ranked);
+    apply_graph_structural_history(
+        region.anchor_vertex_ids.as_slice(),
+        &region_snapshot,
+        &mut ranked,
+    );
     Ok(Some(GraphRetrievedHistoryAnswer {
         query_text: request.query_text.clone(),
-        answer: rank_history_answer(
-            &query,
-            until_valid_at,
-            &timeline.vertices,
-            &changes,
-            &timeline_issues(
-                &timeline.vertices,
-                "conflict",
-                &request.entity_id,
-                request.slot_key.as_deref(),
-            ),
-            &timeline_issues(
-                &timeline.vertices,
-                "gap",
-                &request.entity_id,
-                request.slot_key.as_deref(),
-            ),
-        ),
+        answer: ranked,
         query,
         seeds,
         region,
@@ -116,6 +132,38 @@ pub(crate) fn build_history_region(
         .collect::<Vec<_>>();
     build_region_from_snapshot(
         snapshot,
+        anchors,
+        seeds,
+        request.region_node_limit,
+        request.expansion_hops,
+        history_edge_allowed,
+    )
+}
+
+pub(crate) fn build_history_region_from_view(
+    view: &KernelQueryView<'_>,
+    request: &GraphRetrievedHistoryQueryRequest,
+    seeds: &[GraphRetrievedSeed],
+) -> (
+    phoenix_graph_kernel::KernelGraphSnapshot,
+    crate::retrieval::GraphRetrievedRegion,
+) {
+    let anchors = view
+        .vertices()
+        .iter()
+        .filter(|vertex| vertex.entity_id.as_deref() == Some(request.entity_id.as_str()))
+        .filter(|vertex| {
+            vertex.kind == "entity"
+                || request
+                    .slot_key
+                    .as_deref()
+                    .map(|slot_key| slot_key_of(vertex) == Some(slot_key))
+                    .unwrap_or(true)
+        })
+        .map(|vertex| vertex.id.0.clone())
+        .collect::<Vec<_>>();
+    build_region_from_view(
+        view,
         anchors,
         seeds,
         request.region_node_limit,
@@ -168,7 +216,8 @@ fn history_edge_allowed(edge: &KernelEdge) -> bool {
     matches!(
         edge.edge_type.0.as_str(),
         "state_of" | "state_value" | "supported_by" | "about" | "under_view"
-    ) || edge.edge_type.0.starts_with("semantic::")
+    ) || (edge.edge_type.0.starts_with("semantic::")
+        && edge.edge_type.0 != "semantic::missing_intermediate_cause")
 }
 
 fn slot_key_of(vertex: &KernelVertex) -> Option<&str> {

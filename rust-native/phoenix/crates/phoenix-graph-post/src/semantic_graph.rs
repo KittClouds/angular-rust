@@ -20,9 +20,14 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::semantic::{semantic_embedder, SemanticEmbedConfig};
+use crate::semantic_graph_causal_gap::collect_missing_intermediate_cause_edges_from_store;
+use crate::semantic_graph_contradiction::collect_contradictory_support_region_edges;
+use crate::semantic_graph_event::collect_related_event_edges_from_store;
 use crate::semantic_graph_nli::{
     adjudicate_candidates_with_nli, needs_nli_review, SemanticNliConfig,
 };
+use crate::semantic_graph_process::collect_same_process_edges_from_store;
+use crate::semantic_graph_soft::collect_same_slot_family_edges_from_store;
 use crate::semantic_graph_support::{
     build_prototypes, family_label, neighbor_families, node_kind_label, resolve_family,
     status_label, truth_planes_compatible, Prototype,
@@ -219,6 +224,50 @@ where
         config.oversample.max(config.neighbor_limit.max(1)),
         config.min_score_millis,
     )?;
+    candidates.extend(collect_same_slot_family_edges_from_store(
+        store,
+        scope,
+        &prototypes,
+        &embeddings,
+        config.neighbor_limit.max(1),
+        config.oversample.max(config.neighbor_limit.max(1)),
+        config.min_score_millis,
+    )?);
+    candidates.extend(collect_contradictory_support_region_edges(
+        &prototypes,
+        &embeddings,
+        memory_sidecar,
+        config.neighbor_limit.max(1),
+        config.min_score_millis,
+    ));
+    candidates.extend(collect_same_process_edges_from_store(
+        store,
+        scope,
+        &prototypes,
+        &embeddings,
+        config.neighbor_limit.max(1),
+        config.oversample.max(config.neighbor_limit.max(1)),
+        config.min_score_millis,
+    )?);
+    candidates.extend(collect_related_event_edges_from_store(
+        store,
+        scope,
+        &prototypes,
+        &embeddings,
+        config.neighbor_limit.max(1),
+        config.oversample.max(config.neighbor_limit.max(1)),
+        config.min_score_millis,
+    )?);
+    candidates.extend(collect_missing_intermediate_cause_edges_from_store(
+        store,
+        scope,
+        &prototypes,
+        &embeddings,
+        graph_sidecar,
+        config.neighbor_limit.max(1),
+        config.oversample.max(config.neighbor_limit.max(1)),
+        config.min_score_millis,
+    )?);
     if candidates
         .iter()
         .any(|candidate| needs_nli_review(candidate.family))
@@ -228,6 +277,7 @@ where
             adjudicate_candidates_with_nli(&mut candidates, &prototypes, &nli, nli_config)?;
         }
     }
+    candidates.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
     let batch = compile_candidate_graph_batch(scope_key, &prototypes, &candidates, created_at);
     let summary = summarize(&prototypes, &candidates);
     Ok(SemanticGraphScopeSidecar {
@@ -475,6 +525,9 @@ fn dedupe_key(family: SemanticEdgeFamily, source: &Prototype, target: &Prototype
         | SemanticEdgeFamily::ClaimContradiction
         | SemanticEdgeFamily::StateSupport
         | SemanticEdgeFamily::StateContradiction
+        | SemanticEdgeFamily::ContradictorySupportRegion
+        | SemanticEdgeFamily::SameProcess
+        | SemanticEdgeFamily::RelatedEvent
         | SemanticEdgeFamily::EventNeighbor => {
             let (left, right) = if source.node_id <= target.node_id {
                 (&source.node_id, &target.node_id)

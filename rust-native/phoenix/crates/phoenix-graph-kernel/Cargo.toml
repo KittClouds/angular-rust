@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 phoenix-graph = { path = "../phoenix-graph" }
 phoenix-types = { path = "../phoenix-types" }
+scirs2-graph = { version = "0.4.1", features = ["parallel"] }
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

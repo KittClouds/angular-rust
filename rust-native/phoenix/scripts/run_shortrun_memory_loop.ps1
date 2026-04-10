@@ -83,14 +83,11 @@ $seedReport = $seedJson | ConvertFrom-Json
 
 Write-Host "Running relation worker with GLiREL..."
 $relArgs = @("--store-path", $storePath, "--model-root", $ModelRoot, "--persist-patches", "--json", "--case-limit", "24")
-$relJson = Invoke-CargoJson -Package "phoenix-rel-post" -Bin "" -ProgramArgs $relArgs
+$relJson = Invoke-CargoJson -Package "phoenix-rel-post" -Bin "phoenix-rel-post" -ProgramArgs $relArgs
 $relReport = $relJson | ConvertFrom-Json
 
 Write-Host "Running memory compiler after relation patches..."
-$memoryAfterArgs = @("--store-path", $storePath, "--json", "--card-limit", "8")
-if ($PersistMemory) {
-    $memoryAfterArgs += "--persist-patches"
-}
+$memoryAfterArgs = @("--store-path", $storePath, "--json", "--card-limit", "8", "--persist-patches")
 $memoryAfterJson = Invoke-CargoJson -Package "phoenix-memory-post" -Bin "" -ProgramArgs $memoryAfterArgs
 $memoryAfter = $memoryAfterJson | ConvertFrom-Json
 

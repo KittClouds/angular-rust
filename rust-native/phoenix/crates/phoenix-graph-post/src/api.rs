@@ -6,9 +6,10 @@
 
 use phoenix_graph::GraphBackendError;
 use phoenix_graph_kernel::{
-    KernelBiTemporal, KernelEdge, KernelGraphLayer, KernelSlotAnswer, KernelSlotQueryRequest,
-    KernelStateChange, KernelStateIssue, KernelUnresolvedQueryRequest, KernelVertex,
-    KernelViewRequest, KernelWhatChangedRequest, PhoenixGraphKernel,
+    causal_path_candidate_views_from_snapshot, KernelBiTemporal, KernelCausalPathCandidateView,
+    KernelEdge, KernelGraphLayer, KernelSlotAnswer, KernelSlotQueryRequest, KernelStateChange,
+    KernelStateIssue, KernelUnresolvedQueryRequest, KernelVertex, KernelViewRequest,
+    KernelWhatChangedRequest, PhoenixGraphKernel,
 };
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixEventIdentityPatchStore,
@@ -16,9 +17,11 @@ use phoenix_store_native_core::{
     PhoenixTemporalPatchStore, StoreError,
 };
 use phoenix_types::{ScopeKey, SessionId};
-use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::phase4_contract::{
+    GraphPathRerankScore, GraphPhase4RerankScore, GraphStructuralRerankScore,
+};
 pub use crate::retrieval::{
     retrieved_causal_explanation, retrieved_history, retrieved_query, retrieved_world_state,
     GraphRetrievedCausalExplanationAnswer, GraphRetrievedCausalExplanationQueryRequest,
@@ -76,13 +79,19 @@ pub struct GraphRankedStateCandidate {
     pub temporal_fitness: f64,
     pub conflict_penalty: f64,
     pub gap_penalty: f64,
+    pub contradiction_region_penalty: f64,
     pub speculative_penalty: f64,
     pub relevant_conflict_count: usize,
     pub relevant_gap_count: usize,
+    pub contradiction_region_count: usize,
     #[serde(default)]
     pub supporting_modalities: Vec<String>,
     #[serde(default)]
     pub supporting_source_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_rerank: Option<GraphPhase4RerankScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_structural_rerank: Option<GraphStructuralRerankScore>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -144,13 +153,19 @@ pub struct GraphRankedHistoryCandidate {
     pub recency_score: f64,
     pub conflict_penalty: f64,
     pub gap_penalty: f64,
+    pub contradiction_region_penalty: f64,
     pub speculative_penalty: f64,
     pub relevant_conflict_count: usize,
     pub relevant_gap_count: usize,
+    pub contradiction_region_count: usize,
     #[serde(default)]
     pub supporting_modalities: Vec<String>,
     #[serde(default)]
     pub supporting_source_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_rerank: Option<GraphPhase4RerankScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_structural_rerank: Option<GraphStructuralRerankScore>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -237,6 +252,14 @@ pub struct GraphRankedCausalPath {
     pub supporting_modalities: Vec<String>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_rerank: Option<GraphPathRerankScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_rerank: Option<GraphPhase4RerankScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_rerank: Option<GraphPhase4RerankScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_structural_rerank: Option<GraphStructuralRerankScore>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -397,7 +420,11 @@ where
         recorded_at: request.recorded_at,
         include_candidate_graph: request.include_candidate_graph,
     });
-    Ok(Some(rank_world_state_answer(&snapshot.vertices, &answer)))
+    Ok(Some(rank_world_state_answer(
+        &snapshot.vertices,
+        &snapshot.candidate_edges,
+        &answer,
+    )))
 }
 
 pub fn what_is_unresolved<S>(
@@ -440,6 +467,11 @@ where
         return Ok(None);
     };
     let until_valid_at = request.until_valid_at.unwrap_or_else(now_ms);
+    let snapshot = kernel.view_as_of(KernelViewRequest {
+        valid_at: Some(until_valid_at),
+        recorded_at: request.recorded_at,
+        include_candidate_graph: request.include_candidate_graph,
+    });
     let timeline = kernel.entity_timeline(
         &request.entity_id,
         Some((request.since_valid_at, until_valid_at)),
@@ -469,6 +501,7 @@ where
         request,
         until_valid_at,
         &timeline.vertices,
+        &snapshot.candidate_edges,
         &changes,
         &conflicts,
         &gaps,
@@ -537,16 +570,22 @@ where
 
 pub(crate) fn rank_world_state_answer(
     vertices: &[KernelVertex],
+    candidate_edges: &[KernelEdge],
     answer: &KernelSlotAnswer,
 ) -> GraphRankedSlotAnswer {
     let claim_by_id = claim_vertex_index(vertices);
 
     let mut candidates = Vec::new();
     if let Some(active) = answer.active_state.as_ref() {
-        candidates.push(rank_candidate(active, answer, &claim_by_id));
+        candidates.push(rank_candidate(
+            active,
+            answer,
+            candidate_edges,
+            &claim_by_id,
+        ));
     }
     for state in &answer.competing_states {
-        candidates.push(rank_candidate(state, answer, &claim_by_id));
+        candidates.push(rank_candidate(state, answer, candidate_edges, &claim_by_id));
     }
     candidates.sort_by(|left, right| {
         right
@@ -600,6 +639,7 @@ pub fn rank_history_answer(
     request: &GraphHistoryQueryRequest,
     until_valid_at: i64,
     vertices: &[KernelVertex],
+    candidate_edges: &[KernelEdge],
     changes: &[KernelStateChange],
     conflicts: &[KernelStateIssue],
     gaps: &[KernelStateIssue],
@@ -612,6 +652,7 @@ pub fn rank_history_answer(
                 change,
                 conflicts,
                 gaps,
+                candidate_edges,
                 &claim_by_id,
                 request.truth_plane,
                 request.since_valid_at,
@@ -693,18 +734,24 @@ pub fn rank_causal_explanation_answer(
         };
     }
 
-    let all_edges = snapshot
-        .asserted_edges
-        .iter()
-        .chain(snapshot.candidate_edges.iter())
-        .collect::<Vec<_>>();
-    let outgoing_edges = outgoing_edge_index(all_edges.as_slice());
-    let causal_candidates = causal_path_candidates(
-        request,
-        &vertex_by_id,
-        &outgoing_edges,
-        all_edges.as_slice(),
-    );
+    let candidate_limit = request.limit.unwrap_or(8).saturating_mul(4).clamp(12, 64);
+    let mut causal_candidates = causal_path_candidate_views_from_snapshot(
+        snapshot,
+        request.target_vertex_id.as_str(),
+        request.max_depth,
+        candidate_limit,
+    )
+    .into_iter()
+    .map(|candidate| rank_causal_path(request, &vertex_by_id, &candidate))
+    .collect::<Vec<_>>();
+    causal_candidates.sort_by(|left, right| {
+        right
+            .answer_score
+            .partial_cmp(&left.answer_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.source_vertex_id.cmp(&right.source_vertex_id))
+    });
+    causal_candidates.truncate(request.limit.unwrap_or(8));
     let selected = causal_candidates
         .iter()
         .find(|candidate| candidate.plane_allowed)
@@ -762,125 +809,6 @@ fn vertex_index(vertices: &[KernelVertex]) -> std::collections::BTreeMap<&str, &
         .collect::<std::collections::BTreeMap<_, _>>()
 }
 
-fn outgoing_edge_index<'a>(edges: &[&'a KernelEdge]) -> FxHashMap<&'a str, Vec<&'a KernelEdge>> {
-    let mut index = FxHashMap::<&str, Vec<&KernelEdge>>::default();
-    for edge in edges {
-        index
-            .entry(edge.source_id.0.as_str())
-            .or_default()
-            .push(*edge);
-    }
-    for edges in index.values_mut() {
-        edges.sort_by(|left, right| {
-            right
-                .provenance
-                .confidence
-                .partial_cmp(&left.provenance.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.target_id.0.cmp(&right.target_id.0))
-        });
-    }
-    index
-}
-
-fn causal_path_candidates(
-    request: &GraphCausalExplanationQueryRequest,
-    vertex_by_id: &std::collections::BTreeMap<&str, &KernelVertex>,
-    outgoing_edges: &FxHashMap<&str, Vec<&KernelEdge>>,
-    all_edges: &[&KernelEdge],
-) -> Vec<GraphRankedCausalPath> {
-    let mut incoming = FxHashMap::<&str, Vec<&KernelEdge>>::default();
-    for edge in all_edges {
-        if edge.edge_type.0 == "causal_link" {
-            incoming
-                .entry(edge.target_id.0.as_str())
-                .or_default()
-                .push(*edge);
-        }
-    }
-    for edges in incoming.values_mut() {
-        edges.sort_by(|left, right| {
-            right
-                .provenance
-                .confidence
-                .partial_cmp(&left.provenance.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.source_id.0.cmp(&right.source_id.0))
-        });
-        edges.truncate(8);
-    }
-
-    #[derive(Clone)]
-    struct CausalTraversal<'a> {
-        current_id: String,
-        path_vertex_ids: Vec<String>,
-        path_edges: Vec<&'a KernelEdge>,
-        visited: FxHashSet<String>,
-    }
-
-    let max_depth = request.max_depth.clamp(1, 5);
-    let max_candidates = request.limit.unwrap_or(8).saturating_mul(4).clamp(12, 64);
-    let mut stack = vec![CausalTraversal {
-        current_id: request.target_vertex_id.clone(),
-        path_vertex_ids: vec![request.target_vertex_id.clone()],
-        path_edges: Vec::new(),
-        visited: [request.target_vertex_id.clone()].into_iter().collect(),
-    }];
-    let mut candidates = Vec::new();
-
-    while let Some(frame) = stack.pop() {
-        let Some(edges) = incoming.get(frame.current_id.as_str()) else {
-            continue;
-        };
-        for edge in edges {
-            if frame.visited.contains(edge.source_id.0.as_str()) {
-                continue;
-            }
-            let mut path_vertex_ids = Vec::with_capacity(frame.path_vertex_ids.len() + 1);
-            path_vertex_ids.push(edge.source_id.0.clone());
-            path_vertex_ids.extend(frame.path_vertex_ids.iter().cloned());
-
-            let mut path_edges = Vec::with_capacity(frame.path_edges.len() + 1);
-            path_edges.push(*edge);
-            path_edges.extend(frame.path_edges.iter().copied());
-
-            candidates.push(rank_causal_path(
-                request,
-                vertex_by_id,
-                outgoing_edges,
-                path_vertex_ids.as_slice(),
-                path_edges.as_slice(),
-            ));
-            if candidates.len() >= max_candidates {
-                break;
-            }
-            if path_edges.len() < max_depth {
-                let mut visited = frame.visited.clone();
-                visited.insert(edge.source_id.0.clone());
-                stack.push(CausalTraversal {
-                    current_id: edge.source_id.0.clone(),
-                    path_vertex_ids,
-                    path_edges,
-                    visited,
-                });
-            }
-        }
-        if candidates.len() >= max_candidates {
-            break;
-        }
-    }
-
-    candidates.sort_by(|left, right| {
-        right
-            .answer_score
-            .partial_cmp(&left.answer_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.source_vertex_id.cmp(&right.source_vertex_id))
-    });
-    candidates.truncate(request.limit.unwrap_or(8));
-    candidates
-}
-
 pub(crate) fn load_projection_kernel<S>(
     store: &S,
     scope: &ScopeKey,
@@ -902,6 +830,7 @@ where
 fn rank_candidate(
     state: &phoenix_graph_kernel::KernelSlotState,
     answer: &KernelSlotAnswer,
+    candidate_edges: &[KernelEdge],
     claim_by_id: &std::collections::BTreeMap<String, &KernelVertex>,
 ) -> GraphRankedStateCandidate {
     let (claim_vertices, supporting_modalities, supporting_source_classes) =
@@ -914,12 +843,19 @@ fn rank_candidate(
     let temporal_fitness = temporal_fitness(&state.temporal);
     let relevant_conflict_count = relevant_issue_count(&answer.conflicts, state);
     let relevant_gap_count = relevant_issue_count(&answer.gaps, state);
+    let contradiction_region_count = contradiction_region_count(
+        candidate_edges,
+        state.state_vertex_id.as_str(),
+        state.supporting_claim_ids.as_slice(),
+    );
     let conflict_penalty = (relevant_conflict_count as f64 * 0.18).min(0.45);
     let gap_penalty = (relevant_gap_count as f64 * 0.14).min(0.45);
+    let contradiction_region_penalty = (contradiction_region_count as f64 * 0.12).min(0.36);
     let speculative_penalty = speculative_penalty(truth_plane);
     let answer_score = plane_gate + status_prior + support_strength + temporal_fitness
         - conflict_penalty
         - gap_penalty
+        - contradiction_region_penalty
         - speculative_penalty;
 
     GraphRankedStateCandidate {
@@ -933,11 +869,15 @@ fn rank_candidate(
         temporal_fitness,
         conflict_penalty,
         gap_penalty,
+        contradiction_region_penalty,
         speculative_penalty,
         relevant_conflict_count,
         relevant_gap_count,
+        contradiction_region_count,
         supporting_modalities,
         supporting_source_classes,
+        query_rerank: None,
+        graph_structural_rerank: None,
     }
 }
 
@@ -1070,6 +1010,7 @@ fn rank_history_candidate(
     change: &KernelStateChange,
     conflicts: &[KernelStateIssue],
     gaps: &[KernelStateIssue],
+    candidate_edges: &[KernelEdge],
     claim_by_id: &std::collections::BTreeMap<String, &KernelVertex>,
     requested_plane: GraphTruthPlane,
     since_valid_at: i64,
@@ -1090,13 +1031,20 @@ fn rank_history_candidate(
         history_recency_score(&change.state.temporal, since_valid_at, until_valid_at);
     let relevant_conflict_count = relevant_timeline_issue_count(conflicts, &change.state);
     let relevant_gap_count = relevant_timeline_issue_count(gaps, &change.state);
+    let contradiction_region_count = contradiction_region_count(
+        candidate_edges,
+        change.state.state_vertex_id.as_str(),
+        change.state.supporting_claim_ids.as_slice(),
+    );
     let conflict_penalty = (relevant_conflict_count as f64 * 0.16).min(0.5);
     let gap_penalty = (relevant_gap_count as f64 * 0.12).min(0.4);
+    let contradiction_region_penalty = (contradiction_region_count as f64 * 0.11).min(0.33);
     let speculative_penalty = speculative_penalty(truth_plane);
     let answer_score =
         plane_gate + status_prior + support_strength + temporal_fitness + recency_score
             - conflict_penalty
             - gap_penalty
+            - contradiction_region_penalty
             - speculative_penalty;
 
     GraphRankedHistoryCandidate {
@@ -1111,11 +1059,15 @@ fn rank_history_candidate(
         recency_score,
         conflict_penalty,
         gap_penalty,
+        contradiction_region_penalty,
         speculative_penalty,
         relevant_conflict_count,
         relevant_gap_count,
+        contradiction_region_count,
         supporting_modalities,
         supporting_source_classes,
+        query_rerank: None,
+        graph_structural_rerank: None,
     }
 }
 
@@ -1139,6 +1091,40 @@ fn relevant_issue_count(
         .count()
 }
 
+fn contradiction_region_count(
+    candidate_edges: &[KernelEdge],
+    state_vertex_id: &str,
+    supporting_claim_ids: &[String],
+) -> usize {
+    candidate_edges
+        .iter()
+        .filter(|edge| edge.edge_type.0 == "semantic::contradictory_support_region")
+        .filter(|edge| {
+            edge_touches_state_or_support_claims(edge, state_vertex_id, supporting_claim_ids)
+        })
+        .count()
+}
+
+fn edge_touches_state_or_support_claims(
+    edge: &KernelEdge,
+    state_vertex_id: &str,
+    supporting_claim_ids: &[String],
+) -> bool {
+    edge.source_id.0 == state_vertex_id
+        || edge.target_id.0 == state_vertex_id
+        || edge_touches_supporting_claim(edge.source_id.0.as_str(), supporting_claim_ids)
+        || edge_touches_supporting_claim(edge.target_id.0.as_str(), supporting_claim_ids)
+}
+
+fn edge_touches_supporting_claim(endpoint_id: &str, supporting_claim_ids: &[String]) -> bool {
+    let Some(claim_id) = endpoint_id.strip_prefix("graph::claim::") else {
+        return false;
+    };
+    supporting_claim_ids
+        .iter()
+        .any(|candidate| candidate == claim_id)
+}
+
 fn speculative_penalty(plane: GraphTruthPlane) -> f64 {
     match plane {
         GraphTruthPlane::WorldState | GraphTruthPlane::Unknown => 0.0,
@@ -1153,29 +1139,28 @@ fn speculative_penalty(plane: GraphTruthPlane) -> f64 {
 fn rank_causal_path(
     request: &GraphCausalExplanationQueryRequest,
     vertex_by_id: &std::collections::BTreeMap<&str, &KernelVertex>,
-    outgoing_edges: &FxHashMap<&str, Vec<&KernelEdge>>,
-    path_vertex_ids: &[String],
-    path_edges: &[&KernelEdge],
+    candidate: &KernelCausalPathCandidateView<'_>,
 ) -> GraphRankedCausalPath {
-    let supporting_modalities =
-        collect_path_modalities(path_vertex_ids, vertex_by_id, outgoing_edges);
+    let supporting_modalities = candidate.supporting_modalities.clone();
     let truth_plane = derive_truth_plane(&supporting_modalities);
     let plane_allowed = plane_allowed_for(request.truth_plane, truth_plane);
     let plane_gate = plane_gate(request.truth_plane, truth_plane);
-    let path_stability = causal_path_stability(path_edges);
-    let support_strength = causal_support_strength(path_edges);
-    let temporal_fitness = causal_temporal_fitness(path_vertex_ids, vertex_by_id);
-    let depth_penalty = (path_edges.len().saturating_sub(1) as f64 * 0.12).min(0.48);
+    let path_stability = candidate.features.path_stability;
+    let support_strength = candidate.features.support_strength;
+    let temporal_fitness = candidate.features.temporal_consistency_ratio;
+    let depth_penalty = (candidate.features.depth.saturating_sub(1) as f64 * 0.12).min(0.48);
     let speculative_penalty = speculative_penalty(truth_plane);
     let answer_score = plane_gate + path_stability + support_strength + temporal_fitness
         - depth_penalty
         - speculative_penalty;
-    let mut evidence_refs = path_edges
+    let mut evidence_refs = candidate
+        .path_edges
         .iter()
         .flat_map(|edge| edge.provenance.evidence_refs.iter().cloned())
         .collect::<Vec<_>>();
     sort_and_dedup_strings(&mut evidence_refs);
-    let hops = path_edges
+    let hops = candidate
+        .path_edges
         .iter()
         .map(|edge| GraphCausalHop {
             source_id: edge.source_id.0.clone(),
@@ -1210,11 +1195,12 @@ fn rank_causal_path(
 
     GraphRankedCausalPath {
         target_vertex_id: request.target_vertex_id.clone(),
-        source_vertex_id: path_vertex_ids
-            .first()
-            .cloned()
-            .unwrap_or_else(|| request.target_vertex_id.clone()),
-        path_vertex_ids: path_vertex_ids.to_vec(),
+        source_vertex_id: candidate.source_vertex_id.to_owned(),
+        path_vertex_ids: candidate
+            .path_vertex_ids
+            .iter()
+            .map(|vertex_id| (*vertex_id).to_owned())
+            .collect(),
         hops,
         truth_plane,
         plane_allowed,
@@ -1227,165 +1213,22 @@ fn rank_causal_path(
         speculative_penalty,
         supporting_modalities,
         evidence_refs,
+        path_rerank: None,
+        query_rerank: None,
+        event_rerank: None,
+        graph_structural_rerank: None,
     }
 }
 
-fn causal_path_stability(path_edges: &[&KernelEdge]) -> f64 {
-    if path_edges.is_empty() {
-        return 0.0;
+fn normalize_modality_label(label: &str) -> Option<&'static str> {
+    match label {
+        "asserted" | "observed" | "inferred" | "negated" => Some("asserted"),
+        "reported" | "reportedSpeech" | "attributedClaim" => Some("reported"),
+        "conditional" => Some("conditional"),
+        "hypothetical" => Some("hypothetical"),
+        "planned" => Some("planned"),
+        _ => None,
     }
-    let score = path_edges
-        .iter()
-        .map(|edge| {
-            let status = edge
-                .attributes
-                .get("status")
-                .and_then(serde_json::Value::as_str);
-            let mut score = status_prior(status);
-            if matches!(edge.layer, KernelGraphLayer::Candidate) {
-                score *= 0.8;
-            }
-            score
-        })
-        .sum::<f64>();
-    score / path_edges.len() as f64
-}
-
-fn causal_support_strength(path_edges: &[&KernelEdge]) -> f64 {
-    if path_edges.is_empty() {
-        return 0.0;
-    }
-    let avg_confidence = path_edges
-        .iter()
-        .map(|edge| edge.provenance.confidence.unwrap_or(0.5))
-        .sum::<f64>()
-        / path_edges.len() as f64;
-    let evidence_count = path_edges
-        .iter()
-        .map(|edge| edge.provenance.evidence_refs.len())
-        .sum::<usize>()
-        .min(10) as f64
-        / 10.0;
-    (avg_confidence * 0.8) + (evidence_count * 0.2)
-}
-
-fn causal_temporal_fitness(
-    path_vertex_ids: &[String],
-    vertex_by_id: &std::collections::BTreeMap<&str, &KernelVertex>,
-) -> f64 {
-    if path_vertex_ids.len() <= 1 {
-        return 1.0;
-    }
-    let mut consistent = 0usize;
-    let mut total = 0usize;
-    for pair in path_vertex_ids.windows(2) {
-        let Some(source) = vertex_by_id.get(pair[0].as_str()) else {
-            continue;
-        };
-        let Some(target) = vertex_by_id.get(pair[1].as_str()) else {
-            continue;
-        };
-        total += 1;
-        if temporal_pair_consistent(&source.temporal, &target.temporal) {
-            consistent += 1;
-        }
-    }
-    if total == 0 {
-        0.7
-    } else {
-        consistent as f64 / total as f64
-    }
-}
-
-fn temporal_pair_consistent(source: &KernelBiTemporal, target: &KernelBiTemporal) -> bool {
-    match (source.valid_from, target.valid_from) {
-        (Some(source_start), Some(target_start)) => source_start <= target_start,
-        _ => match (source.valid_to, target.valid_from) {
-            (Some(source_end), Some(target_start)) => source_end <= target_start,
-            _ => true,
-        },
-    }
-}
-
-fn collect_path_modalities(
-    path_vertex_ids: &[String],
-    vertex_by_id: &std::collections::BTreeMap<&str, &KernelVertex>,
-    outgoing_edges: &FxHashMap<&str, Vec<&KernelEdge>>,
-) -> Vec<String> {
-    let mut modalities = path_vertex_ids
-        .iter()
-        .flat_map(|vertex_id| collect_vertex_modalities(vertex_id, vertex_by_id, outgoing_edges))
-        .collect::<Vec<_>>();
-    sort_and_dedup_strings(&mut modalities);
-    modalities
-}
-
-fn collect_vertex_modalities(
-    vertex_id: &str,
-    vertex_by_id: &std::collections::BTreeMap<&str, &KernelVertex>,
-    outgoing_edges: &FxHashMap<&str, Vec<&KernelEdge>>,
-) -> Vec<String> {
-    let mut modalities = Vec::new();
-    if let Some(vertex) = vertex_by_id.get(vertex_id) {
-        if vertex.kind == "claim" {
-            if let Some(modality) = vertex
-                .value
-                .get("modality")
-                .and_then(serde_json::Value::as_str)
-                .and_then(normalize_modality_label)
-            {
-                modalities.push(modality.to_owned());
-            }
-        }
-    }
-    if let Some(edges) = outgoing_edges.get(vertex_id) {
-        for edge in edges {
-            match edge.edge_type.0.as_str() {
-                "supported_by" => {
-                    if let Some(claim) = vertex_by_id.get(edge.target_id.0.as_str()) {
-                        if let Some(modality) = claim
-                            .value
-                            .get("modality")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(normalize_modality_label)
-                        {
-                            modalities.push(modality.to_owned());
-                        }
-                    }
-                }
-                "under_view" => {
-                    if let Some(view) = vertex_by_id.get(edge.target_id.0.as_str()) {
-                        if let Some(modality) = view
-                            .value
-                            .get("modality")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(normalize_modality_label)
-                        {
-                            modalities.push(modality.to_owned());
-                        }
-                        if let Some(modality) = view
-                            .value
-                            .get("modalitySemantics")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(normalize_modality_label)
-                        {
-                            modalities.push(modality.to_owned());
-                        }
-                        if matches!(
-                            view.value
-                                .get("sourceSemantics")
-                                .and_then(serde_json::Value::as_str),
-                            Some("reportedSpeech" | "attributedClaim")
-                        ) {
-                            modalities.push("reported".to_owned());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    modalities
 }
 
 fn collect_timeline_issues(
@@ -1498,17 +1341,6 @@ fn plane_gate(requested_plane: GraphTruthPlane, candidate_plane: GraphTruthPlane
         1.0
     } else {
         0.0
-    }
-}
-
-fn normalize_modality_label(label: &str) -> Option<&'static str> {
-    match label {
-        "asserted" | "observed" | "inferred" | "negated" => Some("asserted"),
-        "reported" | "reportedSpeech" | "attributedClaim" => Some("reported"),
-        "conditional" => Some("conditional"),
-        "hypothetical" => Some("hypothetical"),
-        "planned" => Some("planned"),
-        _ => None,
     }
 }
 

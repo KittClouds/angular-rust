@@ -12,6 +12,31 @@ use std::any::Any;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod borrowed;
+mod causal;
+mod causal_view;
+mod query_view;
+mod region;
+mod snapshot_query;
+mod structural;
+
+pub use borrowed::{KernelCsrRef, KernelGraphRef};
+pub use causal::{causal_path_candidates_from_snapshot, KernelCausalPathCandidate};
+pub use causal_view::{
+    causal_path_candidate_views_from_snapshot, KernelCausalPathCandidateView,
+    KernelCausalPathFeatures,
+};
+pub use query_view::KernelQueryView;
+pub use region::{expand_snapshot_region, KernelExpandedRegion};
+pub use snapshot_query::{
+    entity_timeline_from_snapshot, slot_at_snapshot, unresolved_from_snapshot,
+    what_changed_from_snapshot,
+};
+pub use structural::{KernelStructuralAnalytics, KernelStructuralScore};
+
+#[cfg(test)]
+mod causal_view_tests;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct KernelVertexId(pub String);
@@ -936,42 +961,7 @@ impl PhoenixGraphKernel {
             request.recorded_at,
             request.include_candidate_graph,
         );
-        let mut states = collect_slot_states(
-            &snapshot.vertices,
-            &snapshot.asserted_edges,
-            &request.entity_id,
-            &request.slot_key,
-        );
-        states.sort_by(compare_slot_states);
-        let mut conflicts = collect_state_issues(
-            &snapshot.vertices,
-            &snapshot.asserted_edges,
-            "conflict",
-            &request.entity_id,
-            Some(request.slot_key.as_str()),
-            false,
-        );
-        let mut gaps = collect_state_issues(
-            &snapshot.vertices,
-            &snapshot.asserted_edges,
-            "gap",
-            &request.entity_id,
-            Some(request.slot_key.as_str()),
-            false,
-        );
-        conflicts.sort_by(compare_state_issues);
-        gaps.sort_by(compare_state_issues);
-
-        let active_state = states.first().cloned();
-        let competing_states = states.into_iter().skip(1).collect::<Vec<_>>();
-        KernelSlotAnswer {
-            entity_id: request.entity_id,
-            slot_key: request.slot_key,
-            active_state,
-            competing_states,
-            conflicts,
-            gaps,
-        }
+        slot_at_snapshot(&snapshot, &request)
     }
 
     pub fn what_is_unresolved(
@@ -983,24 +973,7 @@ impl PhoenixGraphKernel {
             request.recorded_at,
             request.include_candidate_graph,
         );
-        let mut issues = collect_state_issues(
-            &snapshot.vertices,
-            &snapshot.asserted_edges,
-            "conflict",
-            &request.entity_id,
-            request.slot_key.as_deref(),
-            true,
-        );
-        issues.extend(collect_state_issues(
-            &snapshot.vertices,
-            &snapshot.asserted_edges,
-            "gap",
-            &request.entity_id,
-            request.slot_key.as_deref(),
-            true,
-        ));
-        issues.sort_by(compare_state_issues);
-        issues
+        unresolved_from_snapshot(&snapshot, &request)
     }
 
     pub fn what_changed(&self, request: KernelWhatChangedRequest) -> Vec<KernelStateChange> {
@@ -1010,39 +983,7 @@ impl PhoenixGraphKernel {
             Some((request.since_valid_at, until)),
             request.recorded_at.or(Some(until)),
         );
-        let mut changes = timeline
-            .vertices
-            .iter()
-            .filter(|vertex| {
-                vertex.kind == "state"
-                    && vertex.entity_id.as_deref() == Some(request.entity_id.as_str())
-                    && request
-                        .slot_key
-                        .as_deref()
-                        .map(|slot_key| vertex_slot_key(vertex) == Some(slot_key))
-                        .unwrap_or(true)
-            })
-            .filter_map(|vertex| {
-                classify_state_change(&vertex.temporal, request.since_valid_at, until).map(
-                    |change_kind| KernelStateChange {
-                        change_kind,
-                        state: build_slot_state(
-                            vertex,
-                            &timeline.asserted_edges,
-                            &request.entity_id,
-                        ),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        changes.sort_by(|left, right| {
-            left.state
-                .temporal
-                .valid_from
-                .cmp(&right.state.temporal.valid_from)
-                .then_with(|| left.state.state_vertex_id.cmp(&right.state.state_vertex_id))
-        });
-        changes
+        what_changed_from_snapshot(&timeline, &request)
     }
 
     pub fn calendar_slice(&self, request: KernelCalendarWindowRequest) -> KernelGraphSnapshot {

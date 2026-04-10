@@ -2094,6 +2094,7 @@ fn build_native_structure_rows(
     scan: &NativeScanRows,
     chunks: &[ChunkRecord],
 ) -> NativeStructureRows {
+    let relation_canonical_mentions = build_relation_canonical_mentions(scan);
     let mut sentence_mentions = vec![SmallVec::<[usize; 8]>::new(); scan.sentences.len()];
     for (mention_ix, mention) in scan.mentions.iter().enumerate() {
         if let Some(bucket) = sentence_mentions.get_mut(mention.sentence_index) {
@@ -2119,17 +2120,12 @@ fn build_native_structure_rows(
             .unwrap_or_default();
         for hit_ix in hit_indexes {
             let hit = &scan.narrative_hits[hit_ix];
-            let mut subject_mention_ix = None;
-            let mut object_mention_ix = None;
-            for mention_ix in &mention_indexes {
-                let mention = &scan.mentions[*mention_ix];
-                if mention.range.end <= hit.range.start {
-                    subject_mention_ix = Some(*mention_ix);
-                } else if mention.range.start >= hit.range.end {
-                    object_mention_ix = Some(*mention_ix);
-                    break;
-                }
-            }
+            let (subject_mention_ix, object_mention_ix) = select_relation_seed_pair(
+                scan,
+                &mention_indexes,
+                hit,
+                &relation_canonical_mentions,
+            );
             relation_seeds.push(NativeRelationSeed {
                 sentence_index: sentence.index,
                 relation_type: hit.relation_type.clone(),
@@ -2143,6 +2139,435 @@ fn build_native_structure_rows(
         relation_seeds,
         sentence_chunk_indexes: sentence_chunk_indexes(&scan.sentences, chunks),
     }
+}
+
+fn build_relation_canonical_mentions(scan: &NativeScanRows) -> Vec<usize> {
+    let mut mention_ix_by_range = FxHashMap::<(u32, u32), usize>::default();
+    for (mention_ix, mention) in scan.mentions.iter().enumerate() {
+        mention_ix_by_range.insert((mention.range.start, mention.range.end), mention_ix);
+    }
+
+    let mut pronoun_target_by_mention_ix = FxHashMap::<usize, usize>::default();
+    for link in &scan.resolver_links {
+        if link.link_kind != Some(ResolverLinkKind::Pronoun) {
+            continue;
+        }
+        let Some(target_range) = link.target_range else {
+            continue;
+        };
+        let Some(&source_ix) =
+            mention_ix_by_range.get(&(link.source_range.start, link.source_range.end))
+        else {
+            continue;
+        };
+        let Some(&target_ix) = mention_ix_by_range.get(&(target_range.start, target_range.end))
+        else {
+            continue;
+        };
+        pronoun_target_by_mention_ix.insert(source_ix, target_ix);
+    }
+
+    let mut canonical_mentions = Vec::with_capacity(scan.mentions.len());
+    for mention_ix in 0..scan.mentions.len() {
+        let mut canonical_ix = mention_ix;
+        if scan.mention_coref_kinds[mention_ix] == CorefMentionKind::Pronoun {
+            if let Some(target_ix) = pronoun_target_by_mention_ix.get(&mention_ix).copied() {
+                canonical_ix = target_ix;
+            }
+        }
+        if let Some(family_ord) = scan.family_ord_by_mention[canonical_ix] {
+            if let Some(family) = scan.mention_families.get(family_ord as usize) {
+                canonical_ix = family.representative_mention_ix;
+            }
+        }
+        canonical_mentions.push(canonical_ix);
+    }
+    canonical_mentions
+}
+
+fn select_relation_seed_pair(
+    scan: &NativeScanRows,
+    mention_indexes: &[usize],
+    hit: &NarrativeVerbHit,
+    relation_canonical_mentions: &[usize],
+) -> (Option<usize>, Option<usize>) {
+    let subject_candidates = mention_indexes
+        .iter()
+        .copied()
+        .filter(|mention_ix| scan.mentions[*mention_ix].range.end <= hit.range.start)
+        .collect::<SmallVec<[usize; 8]>>();
+    let object_candidates = mention_indexes
+        .iter()
+        .copied()
+        .filter(|mention_ix| scan.mentions[*mention_ix].range.start >= hit.range.end)
+        .collect::<SmallVec<[usize; 8]>>();
+
+    if let Some((subject_mention_ix, object_mention_ix)) = select_best_relation_pair(
+        scan,
+        &subject_candidates,
+        &object_candidates,
+        hit,
+        relation_canonical_mentions,
+        false,
+    ) {
+        return (Some(subject_mention_ix), Some(object_mention_ix));
+    }
+
+    if let Some((subject_mention_ix, object_mention_ix)) = select_best_relation_pair(
+        scan,
+        mention_indexes,
+        mention_indexes,
+        hit,
+        relation_canonical_mentions,
+        true,
+    ) {
+        return (Some(subject_mention_ix), Some(object_mention_ix));
+    }
+
+    let subject_mention_ix = subject_candidates.iter().copied().max_by_key(|mention_ix| {
+        relation_argument_candidate_score(
+            scan,
+            *mention_ix,
+            hit,
+            relation_canonical_mentions,
+            true,
+            false,
+        )
+    });
+    let object_mention_ix = select_best_distinct_relation_partner(
+        scan,
+        &object_candidates,
+        subject_mention_ix,
+        hit,
+        relation_canonical_mentions,
+        false,
+        false,
+    )
+    .or_else(|| {
+        select_best_distinct_relation_partner(
+            scan,
+            mention_indexes,
+            subject_mention_ix,
+            hit,
+            relation_canonical_mentions,
+            false,
+            true,
+        )
+    });
+    (subject_mention_ix, object_mention_ix)
+}
+
+fn select_best_relation_pair(
+    scan: &NativeScanRows,
+    subject_candidates: &[usize],
+    object_candidates: &[usize],
+    hit: &NarrativeVerbHit,
+    relation_canonical_mentions: &[usize],
+    relaxed: bool,
+) -> Option<(usize, usize)> {
+    let mut best_pair = None::<(i32, usize, usize)>;
+    for &subject_mention_ix in subject_candidates {
+        let subject_score = relation_argument_candidate_score(
+            scan,
+            subject_mention_ix,
+            hit,
+            relation_canonical_mentions,
+            true,
+            relaxed,
+        );
+        for &object_mention_ix in object_candidates {
+            if subject_mention_ix == object_mention_ix
+                || relation_mentions_collapse_to_same_entity(
+                    scan,
+                    subject_mention_ix,
+                    object_mention_ix,
+                    relation_canonical_mentions,
+                )
+            {
+                continue;
+            }
+            let object_score = relation_argument_candidate_score(
+                scan,
+                object_mention_ix,
+                hit,
+                relation_canonical_mentions,
+                false,
+                relaxed,
+            );
+            let pair_score = subject_score + object_score;
+            match best_pair {
+                Some((best_score, _, _)) if best_score >= pair_score => {}
+                _ => best_pair = Some((pair_score, subject_mention_ix, object_mention_ix)),
+            }
+        }
+    }
+    best_pair
+        .map(|(_, subject_mention_ix, object_mention_ix)| (subject_mention_ix, object_mention_ix))
+}
+
+fn select_best_distinct_relation_partner(
+    scan: &NativeScanRows,
+    candidates: &[usize],
+    anchor_mention_ix: Option<usize>,
+    hit: &NarrativeVerbHit,
+    relation_canonical_mentions: &[usize],
+    subject_role: bool,
+    relaxed: bool,
+) -> Option<usize> {
+    let anchor_mention_ix = anchor_mention_ix?;
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate_ix| {
+            *candidate_ix != anchor_mention_ix
+                && !relation_mentions_collapse_to_same_entity(
+                    scan,
+                    anchor_mention_ix,
+                    *candidate_ix,
+                    relation_canonical_mentions,
+                )
+        })
+        .max_by_key(|mention_ix| {
+            relation_argument_candidate_score(
+                scan,
+                *mention_ix,
+                hit,
+                relation_canonical_mentions,
+                subject_role,
+                relaxed,
+            )
+        })
+}
+
+fn relation_argument_candidate_score(
+    scan: &NativeScanRows,
+    mention_ix: usize,
+    hit: &NarrativeVerbHit,
+    relation_canonical_mentions: &[usize],
+    subject_role: bool,
+    relaxed: bool,
+) -> i32 {
+    let mention = &scan.mentions[mention_ix];
+    let canonical_mention_ix = relation_canonical_mentions[mention_ix];
+    let canonical_mention = &scan.mentions[canonical_mention_ix];
+    let distance = if subject_role {
+        hit.range.start.saturating_sub(mention.range.end)
+    } else {
+        mention.range.start.saturating_sub(hit.range.end)
+    } as i32;
+    let mention_kind_score = match scan.mention_coref_kinds[mention_ix] {
+        CorefMentionKind::Named => 220,
+        CorefMentionKind::Nominal => 120,
+        CorefMentionKind::Pronoun => -40,
+    };
+    let entity_ref_score = match canonical_mention.entity_ref.as_ref() {
+        Some(MentionEntityRef::Known(_)) => 220,
+        Some(MentionEntityRef::Speculative(_)) => 120,
+        None => 0,
+    };
+    let kind_score = canonical_mention
+        .kind
+        .as_ref()
+        .map(|_| 90)
+        .unwrap_or_default();
+    let family_score = scan.family_ord_by_mention[canonical_mention_ix]
+        .and_then(|family_ord| scan.mention_families.get(family_ord as usize))
+        .map(|family| if family.ambiguous { -90 } else { 80 })
+        .unwrap_or_default();
+    let canonicalization_bonus = if canonical_mention_ix != mention_ix {
+        140
+    } else {
+        0
+    };
+    let surface_quality_score = relation_surface_quality_score(canonical_mention);
+    let side_penalty = if relaxed {
+        relation_argument_wrong_side_penalty(mention, hit, subject_role)
+    } else {
+        0
+    };
+
+    1400 - distance.min(900)
+        + mention_kind_score
+        + entity_ref_score
+        + kind_score
+        + family_score
+        + canonicalization_bonus
+        + surface_quality_score
+        + side_penalty
+}
+
+fn relation_argument_wrong_side_penalty(
+    mention: &MentionSpan,
+    hit: &NarrativeVerbHit,
+    subject_role: bool,
+) -> i32 {
+    if subject_role {
+        if mention.range.end > hit.range.start {
+            return -260;
+        }
+    } else if mention.range.start < hit.range.end {
+        return -260;
+    }
+    0
+}
+
+fn relation_mentions_collapse_to_same_entity(
+    scan: &NativeScanRows,
+    left_mention_ix: usize,
+    right_mention_ix: usize,
+    relation_canonical_mentions: &[usize],
+) -> bool {
+    let left_canonical_ix = relation_canonical_mentions[left_mention_ix];
+    let right_canonical_ix = relation_canonical_mentions[right_mention_ix];
+    if left_canonical_ix == right_canonical_ix {
+        return true;
+    }
+    if scan.family_ord_by_mention[left_canonical_ix].is_some()
+        && scan.family_ord_by_mention[left_canonical_ix]
+            == scan.family_ord_by_mention[right_canonical_ix]
+    {
+        return true;
+    }
+    match (
+        scan.mentions[left_canonical_ix].entity_ref.as_ref(),
+        scan.mentions[right_canonical_ix].entity_ref.as_ref(),
+    ) {
+        (Some(MentionEntityRef::Known(left)), Some(MentionEntityRef::Known(right))) => {
+            left == right
+        }
+        (Some(MentionEntityRef::Speculative(left)), Some(MentionEntityRef::Speculative(right))) => {
+            left == right
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelationEndpointRoute {
+    Resolved,
+    CanonicalKnownRef,
+    CanonicalSpeculativeRef,
+    MentionKnownRef,
+    MentionSpeculativeRef,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelationEndpointResolution {
+    entity_ord: u32,
+    mention_ix: usize,
+    route: RelationEndpointRoute,
+}
+
+fn relation_surface_quality_score(mention: &MentionSpan) -> i32 {
+    relation_surface_quality_score_name(
+        mention.surface.trim(),
+        mention.kind.is_some(),
+        matches!(mention.entity_ref, Some(MentionEntityRef::Speculative(_))),
+    )
+}
+
+fn relation_surface_quality_score_name(
+    surface: &str,
+    has_kind: bool,
+    speculative_ref: bool,
+) -> i32 {
+    if surface.is_empty() {
+        return -360;
+    }
+    if is_ascii_pronoun_surface(surface) {
+        return -900;
+    }
+
+    let mut score = 0;
+    if !surface.contains(char::is_whitespace) {
+        if relation_noise_token(surface) {
+            score -= 300;
+        }
+        if surface.len() > 4 && ascii_word_ends_with(surface, "ing") {
+            score -= 240;
+        } else if surface.len() > 4 && ascii_word_ends_with(surface, "ly") {
+            score -= 220;
+        }
+    } else if relation_noise_phrase(surface) {
+        score -= 260;
+    }
+
+    if !has_kind {
+        score -= 120;
+    }
+    if speculative_ref {
+        score -= 80;
+        if !has_kind {
+            score -= 180;
+        }
+    }
+    score
+}
+
+fn relation_noise_token(surface: &str) -> bool {
+    matches_ci(
+        surface,
+        &[
+            "finally",
+            "thankfully",
+            "meanwhile",
+            "however",
+            "therefore",
+            "instead",
+            "maybe",
+            "meh",
+            "hey",
+            "poor",
+            "chapter",
+            "driving",
+            "arriving",
+            "resting",
+            "moving",
+            "italian",
+            "latin",
+            "french",
+            "english",
+            "spanish",
+            "miami-like",
+        ],
+    )
+}
+
+fn relation_noise_phrase(surface: &str) -> bool {
+    matches_ci(
+        surface,
+        &[
+            "table of contents",
+            "french and english",
+            "italy and",
+            "to quicksave",
+            "so the augusti",
+        ],
+    )
+}
+
+fn matches_ci(surface: &str, values: &[&str]) -> bool {
+    values
+        .iter()
+        .any(|value| surface.eq_ignore_ascii_case(value))
+}
+
+fn ascii_word_ends_with(surface: &str, suffix: &str) -> bool {
+    surface.len() >= suffix.len()
+        && surface
+            .chars()
+            .rev()
+            .zip(suffix.chars().rev())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right))
+}
+
+fn is_ascii_pronoun_surface(surface: &str) -> bool {
+    matches_ci(
+        surface.trim_matches(|ch: char| !ch.is_alphanumeric()),
+        &[
+            "he", "she", "they", "them", "him", "her", "we", "us", "i", "you", "it",
+        ],
+    )
 }
 
 fn classify_coref_mention_with_pronoun(
@@ -4827,6 +5252,7 @@ fn resolve_mentions_with_mode(
 }
 
 fn build_semantic_records_native(
+    document: &IngestDocument,
     scan: &NativeScanRows,
     structure: &NativeStructureRows,
     chunks: &[ChunkRecord],
@@ -4841,10 +5267,18 @@ fn build_semantic_records_native(
 ) {
     let mut entities = vec![None::<EntityAccumulatorOrd>; entity_ids.len()];
     let mut unresolved_relation_count = 0usize;
+    let mut self_relation_count = 0usize;
+    let mut low_quality_relates_count = 0usize;
+    let relation_canonical_mentions = build_relation_canonical_mentions(scan);
     let resolved_entity_by_mention_ix = resolutions
         .iter()
         .map(|resolution| resolution.entity_ord)
         .collect::<Vec<_>>();
+    let entity_ord_by_id = entity_ids
+        .iter()
+        .enumerate()
+        .map(|(entity_ord, entity_id)| (entity_id.as_str(), entity_ord as u32))
+        .collect::<FxHashMap<_, _>>();
 
     for resolution in resolutions {
         let Some(entity_ord) = resolution.entity_ord else {
@@ -4890,38 +5324,75 @@ fn build_semantic_records_native(
         }
     }
 
-    let relation_records = structure
-        .relation_seeds
-        .iter()
-        .filter_map(|relation| {
-            let source_entity_ord = relation
-                .subject_mention_ix
-                .and_then(|mention_ix| resolved_entity_by_mention_ix.get(mention_ix))
-                .copied()
-                .flatten();
-            let target_entity_ord = relation
-                .object_mention_ix
-                .and_then(|mention_ix| resolved_entity_by_mention_ix.get(mention_ix))
-                .copied()
-                .flatten();
-            if source_entity_ord.is_none() || target_entity_ord.is_none() {
-                unresolved_relation_count += 1;
-            }
-            Some(SemanticRelationRecord {
-                source_entity_id: EntityId(entity_ids[source_entity_ord? as usize].clone()),
-                target_entity_id: EntityId(entity_ids[target_entity_ord? as usize].clone()),
-                edge_type: relation.relation_type.clone(),
-                sentence_index: relation.sentence_index,
-                chunk_id: structure
-                    .sentence_chunk_indexes
-                    .get(relation.sentence_index)
-                    .cloned()
-                    .flatten()
-                    .and_then(|chunk_ix| chunks.get(chunk_ix as usize))
-                    .map(|chunk| chunk.chunk_id.0.clone()),
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut relation_records = Vec::with_capacity(structure.relation_seeds.len());
+    for relation in &structure.relation_seeds {
+        let source_endpoint = relation.subject_mention_ix.and_then(|mention_ix| {
+            relation_entity_ord_for_mention(
+                document,
+                scan,
+                mention_ix,
+                &relation_canonical_mentions,
+                &resolved_entity_by_mention_ix,
+                &entity_ord_by_id,
+            )
+        });
+        let target_endpoint = relation.object_mention_ix.and_then(|mention_ix| {
+            relation_entity_ord_for_mention(
+                document,
+                scan,
+                mention_ix,
+                &relation_canonical_mentions,
+                &resolved_entity_by_mention_ix,
+                &entity_ord_by_id,
+            )
+        });
+        let (Some(source_endpoint), Some(target_endpoint)) = (source_endpoint, target_endpoint)
+        else {
+            unresolved_relation_count += 1;
+            continue;
+        };
+        if source_endpoint.entity_ord == target_endpoint.entity_ord {
+            self_relation_count += 1;
+            continue;
+        }
+        if relation.relation_type == "relates_to"
+            && (!relation_endpoint_is_assertable(scan, &source_endpoint)
+                || !relation_endpoint_is_assertable(scan, &target_endpoint))
+        {
+            low_quality_relates_count += 1;
+            continue;
+        }
+
+        let chunk_index = structure
+            .sentence_chunk_indexes
+            .get(relation.sentence_index)
+            .copied()
+            .flatten();
+        materialize_relation_endpoint_entity(
+            &mut entities,
+            &entity_ids,
+            scan,
+            source_endpoint,
+            chunk_index,
+        );
+        materialize_relation_endpoint_entity(
+            &mut entities,
+            &entity_ids,
+            scan,
+            target_endpoint,
+            chunk_index,
+        );
+
+        relation_records.push(SemanticRelationRecord {
+            source_entity_id: EntityId(entity_ids[source_endpoint.entity_ord as usize].clone()),
+            target_entity_id: EntityId(entity_ids[target_endpoint.entity_ord as usize].clone()),
+            edge_type: relation.relation_type.clone(),
+            sentence_index: relation.sentence_index,
+            chunk_id: chunk_index
+                .and_then(|chunk_ix| chunks.get(chunk_ix as usize))
+                .map(|chunk| chunk.chunk_id.0.clone()),
+        });
+    }
 
     let mut entity_records = entities
         .into_iter()
@@ -4945,17 +5416,34 @@ fn build_semantic_records_native(
         .collect::<Vec<_>>();
     entity_records.sort_by(|left, right| left.entity_id.0.cmp(&right.entity_id.0));
 
-    let diagnostics = if unresolved_relation_count == 0 {
-        Vec::new()
-    } else {
-        vec![Diagnostic {
+    let mut diagnostics = Vec::new();
+    if unresolved_relation_count > 0 {
+        diagnostics.push(Diagnostic {
             code: "er_relation_skipped_unresolved_entity".to_owned(),
             message: format!(
                 "Skipped {} asserted relations because one or more arguments stayed unresolved.",
                 unresolved_relation_count
             ),
-        }]
-    };
+        });
+    }
+    if self_relation_count > 0 {
+        diagnostics.push(Diagnostic {
+            code: "er_relation_skipped_same_entity".to_owned(),
+            message: format!(
+                "Skipped {} asserted relations because both arguments resolved to the same entity.",
+                self_relation_count
+            ),
+        });
+    }
+    if low_quality_relates_count > 0 {
+        diagnostics.push(Diagnostic {
+            code: "er_relation_skipped_low_quality_relates_to".to_owned(),
+            message: format!(
+                "Skipped {} asserted relates_to edges because one or more arguments were too weak to promote into archive truth.",
+                low_quality_relates_count
+            ),
+        });
+    }
 
     (
         entity_records,
@@ -4963,6 +5451,167 @@ fn build_semantic_records_native(
         scan.discovery_count,
         diagnostics,
     )
+}
+
+fn relation_entity_ord_for_mention(
+    document: &IngestDocument,
+    scan: &NativeScanRows,
+    mention_ix: usize,
+    relation_canonical_mentions: &[usize],
+    resolved_entity_by_mention_ix: &[Option<u32>],
+    entity_ord_by_id: &FxHashMap<&str, u32>,
+) -> Option<RelationEndpointResolution> {
+    let canonical_mention_ix = relation_canonical_mentions[mention_ix];
+    let canonical_ord = resolved_entity_by_mention_ix
+        .get(canonical_mention_ix)
+        .copied()
+        .flatten();
+    if let Some(entity_ord) = canonical_ord {
+        return Some(RelationEndpointResolution {
+            entity_ord,
+            mention_ix: canonical_mention_ix,
+            route: RelationEndpointRoute::Resolved,
+        });
+    }
+
+    if let Some(entity_ord) = relation_entity_ord_from_ref(
+        document,
+        &scan.mentions[canonical_mention_ix],
+        entity_ord_by_id,
+    ) {
+        return Some(RelationEndpointResolution {
+            entity_ord,
+            mention_ix: canonical_mention_ix,
+            route: relation_endpoint_route(&scan.mentions[canonical_mention_ix], true)?,
+        });
+    }
+
+    if canonical_mention_ix != mention_ix {
+        let entity_ord =
+            relation_entity_ord_from_ref(document, &scan.mentions[mention_ix], entity_ord_by_id)?;
+        return Some(RelationEndpointResolution {
+            entity_ord,
+            mention_ix,
+            route: relation_endpoint_route(&scan.mentions[mention_ix], false)?,
+        });
+    }
+
+    None
+}
+
+fn relation_endpoint_route(
+    mention: &MentionSpan,
+    canonical: bool,
+) -> Option<RelationEndpointRoute> {
+    match mention.entity_ref.as_ref()? {
+        MentionEntityRef::Known(_) => Some(if canonical {
+            RelationEndpointRoute::CanonicalKnownRef
+        } else {
+            RelationEndpointRoute::MentionKnownRef
+        }),
+        MentionEntityRef::Speculative(_) => Some(if canonical {
+            RelationEndpointRoute::CanonicalSpeculativeRef
+        } else {
+            RelationEndpointRoute::MentionSpeculativeRef
+        }),
+    }
+}
+
+fn relation_endpoint_is_assertable(
+    scan: &NativeScanRows,
+    endpoint: &RelationEndpointResolution,
+) -> bool {
+    let mention = &scan.mentions[endpoint.mention_ix];
+    let surface = mention.surface.trim();
+    if surface.is_empty() || is_ascii_pronoun_surface(surface) {
+        return false;
+    }
+    if relation_noise_token(surface) || relation_noise_phrase(surface) {
+        return false;
+    }
+    if mention.kind.is_none()
+        && matches!(
+            endpoint.route,
+            RelationEndpointRoute::CanonicalSpeculativeRef
+                | RelationEndpointRoute::MentionSpeculativeRef
+        )
+    {
+        return false;
+    }
+    if matches!(
+        endpoint.route,
+        RelationEndpointRoute::CanonicalSpeculativeRef
+            | RelationEndpointRoute::MentionSpeculativeRef
+    ) && relation_surface_quality_score(mention) <= -200
+    {
+        return false;
+    }
+    true
+}
+
+fn materialize_relation_endpoint_entity(
+    entities: &mut [Option<EntityAccumulatorOrd>],
+    entity_ids: &[String],
+    scan: &NativeScanRows,
+    endpoint: RelationEndpointResolution,
+    chunk_index: Option<u32>,
+) {
+    let mention = &scan.mentions[endpoint.mention_ix];
+    let Some(slot) = entities.get_mut(endpoint.entity_ord as usize) else {
+        return;
+    };
+    let entry = slot.get_or_insert_with(|| EntityAccumulatorOrd {
+        canonical_name: mention.surface.clone(),
+        aliases: SmallVec::new(),
+        kind: mention.kind.clone(),
+        mention_count: 0,
+        chunk_indexes: SmallVec::new(),
+    });
+
+    if entry.kind.is_none() && mention.kind.is_some() {
+        entry.kind = mention.kind.clone();
+    }
+    if relation_surface_quality_score(mention)
+        > relation_surface_quality_score_name(&entry.canonical_name, entry.kind.is_some(), false)
+    {
+        if entry.canonical_name != mention.surface
+            && !entry
+                .aliases
+                .iter()
+                .any(|alias| alias == &entry.canonical_name)
+            && entry.aliases.len() < 8
+        {
+            entry.aliases.push(entry.canonical_name.clone());
+        }
+        entry.canonical_name = mention.surface.clone();
+    } else if entry.canonical_name != mention.surface
+        && !entry.aliases.iter().any(|alias| alias == &mention.surface)
+        && entry.aliases.len() < 8
+        && mention.surface != entity_ids[endpoint.entity_ord as usize]
+    {
+        entry.aliases.push(mention.surface.clone());
+    }
+    if let Some(chunk_index) = chunk_index {
+        if !entry
+            .chunk_indexes
+            .iter()
+            .any(|existing| *existing == chunk_index)
+        {
+            entry.chunk_indexes.push(chunk_index);
+        }
+    }
+}
+
+fn relation_entity_ord_from_ref(
+    document: &IngestDocument,
+    mention: &MentionSpan,
+    entity_ord_by_id: &FxHashMap<&str, u32>,
+) -> Option<u32> {
+    mention
+        .entity_ref
+        .as_ref()
+        .and_then(|entity_ref| entity_id_from_ref(document, entity_ref))
+        .and_then(|entity_id| entity_ord_by_id.get(entity_id.0.as_str()).copied())
 }
 
 fn materialize_coref_clusters(
@@ -5772,6 +6421,81 @@ fn is_verb_token(value: &str) -> bool {
             | "crossed"
             | "cross"
             | "crosses"
+            | "join"
+            | "joined"
+            | "joins"
+            | "work"
+            | "worked"
+            | "works"
+            | "belong"
+            | "belonged"
+            | "belongs"
+            | "live"
+            | "lived"
+            | "lives"
+            | "reside"
+            | "resided"
+            | "resides"
+            | "stay"
+            | "stayed"
+            | "stays"
+            | "base"
+            | "based"
+            | "bases"
+            | "command"
+            | "commanded"
+            | "commands"
+            | "protect"
+            | "protected"
+            | "protects"
+            | "lead"
+            | "leads"
+            | "led"
+            | "manage"
+            | "managed"
+            | "manages"
+            | "head"
+            | "headed"
+            | "heads"
+            | "travel"
+            | "traveled"
+            | "travels"
+            | "arrive"
+            | "arrived"
+            | "arrives"
+            | "leave"
+            | "left"
+            | "leaves"
+            | "report"
+            | "reported"
+            | "reports"
+            | "announce"
+            | "announced"
+            | "announces"
+            | "say"
+            | "said"
+            | "says"
+            | "tell"
+            | "told"
+            | "tells"
+            | "build"
+            | "built"
+            | "builds"
+            | "create"
+            | "created"
+            | "creates"
+            | "destroy"
+            | "destroyed"
+            | "destroys"
+            | "start"
+            | "started"
+            | "starts"
+            | "begin"
+            | "began"
+            | "begins"
+            | "end"
+            | "ended"
+            | "ends"
     ) || value.ends_with("ed")
 }
 
@@ -5802,6 +6526,113 @@ fn classify_verb(value: &str) -> (String, String, String, Option<NarrativeTransi
                 .to_owned(),
             "creation".to_owned(),
             "writes".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "join" | "joined" | "joins" | "belong" | "belonged" | "belongs" => (
+            match value {
+                "joined" | "joins" => "join",
+                _ => "belong",
+            }
+            .to_owned(),
+            "affiliation".to_owned(),
+            "member_of".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "work" | "worked" | "works" => (
+            "work".to_owned(),
+            "affiliation".to_owned(),
+            "works_for".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "live" | "lived" | "lives" | "reside" | "resided" | "resides" | "stay" | "stayed"
+        | "stays" | "base" | "based" | "bases" => (
+            match value {
+                "base" | "based" | "bases" => "base",
+                "stay" | "stayed" | "stays" => "stay",
+                "reside" | "resided" | "resides" => "reside",
+                _ => "live",
+            }
+            .to_owned(),
+            "location".to_owned(),
+            "located_in".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "command" | "commanded" | "commands" | "lead" | "leads" | "led" | "manage" | "managed"
+        | "manages" | "head" | "headed" | "heads" => (
+            match value {
+                "lead" | "leads" | "led" => "lead",
+                "manage" | "managed" | "manages" => "manage",
+                "head" | "headed" | "heads" => "head",
+                _ => "command",
+            }
+            .to_owned(),
+            "leadership".to_owned(),
+            "commands".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "protect" | "protected" | "protects" => (
+            "protect".to_owned(),
+            "conflict".to_owned(),
+            "protects".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "move" | "moved" | "moves" | "travel" | "traveled" | "travels" | "arrive" | "arrived"
+        | "arrives" | "leave" | "left" | "leaves" | "cross" | "crossed" | "crosses" => (
+            match value {
+                "travel" | "traveled" | "travels" => "travel",
+                "arrive" | "arrived" | "arrives" => "arrive",
+                "leave" | "left" | "leaves" => "leave",
+                "cross" | "crossed" | "crosses" => "cross",
+                _ => "move",
+            }
+            .to_owned(),
+            "movement".to_owned(),
+            "moves".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "report" | "reported" | "reports" | "announce" | "announced" | "announces" | "say"
+        | "said" | "says" | "tell" | "told" | "tells" => (
+            match value {
+                "announce" | "announced" | "announces" => "announce",
+                "say" | "said" | "says" => "say",
+                "tell" | "told" | "tells" => "tell",
+                _ => "report",
+            }
+            .to_owned(),
+            "communication".to_owned(),
+            "reports".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "build" | "built" | "builds" | "create" | "created" | "creates" => (
+            match value {
+                "build" | "built" | "builds" => "build",
+                _ => "create",
+            }
+            .to_owned(),
+            "creation".to_owned(),
+            "creates".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "destroy" | "destroyed" | "destroys" => (
+            "destroy".to_owned(),
+            "conflict".to_owned(),
+            "destroys".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "start" | "started" | "starts" | "begin" | "began" | "begins" | "end" | "ended"
+        | "ends" => (
+            match value {
+                "begin" | "began" | "begins" => "begin",
+                "end" | "ended" | "ends" => "end",
+                _ => "start",
+            }
+            .to_owned(),
+            "lifecycle".to_owned(),
+            match value {
+                "end" | "ended" | "ends" => "ends",
+                _ => "starts",
+            }
+            .to_owned(),
             Some(NarrativeTransitivity::Transitive),
         ),
         other => (
@@ -5886,6 +6717,55 @@ mod tests {
         ))
     }
 
+    fn native_relation_outputs(
+        document: &IngestDocument,
+        seeds: &[ResolverEntitySeed],
+    ) -> (
+        NativeScanRows,
+        NativeStructureRows,
+        Vec<SemanticRelationRecord>,
+        Vec<Diagnostic>,
+    ) {
+        let engine = PhoenixInvarantV3::default();
+        let scan = scan_native_compact(
+            &document.text,
+            &document.scope,
+            seeds,
+            &engine.config.extraction,
+        );
+        let (chunks, _) = build_chunk_records(
+            document,
+            &extract_boundaries(&document.text),
+            &build_chunks(
+                &document.text,
+                &ChunkerConfig {
+                    chunk_size: 512,
+                    overlap: 64,
+                },
+            ),
+        );
+        let structure = build_native_structure_rows(&document.text, &scan, &chunks);
+        let coref = build_coref_rows(&scan, &structure, &engine.config.coref);
+        let (resolutions, aliases, _summary, _diagnostics, entity_ids, _entity_ord_by_id) =
+            resolve_mentions_compact_native(
+                document,
+                &scan,
+                &coref,
+                &chunks,
+                &NativeEntityMemory::default(),
+            );
+        let (_entities, relations, _discovery_count, diagnostics) = build_semantic_records_native(
+            document,
+            &scan,
+            &structure,
+            &chunks,
+            &resolutions,
+            &aliases,
+            &entity_ids,
+        );
+        (scan, structure, relations, diagnostics)
+    }
+
     #[test]
     fn scan_and_structure_capture_mentions_and_relations() {
         let engine = PhoenixInvarantV3::default();
@@ -5944,6 +6824,223 @@ mod tests {
         assert!(surfaces.iter().any(|surface| surface == "luffy"));
         assert!(surfaces.iter().any(|surface| surface == "Acme Corporation"));
         assert!(surfaces.iter().any(|surface| surface == "New York"));
+    }
+
+    #[test]
+    fn classify_verb_promotes_state_and_event_families() {
+        assert_eq!(classify_verb("worked").2, "works_for");
+        assert_eq!(classify_verb("joined").2, "member_of");
+        assert_eq!(classify_verb("lived").2, "located_in");
+        assert_eq!(classify_verb("reported").2, "reports");
+        assert_eq!(classify_verb("started").2, "starts");
+    }
+
+    #[test]
+    fn relation_seed_prefers_distinct_named_object_over_reflexive_pronoun() {
+        let document = IngestDocument {
+            document_id: DocumentId("doc-reflexive-object".to_owned()),
+            note_id: None,
+            title: "Reflexive".to_owned(),
+            text: "Ryan introduced himself to Dynamis.".to_owned(),
+            scope: ScopeKey::default(),
+        };
+        let seeds = [
+            ResolverEntitySeed {
+                entity_id: EntityId("ryan".to_owned()),
+                canonical_name: "Ryan".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: ScopeKey::default(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("dynamis".to_owned()),
+                canonical_name: "Dynamis".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Organization),
+                gender: None,
+                number: None,
+                scope: ScopeKey::default(),
+            },
+        ];
+
+        let (scan, structure, _relations, _diagnostics) =
+            native_relation_outputs(&document, &seeds);
+        assert!(structure.relation_seeds.iter().any(|seed| {
+            let Some(subject_mention_ix) = seed.subject_mention_ix else {
+                return false;
+            };
+            let Some(object_mention_ix) = seed.object_mention_ix else {
+                return false;
+            };
+            scan.mentions[subject_mention_ix].surface == "Ryan"
+                && scan.mentions[object_mention_ix].surface == "Dynamis"
+        }));
+    }
+
+    #[test]
+    fn semantic_relations_skip_same_entity_assertions() {
+        let document = IngestDocument {
+            document_id: DocumentId("doc-self-loop".to_owned()),
+            note_id: None,
+            title: "Self Loop".to_owned(),
+            text: "Luffy attacked Luffy.".to_owned(),
+            scope: ScopeKey::default(),
+        };
+        let seeds = [ResolverEntitySeed {
+            entity_id: EntityId("luffy".to_owned()),
+            canonical_name: "Luffy".to_owned(),
+            aliases: Vec::new(),
+            kind: Some(EntityKind::Character),
+            gender: Some(GenderHint::Male),
+            number: None,
+            scope: ScopeKey::default(),
+        }];
+
+        let (_scan, structure, relations, diagnostics) = native_relation_outputs(&document, &seeds);
+        assert!(!structure.relation_seeds.iter().any(|seed| {
+            matches!(
+                (seed.subject_mention_ix, seed.object_mention_ix),
+                (Some(_), Some(_))
+            )
+        }));
+        assert!(relations.is_empty());
+        assert!(!diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "er_relation_skipped_same_entity"));
+    }
+
+    #[test]
+    fn semantic_relations_use_pronoun_antecedent_entities() {
+        let document = IngestDocument {
+            document_id: DocumentId("doc-pronoun-relation".to_owned()),
+            note_id: None,
+            title: "Pronoun Relation".to_owned(),
+            text: "Luffy waited. He joined Dynamis.".to_owned(),
+            scope: ScopeKey::default(),
+        };
+        let seeds = [
+            ResolverEntitySeed {
+                entity_id: EntityId("luffy".to_owned()),
+                canonical_name: "Luffy".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: ScopeKey::default(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("dynamis".to_owned()),
+                canonical_name: "Dynamis".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Organization),
+                gender: None,
+                number: None,
+                scope: ScopeKey::default(),
+            },
+        ];
+
+        let (_scan, _structure, relations, _diagnostics) =
+            native_relation_outputs(&document, &seeds);
+        assert!(relations.iter().any(|relation| {
+            relation.source_entity_id.0 == "luffy"
+                && relation.target_entity_id.0 == "dynamis"
+                && relation.edge_type == "member_of"
+        }));
+    }
+
+    #[test]
+    fn semantic_relations_recover_preposed_location_arguments() {
+        let document = IngestDocument {
+            document_id: DocumentId("doc-preposed-location".to_owned()),
+            note_id: None,
+            title: "Preposed Location".to_owned(),
+            text: "In New Rome, Ryan stayed.".to_owned(),
+            scope: ScopeKey::default(),
+        };
+        let seeds = [
+            ResolverEntitySeed {
+                entity_id: EntityId("ryan".to_owned()),
+                canonical_name: "Ryan".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: ScopeKey::default(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("new_rome".to_owned()),
+                canonical_name: "New Rome".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Location),
+                gender: None,
+                number: None,
+                scope: ScopeKey::default(),
+            },
+        ];
+
+        let (_scan, _structure, relations, _diagnostics) =
+            native_relation_outputs(&document, &seeds);
+        assert!(relations.iter().any(|relation| {
+            relation.source_entity_id.0 == "ryan"
+                && relation.target_entity_id.0 == "new_rome"
+                && relation.edge_type == "located_in"
+        }));
+    }
+
+    #[test]
+    fn semantic_relations_skip_discourse_noise_relates_to_endpoints() {
+        let document = IngestDocument {
+            document_id: DocumentId("doc-discourse-noise".to_owned()),
+            note_id: None,
+            title: "Discourse Noise".to_owned(),
+            text: "Hey amused Ryan.".to_owned(),
+            scope: ScopeKey::default(),
+        };
+        let seeds = [ResolverEntitySeed {
+            entity_id: EntityId("ryan".to_owned()),
+            canonical_name: "Ryan".to_owned(),
+            aliases: Vec::new(),
+            kind: Some(EntityKind::Character),
+            gender: Some(GenderHint::Male),
+            number: None,
+            scope: ScopeKey::default(),
+        }];
+
+        let (_scan, _structure, relations, diagnostics) =
+            native_relation_outputs(&document, &seeds);
+        assert!(relations.is_empty());
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "er_relation_skipped_low_quality_relates_to" }));
+    }
+
+    #[test]
+    fn semantic_relations_skip_speculative_participle_relates_to_endpoints() {
+        let document = IngestDocument {
+            document_id: DocumentId("doc-participle-noise".to_owned()),
+            note_id: None,
+            title: "Participle Noise".to_owned(),
+            text: "Driving startled Ryan.".to_owned(),
+            scope: ScopeKey::default(),
+        };
+        let seeds = [ResolverEntitySeed {
+            entity_id: EntityId("ryan".to_owned()),
+            canonical_name: "Ryan".to_owned(),
+            aliases: Vec::new(),
+            kind: Some(EntityKind::Character),
+            gender: Some(GenderHint::Male),
+            number: None,
+            scope: ScopeKey::default(),
+        }];
+
+        let (_scan, _structure, relations, diagnostics) =
+            native_relation_outputs(&document, &seeds);
+        assert!(relations.is_empty());
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "er_relation_skipped_low_quality_relates_to" }));
     }
 
     #[test]
@@ -8316,6 +9413,7 @@ impl PhoenixInvarantV3 {
         let phase_started = Instant::now();
         let (entities, relations, discovery_count, mut relation_diagnostics) =
             build_semantic_records_native(
+                document,
                 &scan_bundle.scan,
                 &scan_bundle.structure,
                 &scan_bundle.chunks,
@@ -8785,6 +9883,7 @@ impl PhoenixInvarantV3 {
             &causal_substrate,
             &temporal_substrate,
         );
+        let relation_candidates = build_native_relation_candidates(document, &scan_bundle);
         let phase_started = Instant::now();
         let archive = DocumentArchive {
             manifest,
@@ -8802,7 +9901,7 @@ impl PhoenixInvarantV3 {
             entities: resolution_bundle.entities,
             relations: resolution_bundle.relations,
             evidence_spans: Vec::new(),
-            relation_candidates: Vec::new(),
+            relation_candidates,
             graph_batch: KernelMutationBatch::default(),
             structure: None,
             causal_substrate: Some(causal_substrate),
@@ -8906,6 +10005,54 @@ fn build_document_causal_substrate(
         causal_links: causality.links,
         causal_diagnostics: causality.diagnostics,
     }
+}
+
+fn build_native_relation_candidates(
+    document: &IngestDocument,
+    scan_bundle: &NativeScanBundle,
+) -> Vec<RelationCandidate> {
+    let mut relations = Vec::with_capacity(scan_bundle.structure.relation_seeds.len());
+    for seed in &scan_bundle.structure.relation_seeds {
+        let Some(hit) = scan_bundle.scan.narrative_hits.iter().find(|hit| {
+            hit.sentence_index == seed.sentence_index && hit.relation_type == seed.relation_type
+        }) else {
+            continue;
+        };
+        let Some(sentence) = scan_bundle.scan.sentences.get(seed.sentence_index) else {
+            continue;
+        };
+        let evidence = vec![EvidenceSpan {
+            document_id: Some(DocumentId(document.document_id.0.clone())),
+            note_id: document.note_id.clone(),
+            label: document
+                .text
+                .get(sentence.range.start as usize..sentence.range.end as usize)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            kind: Some("sentence".to_owned()),
+            range: sentence.range,
+        }];
+        relations.push(RelationCandidate {
+            sentence_index: seed.sentence_index,
+            verb_range: hit.range,
+            lemma: hit.lemma.clone(),
+            event_class: hit.event_class.clone(),
+            relation_type: hit.relation_type.clone(),
+            subject: seed
+                .subject_mention_ix
+                .and_then(|index| scan_bundle.scan.mentions.get(index))
+                .map(frame_slot_from_native_mention),
+            object: seed
+                .object_mention_ix
+                .and_then(|index| scan_bundle.scan.mentions.get(index))
+                .map(frame_slot_from_native_mention),
+            recipient: None,
+            attachments: Vec::new(),
+            evidence,
+        });
+    }
+    relations
 }
 
 fn build_document_temporal_substrate(
@@ -9853,67 +11000,35 @@ fn build_causal_structure_artifact(
         })
         .collect::<Vec<_>>();
 
-    let mut relations = Vec::new();
+    let relations = build_native_relation_candidates(document, scan_bundle);
     let mut evidence_spans = Vec::new();
-    for seed in &scan_bundle.structure.relation_seeds {
+    for relation in &relations {
         let Some(hit) = scan_bundle.scan.narrative_hits.iter().find(|hit| {
-            hit.sentence_index == seed.sentence_index && hit.relation_type == seed.relation_type
+            hit.sentence_index == relation.sentence_index
+                && hit.relation_type == relation.relation_type
         }) else {
             continue;
         };
-        let sentence = match scan_bundle.scan.sentences.get(seed.sentence_index) {
+        let sentence = match scan_bundle.scan.sentences.get(relation.sentence_index) {
             Some(sentence) => sentence,
             None => continue,
         };
-        let evidence = vec![EvidenceSpan {
-            document_id: Some(DocumentId(document.document_id.0.clone())),
-            note_id: document.note_id.clone(),
-            label: document
-                .text
-                .get(sentence.range.start as usize..sentence.range.end as usize)
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
-            kind: Some("sentence".to_owned()),
-            range: sentence.range,
-        }];
-        let subject = seed
-            .subject_mention_ix
-            .and_then(|index| scan_bundle.scan.mentions.get(index))
-            .map(frame_slot_from_native_mention);
-        let object = seed
-            .object_mention_ix
-            .and_then(|index| scan_bundle.scan.mentions.get(index))
-            .map(frame_slot_from_native_mention);
-        let relation = RelationCandidate {
-            sentence_index: seed.sentence_index,
-            verb_range: hit.range,
-            lemma: hit.lemma.clone(),
-            event_class: hit.event_class.clone(),
-            relation_type: hit.relation_type.clone(),
-            subject,
-            object,
-            recipient: None,
-            attachments: Vec::new(),
-            evidence: evidence.clone(),
-        };
-        if let Some(frame) = sentence_frames.get_mut(seed.sentence_index) {
+        if let Some(frame) = sentence_frames.get_mut(relation.sentence_index) {
             frame.verb_frames.push(VerbFrame {
-                verb_range: hit.range,
+                verb_range: relation.verb_range,
                 lemma: hit.lemma.clone(),
                 event_class: hit.event_class.clone(),
-                relation_type: hit.relation_type.clone(),
+                relation_type: relation.relation_type.clone(),
                 transitivity: hit.transitivity.clone(),
                 subject_candidates: relation.subject.clone().into_iter().collect(),
                 object_candidates: relation.object.clone().into_iter().collect(),
                 recipient_candidates: Vec::new(),
                 pp_attachments: Vec::new(),
                 clause_range: sentence.range,
-                evidence: evidence.clone(),
+                evidence: relation.evidence.clone(),
             });
         }
-        evidence_spans.extend(evidence.iter().cloned());
-        relations.push(relation);
+        evidence_spans.extend(relation.evidence.iter().cloned());
     }
 
     StructureArtifact {

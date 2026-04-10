@@ -1,9 +1,17 @@
 pub mod api;
 
 mod gliclass;
+mod gliclass_instruct;
+mod gliclass_instruct_format;
+mod gliclass_instruct_runtime;
+mod gliner_bi;
+mod gliner_bi_tensors;
+mod gliner_relex;
+mod gliner_relex_decode;
 mod gliner_seed;
 mod glirel;
 mod nli;
+mod ort_runtime;
 mod seed_worker;
 #[cfg(test)]
 mod tests;
@@ -12,6 +20,23 @@ mod worker;
 pub use gliclass::{
     GliclassClassificationType, GliclassError, GliclassLabelScore, GliclassModel,
     GliclassModelMetadata, GliclassPredictOptions, GliclassPrediction,
+};
+pub use gliclass_instruct::{
+    GliclassInstructError, GliclassInstructMetadata, GliclassInstructModel,
+    GliclassInstructPredictOptions,
+};
+pub use gliclass_instruct_format::{
+    build_hierarchical_scores as build_gliclass_instruct_hierarchical_scores,
+    flatten_hierarchical_labels as flatten_gliclass_instruct_hierarchical_labels,
+    GliclassInstructExample, GliclassInstructLabel,
+};
+pub use gliner_bi::{
+    GlinerBiError, GlinerBiLabelSet, GlinerBiModel, GlinerBiModelMetadata, GlinerBiOverlapPolicy,
+    GlinerBiPredictOptions, GlinerBiPrediction,
+};
+pub use gliner_relex::{
+    GlinerRelexEntity, GlinerRelexError, GlinerRelexLabel, GlinerRelexMetadata, GlinerRelexModel,
+    GlinerRelexPredictOptions, GlinerRelexPrediction,
 };
 pub use gliner_seed::{RelationMentionSeeder, RelationSeededSpan};
 pub use glirel::{

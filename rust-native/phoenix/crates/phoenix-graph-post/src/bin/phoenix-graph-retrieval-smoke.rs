@@ -15,9 +15,9 @@ use phoenix_graph_post::{
     derive_scope_review_batch, persist_graph_patch_sidecar, SemanticNliConfig,
 };
 use phoenix_store_native_core::{
-    AnnIndexFamily, PhoenixArchiveStoreV2, PhoenixCausalPatchStore,
-    PhoenixEventIdentityPatchStore, PhoenixGraphPatchStore, PhoenixMemoryPatchStore,
-    PhoenixSemanticGraphPatchStore, PhoenixTemporalPatchStore,
+    AnnIndexFamily, PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixEventIdentityPatchStore,
+    PhoenixGraphPatchStore, PhoenixMemoryPatchStore, PhoenixSemanticGraphPatchStore,
+    PhoenixTemporalPatchStore,
 };
 use phoenix_store_overgraph::PhoenixOvergraphStore;
 use phoenix_types::ScopeKey;

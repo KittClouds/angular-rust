@@ -133,8 +133,10 @@ impl GliclassModel {
         let model_path = find_existing_path(
             model_dir,
             &[
-                "onnx\\model.onnx",
+                "model_quantized.onnx",
+                "onnx\\model_quantized.onnx",
                 "model.onnx",
+                "onnx\\model.onnx",
                 "onnx\\model-int8-quantized.onnx",
                 "onnx\\model-uint8-quantized.onnx",
                 "onnx\\model-int4-quantized.onnx",
@@ -478,6 +480,8 @@ fn sigmoid(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_classification_type_accepts_common_aliases() {
@@ -519,5 +523,25 @@ mod tests {
         let labels = vec!["low".to_owned(), "high".to_owned()];
         let rows = sigmoid_scores(&labels, &[-3.0, 3.0]);
         assert!(rows[0].score < rows[1].score);
+    }
+
+    #[test]
+    fn find_existing_path_prefers_root_quantized_model() {
+        let root = unique_test_dir("gliclass-path-preference");
+        fs::create_dir_all(root.join("onnx")).expect("create test tree");
+        fs::write(root.join("model_quantized.onnx"), b"root-quantized").expect("root model");
+        fs::write(root.join("onnx").join("model.onnx"), b"nested-model").expect("nested model");
+        let resolved = find_existing_path(&root, &["model_quantized.onnx", "onnx\\model.onnx"])
+            .expect("resolve model path");
+        assert_eq!(resolved, root.join("model_quantized.onnx"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("phoenix-rel-post-{label}-{stamp}"))
     }
 }

@@ -26,6 +26,8 @@ pub(crate) struct Prototype {
     pub(crate) semantic_node: SemanticGraphNodeRecord,
     pub(crate) slot_key: Option<String>,
     pub(crate) value_key: Option<String>,
+    pub(crate) primary_entity_id: Option<String>,
+    pub(crate) secondary_entity_id: Option<String>,
 }
 
 pub(crate) fn build_prototypes(
@@ -55,6 +57,8 @@ pub(crate) fn build_prototypes(
                     "document:{}#bytes:{}-{}",
                     archive.manifest.document_id, chunk.range.start, chunk.range.end
                 )],
+                None,
+                None,
                 None,
                 None,
             ));
@@ -99,6 +103,8 @@ pub(crate) fn build_prototypes(
                 entity.identity.continuity_refs.clone(),
                 None,
                 None,
+                Some(entity.entity_id.0.clone()),
+                None,
             ));
         }
     }
@@ -117,6 +123,8 @@ pub(crate) fn build_prototypes(
                 event.document_ids.first().cloned(),
                 events.scope.narrative_id.clone(),
                 event.evidence_refs.clone(),
+                None,
+                None,
                 None,
                 None,
             ));
@@ -146,7 +154,7 @@ pub(crate) fn neighbor_families(
             (EVENT_KIND, SemanticEdgeFamily::EntityEventSupport),
         ],
         SemanticGraphNodeKind::Event => [
-            (EVENT_KIND, SemanticEdgeFamily::EventNeighbor),
+            ("", SemanticEdgeFamily::Unknown),
             ("", SemanticEdgeFamily::Unknown),
         ],
         SemanticGraphNodeKind::Unknown => [
@@ -201,6 +209,11 @@ pub(crate) fn family_label(family: SemanticEdgeFamily) -> &'static str {
         SemanticEdgeFamily::ClaimContradiction => "claim_contradiction",
         SemanticEdgeFamily::StateSupport => "state_support",
         SemanticEdgeFamily::StateContradiction => "state_contradiction",
+        SemanticEdgeFamily::ContradictorySupportRegion => "contradictory_support_region",
+        SemanticEdgeFamily::SameSlotFamily => "same_slot_family",
+        SemanticEdgeFamily::SameProcess => "same_process",
+        SemanticEdgeFamily::RelatedEvent => "related_event",
+        SemanticEdgeFamily::MissingIntermediateCause => "missing_intermediate_cause",
         SemanticEdgeFamily::EntityStateSupport => "entity_state_support",
         SemanticEdgeFamily::EntityEventSupport => "entity_event_support",
         SemanticEdgeFamily::EventNeighbor => "event_neighbor",
@@ -231,6 +244,8 @@ fn prototype(
     evidence_refs: Vec<String>,
     slot_key: Option<String>,
     value_key: Option<String>,
+    primary_entity_id: Option<String>,
+    secondary_entity_id: Option<String>,
 ) -> Prototype {
     let text_hash = fx_hash64(&text);
     Prototype {
@@ -255,6 +270,8 @@ fn prototype(
         evidence_refs,
         slot_key,
         value_key,
+        primary_entity_id,
+        secondary_entity_id,
     }
 }
 
@@ -274,6 +291,15 @@ fn claim_prototype(claim: &MemoryClaimAtom, narrative_id: &Option<String>) -> Pr
         claim.evidence_refs.clone(),
         Some(claim.slot_key.clone()),
         Some(normalized_key(&claim.object_value)),
+        claim
+            .source_entity_id
+            .as_ref()
+            .map(|entity_id| entity_id.0.clone()),
+        claim
+            .object_entity_id
+            .as_ref()
+            .or(claim.target_entity_id.as_ref())
+            .map(|entity_id| entity_id.0.clone()),
     )
 }
 
@@ -294,6 +320,11 @@ fn state_prototype(state: &MemoryStateRecord, narrative_id: &Option<String>) -> 
             .collect(),
         Some(state.slot_key.clone()),
         Some(normalized_key(&state.value)),
+        Some(state.entity_id.0.clone()),
+        state
+            .value_entity_id
+            .as_ref()
+            .map(|entity_id| entity_id.0.clone()),
     )
 }
 
@@ -318,6 +349,14 @@ fn event_prototype(event: &MemoryEventRecord, narrative_id: &Option<String>) -> 
         Some(normalized_key(
             event.new_value.as_deref().unwrap_or_default(),
         )),
+        event
+            .subject_entity_id
+            .as_ref()
+            .map(|entity_id| entity_id.0.clone()),
+        event
+            .object_entity_id
+            .as_ref()
+            .map(|entity_id| entity_id.0.clone()),
     )
 }
 
@@ -361,6 +400,8 @@ mod tests {
             Vec::new(),
             Some("entity.employer".to_owned()),
             Some("acme".to_owned()),
+            None,
+            None,
         );
         let right = prototype(
             "graph::state::2".to_owned(),
@@ -374,6 +415,8 @@ mod tests {
             Vec::new(),
             Some("entity.employer".to_owned()),
             Some("globex".to_owned()),
+            None,
+            None,
         );
         assert_eq!(
             resolve_family(SemanticEdgeFamily::StateSupport, &left, &right),
@@ -391,6 +434,8 @@ mod tests {
             Vec::new(),
             Some("entity.employer".to_owned()),
             Some("acme".to_owned()),
+            None,
+            None,
         );
         let claim_right = prototype(
             "graph::claim::2".to_owned(),
@@ -404,6 +449,8 @@ mod tests {
             Vec::new(),
             Some("entity.employer".to_owned()),
             Some("globex".to_owned()),
+            None,
+            None,
         );
         assert_eq!(
             resolve_family(SemanticEdgeFamily::ClaimSupport, &claim_left, &claim_right),

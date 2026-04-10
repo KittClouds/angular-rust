@@ -3,17 +3,33 @@ use phoenix_embed::{
 };
 use phoenix_graph::GraphBackendError;
 use phoenix_graph_kernel::{
-    KernelEdge, KernelGraphLayer, KernelGraphSnapshot, KernelMutationBatch, KernelMutationScope,
-    PhoenixGraphKernel,
+    expand_snapshot_region, KernelEdge, KernelGraphSnapshot, KernelQueryView,
 };
+#[cfg(test)]
+use phoenix_graph_kernel::{
+    KernelGraphLayer, KernelMutationBatch, KernelMutationScope, PhoenixGraphKernel,
+};
+#[cfg(test)]
 use phoenix_semantic_v2::scope_storage_key;
 use phoenix_store_native_core::{PhoenixSemanticIndexStore, SemanticNodeNeighbor};
 use phoenix_types::ScopeKey;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 
 use crate::api::GraphQueryError;
 use crate::retrieval::{GraphRetrievedRegion, GraphRetrievedSeed};
 use crate::semantic::ensure_ort_dylib_path;
+
+thread_local! {
+    static QUERY_EMBEDDER_CACHE: RefCell<QueryEmbedderCache> =
+        RefCell::new(QueryEmbedderCache::default());
+}
+
+#[derive(Default)]
+struct QueryEmbedderCache {
+    attempted: bool,
+    embedder: Option<OrtTextEmbedder>,
+}
 
 pub(crate) fn retrieve_query_seeds<S>(
     store: &S,
@@ -75,100 +91,59 @@ pub(crate) fn build_region_from_snapshot(
         })
         .map(|seed| seed.node_id.clone())
         .collect::<Vec<_>>();
-    let mut included = FxHashSet::<String>::default();
-    let mut frontier = Vec::<String>::new();
-    for vertex_id in anchor_vertex_ids.iter().chain(seed_vertex_ids.iter()) {
-        if included.insert(vertex_id.clone()) {
-            frontier.push(vertex_id.clone());
-        }
-    }
-    let all_edges = snapshot
-        .asserted_edges
-        .iter()
-        .chain(snapshot.candidate_edges.iter())
-        .collect::<Vec<_>>();
-    let adjacency = region_adjacency(all_edges.as_slice());
-    let node_limit = region_node_limit.clamp(8, 256);
-    let mut truncated = false;
-    for _ in 0..expansion_hops.clamp(1, 4) {
-        if frontier.is_empty() || included.len() >= node_limit {
-            break;
-        }
-        let mut next_frontier = Vec::new();
-        for vertex_id in frontier {
-            let Some(edges) = adjacency.get(vertex_id.as_str()) else {
-                continue;
-            };
-            for edge in edges {
-                if !edge_allowed(edge) {
-                    continue;
-                }
-                for neighbor in [edge.source_id.0.as_str(), edge.target_id.0.as_str()] {
-                    if included.len() >= node_limit && !included.contains(neighbor) {
-                        truncated = true;
-                        continue;
-                    }
-                    if included.insert(neighbor.to_owned()) {
-                        next_frontier.push(neighbor.to_owned());
-                    }
-                }
-            }
-        }
-        frontier = next_frontier;
-    }
-    let mut vertices = snapshot
-        .vertices
-        .iter()
-        .filter(|vertex| included.contains(vertex.id.0.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut asserted_edges = snapshot
-        .asserted_edges
-        .iter()
-        .filter(|edge| {
-            included.contains(edge.source_id.0.as_str())
-                && included.contains(edge.target_id.0.as_str())
-                && edge_allowed(edge)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut candidate_edges = snapshot
-        .candidate_edges
-        .iter()
-        .filter(|edge| {
-            included.contains(edge.source_id.0.as_str())
-                && included.contains(edge.target_id.0.as_str())
-                && edge_allowed(edge)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    vertices.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-    asserted_edges.sort_by(|left, right| left.source_id.0.cmp(&right.source_id.0));
-    candidate_edges.sort_by(|left, right| left.source_id.0.cmp(&right.source_id.0));
-    let mut included_vertex_ids = vertices
-        .iter()
-        .map(|vertex| vertex.id.0.clone())
-        .collect::<Vec<_>>();
-    included_vertex_ids.sort();
+    let expanded = expand_snapshot_region(
+        snapshot,
+        anchor_vertex_ids.as_slice(),
+        seed_vertex_ids.as_slice(),
+        region_node_limit,
+        expansion_hops,
+        edge_allowed,
+    );
     let region = GraphRetrievedRegion {
-        vertex_count: vertices.len(),
-        asserted_edge_count: asserted_edges.len(),
-        candidate_edge_count: candidate_edges.len(),
-        truncated,
+        vertex_count: expanded.snapshot.vertices.len(),
+        asserted_edge_count: expanded.snapshot.asserted_edges.len(),
+        candidate_edge_count: expanded.snapshot.candidate_edges.len(),
+        truncated: expanded.truncated,
         anchor_vertex_ids,
-        seed_vertex_ids,
-        included_vertex_ids,
+        seed_vertex_ids: expanded.seed_vertex_ids,
+        included_vertex_ids: expanded.included_vertex_ids,
     };
-    (
-        KernelGraphSnapshot {
-            vertices,
-            asserted_edges,
-            candidate_edges,
-        },
-        region,
-    )
+    (expanded.snapshot, region)
 }
 
+pub(crate) fn build_region_from_view(
+    view: &KernelQueryView<'_>,
+    anchor_vertex_ids: Vec<String>,
+    seeds: &[GraphRetrievedSeed],
+    region_node_limit: usize,
+    expansion_hops: usize,
+    edge_allowed: fn(&KernelEdge) -> bool,
+) -> (KernelGraphSnapshot, GraphRetrievedRegion) {
+    let seed_vertex_ids = seeds
+        .iter()
+        .filter(|seed| view.find_vertex(seed.node_id.as_str()).is_some())
+        .map(|seed| seed.node_id.clone())
+        .collect::<Vec<_>>();
+    let expanded = view.expand_region(
+        anchor_vertex_ids.as_slice(),
+        seed_vertex_ids.as_slice(),
+        region_node_limit,
+        expansion_hops,
+        edge_allowed,
+    );
+    let region = GraphRetrievedRegion {
+        vertex_count: expanded.snapshot.vertices.len(),
+        asserted_edge_count: expanded.snapshot.asserted_edges.len(),
+        candidate_edge_count: expanded.snapshot.candidate_edges.len(),
+        truncated: expanded.truncated,
+        anchor_vertex_ids,
+        seed_vertex_ids: expanded.seed_vertex_ids,
+        included_vertex_ids: expanded.included_vertex_ids,
+    };
+    (expanded.snapshot, region)
+}
+
+#[cfg(test)]
 pub(crate) fn kernel_from_snapshot(
     scope: &ScopeKey,
     snapshot: &KernelGraphSnapshot,
@@ -224,37 +199,45 @@ fn seed_from_neighbor(hit: SemanticNodeNeighbor) -> GraphRetrievedSeed {
     }
 }
 
-fn region_adjacency<'a>(edges: &[&'a KernelEdge]) -> FxHashMap<&'a str, Vec<&'a KernelEdge>> {
-    let mut adjacency = FxHashMap::<&str, Vec<&KernelEdge>>::default();
-    for edge in edges {
-        adjacency
-            .entry(edge.source_id.0.as_str())
-            .or_default()
-            .push(*edge);
-        adjacency
-            .entry(edge.target_id.0.as_str())
-            .or_default()
-            .push(*edge);
-    }
-    adjacency
+fn embed_query(query_text: &str) -> Result<Vec<f32>, GraphQueryError> {
+    with_query_embedder(|embedder| {
+        let rows = embedder.embed_texts(&[query_text]).map_err(|error| {
+            GraphBackendError::Operation(format!("query embed inference failed: {error}"))
+        })?;
+        rows.into_iter().next().ok_or_else(|| {
+            GraphQueryError::Kernel(GraphBackendError::Operation(
+                "query embedder returned no vector".to_owned(),
+            ))
+        })
+    })
 }
 
-fn embed_query(query_text: &str) -> Result<Vec<f32>, GraphQueryError> {
-    let _ = ensure_ort_dylib_path();
-    let embedder = OrtTextEmbedder::load(&OrtTextEmbedConfig {
-        model_root: default_embedding_model_root(),
-        batch_size: 1,
-        max_length: 512,
-        profile: TextEmbeddingProfile::Native384,
-        prefix_passage: false,
-    })
-    .map_err(|error| GraphBackendError::Operation(format!("query embed load failed: {error}")))?;
-    let rows = embedder.embed_texts(&[query_text]).map_err(|error| {
-        GraphBackendError::Operation(format!("query embed inference failed: {error}"))
-    })?;
-    rows.into_iter().next().ok_or_else(|| {
-        GraphQueryError::Kernel(GraphBackendError::Operation(
-            "query embedder returned no vector".to_owned(),
-        ))
+fn with_query_embedder<R>(
+    f: impl FnOnce(&OrtTextEmbedder) -> Result<R, GraphQueryError>,
+) -> Result<R, GraphQueryError> {
+    QUERY_EMBEDDER_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if !cache.attempted {
+            cache.attempted = true;
+            let _ = ensure_ort_dylib_path();
+            cache.embedder = Some(
+                OrtTextEmbedder::load(&OrtTextEmbedConfig {
+                    model_root: default_embedding_model_root(),
+                    batch_size: 1,
+                    max_length: 512,
+                    profile: TextEmbeddingProfile::Native384,
+                    prefix_passage: false,
+                })
+                .map_err(|error| {
+                    GraphBackendError::Operation(format!("query embed load failed: {error}"))
+                })?,
+            );
+        }
+        let embedder = cache.embedder.as_ref().ok_or_else(|| {
+            GraphQueryError::Kernel(GraphBackendError::Operation(
+                "query embedder was unavailable".to_owned(),
+            ))
+        })?;
+        f(embedder)
     })
 }

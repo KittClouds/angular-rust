@@ -114,6 +114,7 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
         let mut winning_index = positive[0];
         let mut history = vec![winning_index];
         let mut unresolved_conflict = None::<MemoryConflictRecord>;
+        let mut competitive_conflicts = Vec::<MemoryConflictRecord>::new();
 
         for candidate_index in positive.iter().copied().skip(1) {
             let winner = &claims[winning_index];
@@ -128,12 +129,32 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
             }
             match compare_claims(winner, candidate) {
                 Ordering::Less => {
+                    let conflict = competitive_current_conflict(
+                        winner,
+                        candidate,
+                        &entity_id,
+                        &slot_key,
+                        Some(candidate.claim_id.as_str()),
+                    );
                     claims[winning_index].status = MemoryClaimStatus::Superseded;
+                    if let Some(conflict) = conflict {
+                        competitive_conflicts.push(conflict);
+                    }
                     winning_index = candidate_index;
                     history.push(candidate_index);
                 }
                 Ordering::Greater => {
+                    let conflict = competitive_current_conflict(
+                        winner,
+                        candidate,
+                        &entity_id,
+                        &slot_key,
+                        Some(winner.claim_id.as_str()),
+                    );
                     claims[candidate_index].status = MemoryClaimStatus::Superseded;
+                    if let Some(conflict) = conflict {
+                        competitive_conflicts.push(conflict);
+                    }
                 }
                 Ordering::Equal => {
                     let conflict = MemoryConflictRecord {
@@ -215,6 +236,35 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
             deltas.push(delta);
         }
 
+        if !competitive_conflicts.is_empty() {
+            let mut merged_claim_ids = competitive_conflicts
+                .iter()
+                .flat_map(|conflict| conflict.claim_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            merged_claim_ids.sort();
+            merged_claim_ids.dedup();
+            let merged_temporal = merge_temporal(
+                &competitive_conflicts
+                    .iter()
+                    .map(|conflict| &conflict.temporal)
+                    .collect::<Vec<_>>(),
+            );
+            for conflict in &competitive_conflicts {
+                conflicts.push(conflict.clone());
+                events.push(conflict_event("conflict_opened", conflict));
+            }
+            gaps.push(MemoryContinuityGapRecord {
+                gap_id: format!("gap:competitive:{}:{}", entity_key, slot_key),
+                entity_id: entity_id.clone(),
+                slot_key: slot_key.clone(),
+                kind: MemoryGapKind::UnresolvedConflict,
+                status: MemoryClaimStatus::Deferred,
+                detail: "multiple overlapping current values remain in contention".to_owned(),
+                temporal: merged_temporal,
+                claim_ids: merged_claim_ids,
+            });
+        }
+
         if let Some(mut conflict) = unresolved_conflict {
             conflict.preferred_claim_id = Some(winner.claim_id.clone());
             conflicts.push(conflict.clone());
@@ -279,6 +329,11 @@ pub fn compile_memory(batch: &MemoryNormalizedBatch) -> CompiledMemory {
     );
 
     let relationship_ledgers = build_relationship_ledgers(&claims, &batch.slot_definitions);
+    let (relationship_conflicts, relationship_gaps, relationship_events) =
+        build_relationship_conflicts(&relationship_ledgers);
+    conflicts.extend(relationship_conflicts);
+    gaps.extend(relationship_gaps);
+    events.extend(relationship_events);
     let entity_cards = build_entity_cards(
         &batch.entity_profiles,
         &states,
@@ -351,6 +406,53 @@ fn compare_temporal(left: &BiTemporalWindow, right: &BiTemporalWindow) -> Orderi
 
 fn same_value(left: &MemoryClaimAtom, right: &MemoryClaimAtom) -> bool {
     left.object_value == right.object_value && left.object_entity_id == right.object_entity_id
+}
+
+fn competitive_current_conflict(
+    winner: &MemoryClaimAtom,
+    candidate: &MemoryClaimAtom,
+    entity_id: &EntityId,
+    slot_key: &str,
+    preferred_claim_id: Option<&str>,
+) -> Option<MemoryConflictRecord> {
+    if !current_conflict_compatible(winner, candidate) {
+        return None;
+    }
+    let mut claim_ids = vec![winner.claim_id.clone(), candidate.claim_id.clone()];
+    claim_ids.sort();
+    claim_ids.dedup();
+    Some(MemoryConflictRecord {
+        conflict_id: format!(
+            "conflict:competitive:{}:{}:{}:{}",
+            entity_id.0, slot_key, claim_ids[0], claim_ids[1]
+        ),
+        entity_id: entity_id.clone(),
+        slot_key: slot_key.to_owned(),
+        kind: MemoryConflictKind::TemporalOverlap,
+        preferred_claim_id: preferred_claim_id.map(str::to_owned),
+        status: MemoryClaimStatus::Deferred,
+        temporal: merge_temporal(&[&winner.temporal, &candidate.temporal]),
+        claim_ids,
+    })
+}
+
+fn current_conflict_compatible(left: &MemoryClaimAtom, right: &MemoryClaimAtom) -> bool {
+    !same_value(left, right)
+        && current_window(&left.temporal)
+        && current_window(&right.temporal)
+        && temporal_overlap(&left.temporal, &right.temporal)
+}
+
+fn current_window(window: &BiTemporalWindow) -> bool {
+    window.valid_to.is_none()
+}
+
+fn temporal_overlap(left: &BiTemporalWindow, right: &BiTemporalWindow) -> bool {
+    let left_start = left.valid_from.unwrap_or(i64::MIN);
+    let left_end = left.valid_to.unwrap_or(i64::MAX);
+    let right_start = right.valid_from.unwrap_or(i64::MIN);
+    let right_end = right.valid_to.unwrap_or(i64::MAX);
+    left_start <= right_end && right_start <= left_end
 }
 
 fn merge_temporal(temporals: &[&BiTemporalWindow]) -> BiTemporalWindow {
@@ -567,6 +669,56 @@ fn build_relationship_ledgers(
     }
     ledgers.sort_by(|left, right| left.ledger_id.cmp(&right.ledger_id));
     ledgers
+}
+
+fn build_relationship_conflicts(
+    ledgers: &[RelationshipMemoryLedger],
+) -> (
+    Vec<MemoryConflictRecord>,
+    Vec<MemoryContinuityGapRecord>,
+    Vec<MemoryEventRecord>,
+) {
+    let mut conflicts = Vec::new();
+    let mut gaps = Vec::new();
+    let mut events = Vec::new();
+    for ledger in ledgers {
+        if ledger.supporting_claim_ids.is_empty() || ledger.contradicting_claim_ids.is_empty() {
+            continue;
+        }
+        let mut claim_ids = ledger
+            .supporting_claim_ids
+            .iter()
+            .chain(ledger.contradicting_claim_ids.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        claim_ids.sort();
+        claim_ids.dedup();
+        let slot_key = format!("relation.{}", ledger.relation_family);
+        let conflict = MemoryConflictRecord {
+            conflict_id: format!("conflict:relationship:{}", ledger.ledger_id),
+            entity_id: ledger.source_entity_id.clone(),
+            slot_key: slot_key.clone(),
+            kind: MemoryConflictKind::SupportVsContradiction,
+            preferred_claim_id: ledger.supporting_claim_ids.first().cloned(),
+            status: MemoryClaimStatus::Deferred,
+            temporal: ledger.temporal.clone(),
+            claim_ids: claim_ids.clone(),
+        };
+        let gap = MemoryContinuityGapRecord {
+            gap_id: format!("gap:relationship:{}", ledger.ledger_id),
+            entity_id: ledger.source_entity_id.clone(),
+            slot_key,
+            kind: MemoryGapKind::UnresolvedConflict,
+            status: MemoryClaimStatus::Deferred,
+            detail: "relationship ledger contains supporting and contradicting evidence".to_owned(),
+            temporal: ledger.temporal.clone(),
+            claim_ids,
+        };
+        events.push(conflict_event("conflict_opened", &conflict));
+        conflicts.push(conflict);
+        gaps.push(gap);
+    }
+    (conflicts, gaps, events)
 }
 
 fn build_entity_cards(

@@ -247,6 +247,25 @@ fn sample_relation_sidecar() -> RelationScopePatchSidecar {
     }
 }
 
+fn sample_prefixed_relation_sidecar() -> RelationScopePatchSidecar {
+    let mut sidecar = sample_relation_sidecar();
+    sidecar.edge_additions = vec![RelationEdgeAddition {
+        case_id: "case-prefixed-loc".to_owned(),
+        document_id: "doc-1".to_owned(),
+        window_id: "window-prefixed".to_owned(),
+        source_entity_id: EntityId("e1".to_owned()),
+        target_entity_id: EntityId("e3".to_owned()),
+        edge_type: "window::located_in".to_owned(),
+        confidence_millis: 805,
+        evidence_refs: vec!["ev:prefixed".to_owned()],
+        created_at: 305,
+    }];
+    sidecar.support_judgments.clear();
+    sidecar.contradiction_judgments.clear();
+    sidecar.decisions.clear();
+    sidecar
+}
+
 #[test]
 fn normalizes_claims_from_relation_and_er_inputs() {
     let archive = sample_archive();
@@ -276,6 +295,37 @@ fn normalizes_claims_from_relation_and_er_inputs() {
         .iter()
         .any(|claim| claim.source_class == "er_alias_addition"));
     assert!(!normalized.pending_reviews.is_empty());
+}
+
+#[test]
+fn normalizes_prefixed_relation_families_into_state_slots() {
+    let normalized = normalize_memory_inputs(
+        &[sample_archive()],
+        Some(&sample_session()),
+        None,
+        None,
+        Some(&sample_prefixed_relation_sidecar()),
+        None,
+    );
+    assert!(normalized.claims.iter().any(|claim| {
+        claim.source_class == "relation_edge_addition"
+            && claim.relation_family.as_deref() == Some("located_in")
+            && claim.slot_key == "entity.location"
+    }));
+
+    let batch = derive_scope_review_batch(
+        &[sample_archive()],
+        Some(&sample_session()),
+        None,
+        None,
+        None,
+        Some(&sample_prefixed_relation_sidecar()),
+        None,
+    );
+    assert!(batch
+        .states
+        .iter()
+        .any(|state| state.slot_key == "entity.location" && state.value == "New Rome"));
 }
 
 #[test]
