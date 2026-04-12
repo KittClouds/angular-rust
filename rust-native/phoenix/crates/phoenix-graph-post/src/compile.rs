@@ -5,10 +5,10 @@ use phoenix_graph_kernel::{
 };
 use phoenix_semantic_v2::{
     CanonicalEventId, CanonicalEventRecord, CausalEdgeAddition, CausalScopeSidecar,
-    EventIdentityScopeSidecar, GraphCompilerSummary, MemoryClaimAtom, MemoryConflictRecord,
-    MemoryContinuityGapRecord, MemoryEventRecord, MemoryScopeSidecar, MemoryStateRecord,
-    TemporalAnchorId, TemporalAnchorRecord, TemporalReferenceEdge, TemporalScopeSidecar,
-    TemporalTimexId, TemporalTimexRecord,
+    DocumentArchive, EventIdentityScopeSidecar, GraphCompilerSummary, MemoryClaimAtom,
+    MemoryConflictRecord, MemoryContinuityGapRecord, MemoryEventRecord, MemoryScopeSidecar,
+    MemoryStateRecord, TemporalAnchorId, TemporalAnchorRecord, TemporalReferenceEdge,
+    TemporalScopeSidecar, TemporalTimexId, TemporalTimexRecord,
 };
 use phoenix_types::{BiTemporalWindow, EntityId, SemanticNodeRef};
 use rustc_hash::FxHashMap;
@@ -28,9 +28,32 @@ struct GraphProjectionBuilder {
     edges: FxHashMap<String, KernelEdge>,
 }
 
+#[derive(Clone, Debug)]
+struct CausalEndpointResolution {
+    vertex_id: String,
+    vertex: KernelVertex,
+    semantic_kind: &'static str,
+    semantic_id: String,
+    label: String,
+    tier: &'static str,
+    fallback: bool,
+    promoted: bool,
+}
+
+struct CausalEndpointContext<'a> {
+    canonical_by_event: &'a FxHashMap<String, CanonicalEventId>,
+    canonical_by_semantic_node: &'a FxHashMap<String, CanonicalEventId>,
+    raw_event_by_semantic_node: &'a FxHashMap<String, String>,
+    label_by_semantic_node: &'a FxHashMap<String, String>,
+}
+
 impl GraphProjectionBuilder {
     fn add_vertex(&mut self, vertex: KernelVertex) {
         self.vertices.insert(vertex.id.0.clone(), vertex);
+    }
+
+    fn add_vertex_if_missing(&mut self, vertex: KernelVertex) {
+        self.vertices.entry(vertex.id.0.clone()).or_insert(vertex);
     }
 
     fn add_edge(&mut self, edge: KernelEdge) {
@@ -72,8 +95,41 @@ pub fn compile_graph_projection(
     memory_sidecar: Option<&MemoryScopeSidecar>,
     recorded_at: Option<i64>,
 ) -> CompiledGraphProjection {
+    compile_graph_projection_with_archives(
+        scope_key,
+        &[],
+        event_identity_sidecar,
+        temporal_sidecar,
+        causal_sidecar,
+        memory_sidecar,
+        recorded_at,
+    )
+}
+
+pub(crate) fn compile_graph_projection_with_archives(
+    scope_key: &str,
+    archives: &[DocumentArchive],
+    event_identity_sidecar: Option<&EventIdentityScopeSidecar>,
+    temporal_sidecar: Option<&TemporalScopeSidecar>,
+    causal_sidecar: Option<&CausalScopeSidecar>,
+    memory_sidecar: Option<&MemoryScopeSidecar>,
+    recorded_at: Option<i64>,
+) -> CompiledGraphProjection {
     let mut builder = GraphProjectionBuilder::default();
     let canonical_by_event = canonical_event_ids_by_event(event_identity_sidecar);
+    let raw_event_by_semantic_node = raw_event_ids_by_semantic_node(archives);
+    let label_by_semantic_node = labels_by_semantic_node(archives);
+    let canonical_by_semantic_node = canonical_event_ids_by_semantic_node(
+        causal_sidecar,
+        &canonical_by_event,
+        &raw_event_by_semantic_node,
+    );
+    let endpoint_context = CausalEndpointContext {
+        canonical_by_event: &canonical_by_event,
+        canonical_by_semantic_node: &canonical_by_semantic_node,
+        raw_event_by_semantic_node: &raw_event_by_semantic_node,
+        label_by_semantic_node: &label_by_semantic_node,
+    };
 
     if let Some(sidecar) = event_identity_sidecar {
         for event in &sidecar.canonical_events {
@@ -166,7 +222,29 @@ pub fn compile_graph_projection(
 
     if let Some(sidecar) = causal_sidecar {
         for edge_record in &sidecar.edge_additions {
-            builder.add_edge(causal_kernel_edge(edge_record, &canonical_by_event));
+            let causal_temporal = kernel_temporal(&edge_record.effective_interval);
+            let source_endpoint = causal_endpoint_resolution(
+                &edge_record.source,
+                edge_record.canonical_cause_event_id.as_ref(),
+                &endpoint_context,
+                edge_record.document_id.as_str(),
+                &causal_temporal,
+            );
+            let target_endpoint = causal_endpoint_resolution(
+                &edge_record.target,
+                edge_record.canonical_effect_event_id.as_ref(),
+                &endpoint_context,
+                edge_record.document_id.as_str(),
+                &causal_temporal,
+            );
+            builder.add_vertex_if_missing(source_endpoint.vertex.clone());
+            builder.add_vertex_if_missing(target_endpoint.vertex.clone());
+            builder.add_edge(causal_kernel_edge(
+                edge_record,
+                &source_endpoint,
+                &target_endpoint,
+                &causal_temporal,
+            ));
         }
     }
 
@@ -515,6 +593,140 @@ fn canonical_event_ids_by_event(
     rows
 }
 
+fn raw_event_ids_by_semantic_node(archives: &[DocumentArchive]) -> FxHashMap<String, String> {
+    let mut rows = FxHashMap::default();
+    for archive in archives {
+        let Some(substrate) = archive.causal_substrate.as_ref() else {
+            continue;
+        };
+        let mut event_by_proposition = FxHashMap::<String, String>::default();
+        for event in &substrate.semantic_events {
+            if let Some(event_id) = event.event_id.as_ref() {
+                event_by_proposition
+                    .entry(event.proposition_id.to_string())
+                    .or_insert_with(|| event_id.0.clone());
+            }
+        }
+        for claim in &substrate.semantic_claims {
+            if let (Some(claim_id), Some(event_id)) = (
+                claim.claim_id.as_ref(),
+                event_by_proposition.get(&claim.proposition_id.to_string()),
+            ) {
+                rows.entry(claim_id.0.clone())
+                    .or_insert_with(|| event_id.clone());
+            }
+        }
+        for state in &substrate.semantic_states {
+            if let (Some(state_id), Some(event_id)) = (
+                state.state_id.as_ref(),
+                event_by_proposition.get(&state.proposition_id.to_string()),
+            ) {
+                rows.entry(state_id.0.clone())
+                    .or_insert_with(|| event_id.clone());
+            }
+        }
+    }
+    rows
+}
+
+fn labels_by_semantic_node(archives: &[DocumentArchive]) -> FxHashMap<String, String> {
+    let mut rows = FxHashMap::default();
+    for archive in archives {
+        let Some(substrate) = archive.causal_substrate.as_ref() else {
+            continue;
+        };
+        for event in &substrate.semantic_events {
+            if let Some(event_id) = event.event_id.as_ref() {
+                rows.entry(event_id.0.clone())
+                    .or_insert_with(|| event.label.to_string());
+            }
+        }
+        for claim in &substrate.semantic_claims {
+            if let Some(claim_id) = claim.claim_id.as_ref() {
+                rows.entry(claim_id.0.clone())
+                    .or_insert_with(|| claim.label.to_string());
+            }
+        }
+        for state in &substrate.semantic_states {
+            if let Some(state_id) = state.state_id.as_ref() {
+                rows.entry(state_id.0.clone())
+                    .or_insert_with(|| state.label.to_string());
+            }
+        }
+    }
+    rows
+}
+
+fn canonical_event_ids_by_semantic_node(
+    causal_sidecar: Option<&CausalScopeSidecar>,
+    canonical_by_event: &FxHashMap<String, CanonicalEventId>,
+    raw_event_by_semantic_node: &FxHashMap<String, String>,
+) -> FxHashMap<String, CanonicalEventId> {
+    let mut rows = FxHashMap::default();
+    for (semantic_id, event_id) in raw_event_by_semantic_node {
+        if let Some(canonical_event_id) = canonical_by_event.get(event_id.as_str()) {
+            rows.insert(semantic_id.clone(), canonical_event_id.clone());
+        }
+    }
+    let Some(sidecar) = causal_sidecar else {
+        return rows;
+    };
+    for atom in &sidecar.claim_atoms {
+        insert_canonical_for_node(
+            &mut rows,
+            &atom.cause_event,
+            atom.canonical_cause_event_id.as_ref(),
+        );
+        insert_canonical_for_node(
+            &mut rows,
+            &atom.effect_event,
+            atom.canonical_effect_event_id.as_ref(),
+        );
+    }
+    for edge in sidecar
+        .edge_records
+        .iter()
+        .chain(sidecar.edge_additions.iter())
+    {
+        insert_canonical_for_node(
+            &mut rows,
+            &edge.source,
+            edge.canonical_cause_event_id.as_ref(),
+        );
+        insert_canonical_for_node(
+            &mut rows,
+            &edge.target,
+            edge.canonical_effect_event_id.as_ref(),
+        );
+    }
+    for review in &sidecar.counterfactual_reviews {
+        insert_canonical_for_node(
+            &mut rows,
+            &review.source,
+            review.canonical_cause_event_id.as_ref(),
+        );
+        insert_canonical_for_node(
+            &mut rows,
+            &review.target,
+            review.canonical_effect_event_id.as_ref(),
+        );
+    }
+    rows
+}
+
+fn insert_canonical_for_node(
+    rows: &mut FxHashMap<String, CanonicalEventId>,
+    node: &SemanticNodeRef,
+    canonical_event_id: Option<&CanonicalEventId>,
+) {
+    if let Some(canonical_event_id) = canonical_event_id {
+        rows.insert(
+            semantic_node_raw_id(node).to_owned(),
+            canonical_event_id.clone(),
+        );
+    }
+}
+
 fn canonical_event_vertex(event: &CanonicalEventRecord) -> KernelVertex {
     KernelVertex {
         id: KernelVertexId(canonical_event_vertex_id(&event.canonical_event_id)),
@@ -788,21 +1000,13 @@ fn temporal_reference_kernel_edge(
 
 fn causal_kernel_edge(
     record: &CausalEdgeAddition,
-    canonical_by_event: &FxHashMap<String, CanonicalEventId>,
+    source: &CausalEndpointResolution,
+    target: &CausalEndpointResolution,
+    temporal: &KernelBiTemporal,
 ) -> KernelEdge {
-    let source_id = semantic_node_vertex_id(
-        &record.source,
-        record.canonical_cause_event_id.as_ref(),
-        canonical_by_event,
-    );
-    let target_id = semantic_node_vertex_id(
-        &record.target,
-        record.canonical_effect_event_id.as_ref(),
-        canonical_by_event,
-    );
     edge(
-        &source_id,
-        &target_id,
+        &source.vertex_id,
+        &target.vertex_id,
         "causal_link",
         KernelRelationClass::Semantic,
         json!({
@@ -813,11 +1017,126 @@ fn causal_kernel_edge(
             "status": label_of(&record.status),
             "cue": record.cue,
             "polarity": label_of(&record.polarity),
+            "sourceSemanticNodeKind": source.semantic_kind,
+            "sourceSemanticNodeId": source.semantic_id,
+            "sourceSemanticLabel": source.label,
+            "sourceEndpointResolutionTier": source.tier,
+            "sourceEndpointFallback": source.fallback,
+            "sourceEndpointPromoted": source.promoted,
+            "targetSemanticNodeKind": target.semantic_kind,
+            "targetSemanticNodeId": target.semantic_id,
+            "targetSemanticLabel": target.label,
+            "targetEndpointResolutionTier": target.tier,
+            "targetEndpointFallback": target.fallback,
+            "targetEndpointPromoted": target.promoted,
         }),
         Some(record.document_id.clone()),
-        Some(kernel_temporal(&record.effective_interval)),
+        Some(temporal.clone()),
         provenance("causal", record.confidence_millis, &record.evidence_refs),
     )
+}
+
+fn causal_endpoint_resolution(
+    node: &SemanticNodeRef,
+    canonical_event_id: Option<&CanonicalEventId>,
+    context: &CausalEndpointContext<'_>,
+    document_id: &str,
+    temporal: &KernelBiTemporal,
+) -> CausalEndpointResolution {
+    let semantic_kind = semantic_node_kind(node);
+    let semantic_id = semantic_node_raw_id(node).to_owned();
+    let label = context
+        .label_by_semantic_node
+        .get(semantic_id.as_str())
+        .cloned()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| semantic_id.clone());
+    let (vertex_id, tier, fallback, promoted) = if let Some(canonical_event_id) = canonical_event_id
+    {
+        (
+            canonical_event_vertex_id(canonical_event_id),
+            "canonicalEventField",
+            false,
+            !matches!(node, SemanticNodeRef::Event(_)),
+        )
+    } else if let Some(canonical_event_id) =
+        context.canonical_by_semantic_node.get(semantic_id.as_str())
+    {
+        (
+            canonical_event_vertex_id(canonical_event_id),
+            "semanticNodeCanonical",
+            false,
+            !matches!(node, SemanticNodeRef::Event(_)),
+        )
+    } else if let Some(raw_event_id) = context.raw_event_by_semantic_node.get(semantic_id.as_str())
+    {
+        if let Some(canonical_event_id) = context.canonical_by_event.get(raw_event_id.as_str()) {
+            (
+                canonical_event_vertex_id(canonical_event_id),
+                "semanticSiblingCanonicalEvent",
+                false,
+                !matches!(node, SemanticNodeRef::Event(_)),
+            )
+        } else {
+            (
+                memory_event_vertex_id(raw_event_id.as_str()),
+                "semanticSiblingRawEvent",
+                false,
+                !matches!(node, SemanticNodeRef::Event(_)),
+            )
+        }
+    } else if let SemanticNodeRef::Event(event_id) = node {
+        if let Some(canonical_event_id) = context.canonical_by_event.get(event_id.0.as_str()) {
+            (
+                canonical_event_vertex_id(canonical_event_id),
+                "eventIdentityCanonical",
+                false,
+                false,
+            )
+        } else {
+            (
+                memory_event_vertex_id(event_id.0.as_str()),
+                "rawEvent",
+                false,
+                false,
+            )
+        }
+    } else {
+        match node {
+            SemanticNodeRef::Event(_) => unreachable!("event refs are handled before fallback"),
+            SemanticNodeRef::Claim(claim_id) => (
+                claim_vertex_id(claim_id.0.as_str()),
+                "fallbackSemanticClaim",
+                true,
+                false,
+            ),
+            SemanticNodeRef::State(state_id) => (
+                state_vertex_id(state_id.0.as_str()),
+                "stateRef",
+                false,
+                false,
+            ),
+        }
+    };
+    let vertex = match node {
+        SemanticNodeRef::Claim(_) if fallback => {
+            causal_endpoint_claim_vertex(&vertex_id, node, &label, document_id, temporal)
+        }
+        SemanticNodeRef::State(_) if fallback => {
+            causal_endpoint_state_vertex(&vertex_id, node, &label, document_id, temporal)
+        }
+        _ => causal_endpoint_event_vertex(&vertex_id, node, &label, document_id, temporal),
+    };
+    CausalEndpointResolution {
+        vertex_id,
+        vertex,
+        semantic_kind,
+        semantic_id,
+        label,
+        tier,
+        fallback,
+        promoted,
+    }
 }
 
 fn temporal_target_vertex_id(
@@ -834,22 +1153,6 @@ fn temporal_target_vertex_id(
             })
         })
         .or_else(|| record.target_timex_id.as_ref().map(timex_vertex_id))
-}
-
-fn semantic_node_vertex_id(
-    node: &SemanticNodeRef,
-    canonical_event_id: Option<&CanonicalEventId>,
-    canonical_by_event: &FxHashMap<String, CanonicalEventId>,
-) -> String {
-    match node {
-        SemanticNodeRef::Event(event_id) => canonical_or_raw_event_vertex_id(
-            canonical_event_id,
-            Some(event_id.0.as_str()),
-            canonical_by_event,
-        ),
-        SemanticNodeRef::Claim(claim_id) => claim_vertex_id(claim_id.0.as_str()),
-        SemanticNodeRef::State(state_id) => state_vertex_id(state_id.0.as_str()),
-    }
 }
 
 fn canonical_or_raw_event_vertex_id(
@@ -940,6 +1243,110 @@ fn scalar_value_vertex(id: &str, value: &str, temporal: &BiTemporalWindow) -> Ke
 
 fn view_vertex(id: &str, value: Value) -> KernelVertex {
     simple_vertex(id, "view", KernelVertexClass::Generic, value, None)
+}
+
+fn causal_endpoint_event_vertex(
+    id: &str,
+    node: &SemanticNodeRef,
+    label: &str,
+    document_id: &str,
+    temporal: &KernelBiTemporal,
+) -> KernelVertex {
+    let mut vertex = simple_vertex(
+        id,
+        "event",
+        KernelVertexClass::Event,
+        json!({
+            "label": label,
+            "eventType": "causalEndpoint",
+        }),
+        Some(temporal.clone()),
+    );
+    vertex.labels = vec![label.to_owned()];
+    vertex.attributes = json!({
+        "sourceClass": "causal_endpoint",
+        "semanticNodeKind": semantic_node_kind(node),
+        "semanticNodeId": semantic_node_raw_id(node),
+        "semanticLabel": label,
+    });
+    vertex.document_id = Some(document_id.to_owned());
+    vertex.provenance.source = Some("causal".to_owned());
+    vertex
+}
+
+fn causal_endpoint_claim_vertex(
+    id: &str,
+    node: &SemanticNodeRef,
+    label: &str,
+    document_id: &str,
+    temporal: &KernelBiTemporal,
+) -> KernelVertex {
+    let mut vertex = simple_vertex(
+        id,
+        "claim",
+        KernelVertexClass::Generic,
+        json!({
+            "slotKey": "semantic.claim",
+            "objectValue": label,
+            "status": "active",
+            "modality": "asserted",
+        }),
+        Some(temporal.clone()),
+    );
+    vertex.labels = vec!["semantic.claim".to_owned(), label.to_owned()];
+    vertex.attributes = json!({
+        "sourceClass": "causal_semantic_claim",
+        "semanticNodeId": semantic_node_raw_id(node),
+        "semanticLabel": label,
+    });
+    vertex.document_id = Some(document_id.to_owned());
+    vertex.provenance.source = Some("causal".to_owned());
+    vertex
+}
+
+fn causal_endpoint_state_vertex(
+    id: &str,
+    node: &SemanticNodeRef,
+    label: &str,
+    document_id: &str,
+    temporal: &KernelBiTemporal,
+) -> KernelVertex {
+    let mut vertex = simple_vertex(
+        id,
+        "state",
+        KernelVertexClass::State,
+        json!({
+            "slotKey": "semantic.state",
+            "value": label,
+            "status": "active",
+        }),
+        Some(temporal.clone()),
+    );
+    vertex.labels = vec!["semantic.state".to_owned(), label.to_owned()];
+    vertex.attributes = json!({
+        "sourceClass": "causal_semantic_state",
+        "semanticNodeId": semantic_node_raw_id(node),
+        "semanticLabel": label,
+    });
+    vertex.document_id = Some(document_id.to_owned());
+    vertex.provenance.source = Some("causal".to_owned());
+    vertex
+}
+
+fn semantic_node_kind(node: &SemanticNodeRef) -> &'static str {
+    match node {
+        SemanticNodeRef::Event(_) => "event",
+        SemanticNodeRef::Claim(_) => "claim",
+        SemanticNodeRef::State(_) => "state",
+    }
+}
+
+fn semantic_node_raw_id(node: &SemanticNodeRef) -> &str {
+    match node {
+        SemanticNodeRef::Event(id) => id.0.as_str(),
+        SemanticNodeRef::Claim(id) => id.0.as_str(),
+        SemanticNodeRef::State(id) => id.0.as_str(),
+    }
 }
 
 fn kernel_temporal(window: &BiTemporalWindow) -> KernelBiTemporal {
@@ -1041,4 +1448,296 @@ fn canonical_event_view_id(event: &CanonicalEventRecord) -> String {
         slug(label_of(&event.modality_semantics).as_str()),
         slug(event.realis.as_str())
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phoenix_graph_kernel::{causal_path_candidate_views_from_snapshot, KernelGraphSnapshot};
+    use phoenix_semantic_v2::{
+        CausalClaimStatus, CausalEdgeId, CausalRelationKind, DocumentCausalSubstrate,
+    };
+    use phoenix_types::{CausalKind, ClaimId, ClaimRecord, EventId, EventRecord, Polarity};
+
+    #[test]
+    fn causal_claim_endpoint_is_materialized_for_runtime_paths() {
+        let canonical_effect = CanonicalEventId("canonical:effect".to_owned());
+        let sidecar = CausalScopeSidecar {
+            edge_additions: vec![test_causal_edge(
+                SemanticNodeRef::Claim(ClaimId("claim:prop:source".to_owned())),
+                None,
+                SemanticNodeRef::Event(EventId("event:raw:effect".to_owned())),
+                Some(canonical_effect.clone()),
+            )],
+            ..CausalScopeSidecar::default()
+        };
+
+        let projection =
+            compile_graph_projection("scope", None, None, Some(&sidecar), None, Some(100));
+        let source_id = "graph::claim::claim:prop:source";
+        let target_id = canonical_event_vertex_id(&canonical_effect);
+
+        assert!(projection
+            .graph_batch
+            .vertices
+            .iter()
+            .any(|vertex| vertex.id.0 == source_id && vertex.kind == "claim"));
+        assert!(projection
+            .graph_batch
+            .vertices
+            .iter()
+            .any(|vertex| vertex.id.0 == target_id && vertex.kind == "event"));
+        let causal_edge = projection
+            .graph_batch
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type.0 == "causal_link"
+                    && edge.source_id.0 == source_id
+                    && edge.target_id.0 == target_id
+            })
+            .expect("causal edge");
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceEndpointResolutionTier")
+                .and_then(serde_json::Value::as_str),
+            Some("fallbackSemanticClaim")
+        );
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("targetEndpointResolutionTier")
+                .and_then(serde_json::Value::as_str),
+            Some("canonicalEventField")
+        );
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceEndpointFallback")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(projection.graph_batch.edges.iter().any(|edge| {
+            edge.edge_type.0 == "causal_link"
+                && edge.source_id.0 == source_id
+                && edge.target_id.0 == target_id
+        }));
+
+        let snapshot = KernelGraphSnapshot {
+            vertices: projection.graph_batch.vertices,
+            asserted_edges: projection.graph_batch.edges,
+            candidate_edges: Vec::new(),
+        };
+        let paths = causal_path_candidate_views_from_snapshot(&snapshot, &target_id, 3, 4);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].source_vertex_id, source_id);
+    }
+
+    #[test]
+    fn causal_claim_endpoint_promotes_to_canonical_event_when_available() {
+        let canonical_cause = CanonicalEventId("canonical:cause".to_owned());
+        let canonical_effect = CanonicalEventId("canonical:effect".to_owned());
+        let sidecar = CausalScopeSidecar {
+            edge_additions: vec![test_causal_edge(
+                SemanticNodeRef::Claim(ClaimId("claim:prop:source".to_owned())),
+                Some(canonical_cause.clone()),
+                SemanticNodeRef::Event(EventId("event:raw:effect".to_owned())),
+                Some(canonical_effect.clone()),
+            )],
+            ..CausalScopeSidecar::default()
+        };
+
+        let projection =
+            compile_graph_projection("scope", None, None, Some(&sidecar), None, Some(100));
+        let source_id = canonical_event_vertex_id(&canonical_cause);
+        let target_id = canonical_event_vertex_id(&canonical_effect);
+        let causal_edge = projection
+            .graph_batch
+            .edges
+            .iter()
+            .find(|edge| edge.edge_type.0 == "causal_link")
+            .expect("causal edge");
+
+        assert_eq!(causal_edge.source_id.0, source_id);
+        assert_eq!(causal_edge.target_id.0, target_id);
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceEndpointPromoted")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(projection
+            .graph_batch
+            .vertices
+            .iter()
+            .any(|vertex| vertex.id.0 == source_id && vertex.kind == "event"));
+    }
+
+    #[test]
+    fn causal_claim_endpoint_promotes_to_sibling_raw_event_from_archive() {
+        let archive = DocumentArchive {
+            causal_substrate: Some(DocumentCausalSubstrate {
+                semantic_events: vec![EventRecord {
+                    event_id: Some(EventId("event:source".to_owned())),
+                    label: "source".into(),
+                    proposition_id: "prop:source".into(),
+                    ..EventRecord::default()
+                }],
+                semantic_claims: vec![ClaimRecord {
+                    claim_id: Some(ClaimId("claim:prop:source".to_owned())),
+                    label: "source claim".into(),
+                    proposition_id: "prop:source".into(),
+                    ..ClaimRecord::default()
+                }],
+                ..DocumentCausalSubstrate::default()
+            }),
+            ..DocumentArchive::default()
+        };
+        let sidecar = CausalScopeSidecar {
+            edge_additions: vec![test_causal_edge(
+                SemanticNodeRef::Claim(ClaimId("claim:prop:source".to_owned())),
+                None,
+                SemanticNodeRef::Event(EventId("event:effect".to_owned())),
+                None,
+            )],
+            ..CausalScopeSidecar::default()
+        };
+
+        let projection = compile_graph_projection_with_archives(
+            "scope",
+            &[archive],
+            None,
+            None,
+            Some(&sidecar),
+            None,
+            Some(100),
+        );
+        let causal_edge = projection
+            .graph_batch
+            .edges
+            .iter()
+            .find(|edge| edge.edge_type.0 == "causal_link")
+            .expect("causal edge");
+
+        assert_eq!(
+            causal_edge.source_id.0,
+            "graph::event::memory::event:source"
+        );
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceEndpointResolutionTier")
+                .and_then(serde_json::Value::as_str),
+            Some("semanticSiblingRawEvent")
+        );
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceEndpointPromoted")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceSemanticLabel")
+                .and_then(serde_json::Value::as_str),
+            Some("source claim")
+        );
+        assert_eq!(
+            causal_edge
+                .attributes
+                .get("sourceEndpointFallback")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn causal_fallback_claim_endpoint_uses_archive_label() {
+        let archive = DocumentArchive {
+            causal_substrate: Some(DocumentCausalSubstrate {
+                semantic_claims: vec![ClaimRecord {
+                    claim_id: Some(ClaimId("claim:prop:source".to_owned())),
+                    label: "the bridge collapsed".into(),
+                    proposition_id: "prop:source".into(),
+                    ..ClaimRecord::default()
+                }],
+                ..DocumentCausalSubstrate::default()
+            }),
+            ..DocumentArchive::default()
+        };
+        let sidecar = CausalScopeSidecar {
+            edge_additions: vec![test_causal_edge(
+                SemanticNodeRef::Claim(ClaimId("claim:prop:source".to_owned())),
+                None,
+                SemanticNodeRef::Event(EventId("event:effect".to_owned())),
+                None,
+            )],
+            ..CausalScopeSidecar::default()
+        };
+
+        let projection = compile_graph_projection_with_archives(
+            "scope",
+            &[archive],
+            None,
+            None,
+            Some(&sidecar),
+            None,
+            Some(100),
+        );
+        let source = projection
+            .graph_batch
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id.0 == "graph::claim::claim:prop:source")
+            .expect("claim endpoint");
+
+        assert_eq!(source.labels[1], "the bridge collapsed");
+        assert_eq!(
+            source
+                .value
+                .get("objectValue")
+                .and_then(serde_json::Value::as_str),
+            Some("the bridge collapsed")
+        );
+    }
+
+    fn test_causal_edge(
+        source: SemanticNodeRef,
+        canonical_cause_event_id: Option<CanonicalEventId>,
+        target: SemanticNodeRef,
+        canonical_effect_event_id: Option<CanonicalEventId>,
+    ) -> CausalEdgeAddition {
+        CausalEdgeAddition {
+            edge_id: CausalEdgeId("edge:1".to_owned()),
+            case_id: "case:1".to_owned(),
+            document_id: "doc:1".to_owned(),
+            source,
+            canonical_cause_event_id,
+            target,
+            canonical_effect_event_id,
+            kind: CausalKind::Causes,
+            relation_kind: CausalRelationKind::DirectCause,
+            status: CausalClaimStatus::Supported,
+            first_seen_revision: 1,
+            latest_decision_id: None,
+            confidence_millis: 870,
+            cue: None,
+            attributed_to: None,
+            polarity: Polarity::Positive,
+            claim_atom_ids: Vec::new(),
+            evidence_refs: vec!["evidence:1".to_owned()],
+            effective_interval: BiTemporalWindow {
+                valid_from: Some(10),
+                recorded_from: Some(100),
+                ..BiTemporalWindow::default()
+            },
+            observation_interval: BiTemporalWindow::default(),
+            temporal_certainty_millis: 1000,
+            created_at: 100,
+        }
+    }
 }

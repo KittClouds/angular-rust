@@ -9,9 +9,12 @@ use crate::api::{
     GraphRankedCausalExplanationAnswer, GraphRankedHistoryAnswer, GraphRankedSlotAnswer,
     GraphTruthPlane, GraphWorldStateQueryRequest,
 };
-use crate::retrieval_causal::retrieved_causal_explanation_impl;
-use crate::retrieval_history::retrieved_history_impl;
-use crate::retrieval_world::retrieved_world_state_impl;
+use crate::query_session::{open_scope_query_session, ScopeQuerySession};
+use crate::retrieval_causal::{
+    retrieved_causal_explanation_impl, retrieved_causal_explanation_with_session_impl,
+};
+use crate::retrieval_history::{retrieved_history_impl, retrieved_history_with_session_impl};
+use crate::retrieval_world::{retrieved_world_state_impl, retrieved_world_state_with_session_impl};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,6 +211,27 @@ pub enum GraphRetrievedQueryAnswer {
     },
 }
 
+pub fn open_retrieved_query_session<S>(
+    store: &S,
+    scope: &ScopeKey,
+) -> Result<Option<ScopeQuerySession>, GraphQueryError>
+where
+    S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore,
+{
+    open_scope_query_session(store, scope)
+}
+
+pub fn retrieved_world_state_with_session<S>(
+    store: &S,
+    session: &ScopeQuerySession,
+    request: &GraphRetrievedWorldStateQueryRequest,
+) -> Result<Option<GraphRetrievedWorldStateAnswer>, GraphQueryError>
+where
+    S: PhoenixSemanticIndexStore,
+{
+    retrieved_world_state_with_session_impl(store, session, request)
+}
+
 pub fn retrieved_world_state<S>(
     store: &S,
     scope: &ScopeKey,
@@ -219,6 +243,17 @@ where
     retrieved_world_state_impl(store, scope, request)
 }
 
+pub fn retrieved_history_with_session<S>(
+    store: &S,
+    session: &ScopeQuerySession,
+    request: &GraphRetrievedHistoryQueryRequest,
+) -> Result<Option<GraphRetrievedHistoryAnswer>, GraphQueryError>
+where
+    S: PhoenixSemanticIndexStore,
+{
+    retrieved_history_with_session_impl(store, session, request)
+}
+
 pub fn retrieved_history<S>(
     store: &S,
     scope: &ScopeKey,
@@ -228,6 +263,17 @@ where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore + PhoenixSemanticIndexStore,
 {
     retrieved_history_impl(store, scope, request)
+}
+
+pub fn retrieved_causal_explanation_with_session<S>(
+    store: &S,
+    session: &ScopeQuerySession,
+    request: &GraphRetrievedCausalExplanationQueryRequest,
+) -> Result<Option<GraphRetrievedCausalExplanationAnswer>, GraphQueryError>
+where
+    S: PhoenixSemanticIndexStore,
+{
+    retrieved_causal_explanation_with_session_impl(store, session, request)
 }
 
 pub fn retrieved_causal_explanation<S>(

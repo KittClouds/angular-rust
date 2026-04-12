@@ -8,7 +8,7 @@
 
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore,
-    PhoenixEventIdentityPatchStore, StoreError,
+    PhoenixEventIdentityPatchStore, PhoenixTemporalPatchStore, StoreError,
 };
 use phoenix_types::SessionId;
 
@@ -25,7 +25,8 @@ where
     S: PhoenixArchiveStoreV2
         + PhoenixErPatchStore
         + PhoenixCausalPatchStore
-        + PhoenixEventIdentityPatchStore,
+        + PhoenixEventIdentityPatchStore
+        + PhoenixTemporalPatchStore,
 {
     derive_dirty_scope_review_batches(store, session_id)
 }

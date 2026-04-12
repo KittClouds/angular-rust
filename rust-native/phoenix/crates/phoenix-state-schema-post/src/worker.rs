@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use phoenix_scope_analysis::ScopeAnalysisContext;
 use phoenix_semantic_v2::{
     scope_storage_key, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef,
     RelationScopePatchSidecar, ScopeOrd, SessionArchive, StateSchemaCompilerSummary,
@@ -14,8 +15,8 @@ use phoenix_types::{ScopeKey, SessionId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    mine_slot_candidates, normalize_state_schema_inputs, promote_slot_definitions,
-    StateSchemaEvidenceRow,
+    mine_slot_candidates, normalize_state_schema_inputs,
+    normalize_state_schema_inputs_from_analysis, promote_slot_definitions, StateSchemaEvidenceRow,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +102,39 @@ pub fn derive_scope_review_batch(
         write_proposals: Vec::new(),
         relation_generation: relation_sidecar.map(|value| value.generation),
         state_schema_generation: None,
+        summary: StateSchemaCompilerSummary::default(),
+        diagnostics: normalized.diagnostics,
+        base_slot_definitions,
+        evidence_rows: normalized.evidence_rows,
+    }
+}
+
+pub fn derive_scope_review_batch_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&RelationScopePatchSidecar>,
+) -> StateSchemaScopeReviewBatch {
+    let normalized = normalize_state_schema_inputs_from_analysis(analysis, relation_sidecar);
+    let base_slot_definitions = normalized.seed_slot_definitions.clone();
+
+    StateSchemaScopeReviewBatch {
+        scope: analysis.scope.clone(),
+        scope_key: analysis.scope_key.clone(),
+        scope_ord: analysis.dirty.scope_ord,
+        session_id: analysis.session_id.clone(),
+        dirty: Some(analysis.dirty.clone()),
+        document_refs: analysis.document_refs.as_ref().to_vec(),
+        slot_families: normalized.slot_families,
+        slot_definitions: normalized.seed_slot_definitions,
+        slot_candidates: Vec::new(),
+        promotion_decisions: Vec::new(),
+        write_proposals: Vec::new(),
+        relation_generation: relation_sidecar.map(|value| value.generation),
+        state_schema_generation: analysis
+            .runtime
+            .sidecars
+            .state_schema
+            .as_ref()
+            .map(|value| value.generation),
         summary: StateSchemaCompilerSummary::default(),
         diagnostics: normalized.diagnostics,
         base_slot_definitions,

@@ -78,8 +78,9 @@ pub fn discover_causal_target_candidates(
             let count = incoming.get(vertex.id.0.as_str()).copied().unwrap_or(0);
             let description = describe_vertex(vertex);
             let query_text = format!("what led to {}", description);
+            let path_bonus = if count > 0 { 360 } else { 0 };
             (
-                causal_target_score(vertex) + (count as i32 * 240),
+                causal_target_score(vertex) + path_bonus + (count as i32 * 260),
                 CausalTargetCandidate {
                     vertex_id: vertex.id.0.clone(),
                     query_text,
@@ -126,6 +127,11 @@ pub fn vertex_slot_key(vertex: &KernelVertex) -> Option<&str> {
 }
 
 pub fn describe_vertex(vertex: &KernelVertex) -> String {
+    if let Some(label) = string_attr(&vertex.attributes, "semanticLabel") {
+        if !label.is_empty() {
+            return label.to_owned();
+        }
+    }
     let mut parts = Vec::new();
     if !vertex.labels.is_empty() {
         parts.push(vertex.labels.join(" "));
@@ -190,7 +196,27 @@ fn world_anchor_score(vertex: &KernelVertex, slot_key: &str) -> i32 {
     {
         score += 50;
     }
+    score += preferred_slot_score(slot_key);
+    if vertex.id.0.contains("conflict") || vertex.id.0.contains("gap") {
+        score -= 120;
+    }
+    if vertex.id.0.contains("archive-relation") && slot_key.starts_with("relation.") {
+        score -= 180;
+    }
     score
+}
+
+fn preferred_slot_score(slot_key: &str) -> i32 {
+    match slot_key {
+        "entity.location" => 140,
+        "entity.membership" => 130,
+        "entity.employer" => 120,
+        "entity.role" => 110,
+        "entity.status" => 100,
+        key if key.starts_with("entity.") => 90,
+        key if key.starts_with("relation.") => -260,
+        _ => 0,
+    }
 }
 
 fn causal_target_score(vertex: &KernelVertex) -> i32 {
@@ -236,4 +262,118 @@ fn incoming_causal_counts(edges: &[KernelEdge]) -> std::collections::BTreeMap<&s
         }
     }
     counts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{discover_causal_target_candidates, discover_world_anchor};
+    use phoenix_graph_kernel::{
+        KernelEdge, KernelEdgeType, KernelVertex, KernelVertexClass, KernelVertexId,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn discover_world_anchor_prefers_entity_state_over_relation_claim_noise() {
+        let anchor = discover_world_anchor(&[
+            vertex(
+                "graph::claim::claim:archive-relation:test:abombs:mechron:relates_to",
+                "claim",
+                Some("test::abombs"),
+                "relation.relates_to",
+                None,
+            ),
+            vertex(
+                "graph::state::state:test::ryan:entity.location",
+                "state",
+                Some("test::ryan"),
+                "entity.location",
+                Some("active"),
+            ),
+        ])
+        .expect("anchor");
+
+        assert_eq!(anchor.entity_id, "test::ryan");
+        assert_eq!(anchor.slot_key, "entity.location");
+    }
+
+    #[test]
+    fn discover_world_anchor_prefers_stable_entity_slots() {
+        let anchor = discover_world_anchor(&[
+            vertex(
+                "graph::state::state:test::wyvern:entity.membership",
+                "state",
+                Some("test::wyvern"),
+                "entity.membership",
+                Some("active"),
+            ),
+            vertex(
+                "graph::state::state:test::wyvern:entity.status",
+                "state",
+                Some("test::wyvern"),
+                "entity.status",
+                Some("active"),
+            ),
+        ])
+        .expect("anchor");
+
+        assert_eq!(anchor.slot_key, "entity.membership");
+    }
+
+    #[test]
+    fn discover_causal_targets_prefers_path_bearing_events() {
+        let no_path = vertex(
+            "graph::event::memory::event:state_started:state:test::a:entity.location",
+            "event",
+            Some("test::a"),
+            "entity.location",
+            None,
+        );
+        let cause = vertex("graph::event::memory::cause", "event", None, "", None);
+        let effect = vertex("graph::event::memory::effect", "event", None, "", None);
+        let candidates = discover_causal_target_candidates(
+            &[no_path, cause, effect],
+            &[causal_edge(
+                "graph::event::memory::cause",
+                "graph::event::memory::effect",
+            )],
+            2,
+        );
+
+        assert_eq!(candidates[0].vertex_id, "graph::event::memory::effect");
+        assert!(candidates[0].path_bearing);
+    }
+
+    fn vertex(
+        id: &str,
+        kind: &str,
+        entity_id: Option<&str>,
+        slot_key: &str,
+        status: Option<&str>,
+    ) -> KernelVertex {
+        let mut value = json!({ "slotKey": slot_key });
+        if let Some(status) = status {
+            value["status"] = json!(status);
+        }
+        KernelVertex {
+            id: KernelVertexId(id.to_owned()),
+            kind: kind.to_owned(),
+            class: if kind == "state" {
+                KernelVertexClass::State
+            } else {
+                KernelVertexClass::Generic
+            },
+            entity_id: entity_id.map(str::to_owned),
+            value,
+            ..KernelVertex::default()
+        }
+    }
+
+    fn causal_edge(source_id: &str, target_id: &str) -> KernelEdge {
+        KernelEdge {
+            source_id: KernelVertexId(source_id.to_owned()),
+            target_id: KernelVertexId(target_id.to_owned()),
+            edge_type: KernelEdgeType("causal_link".to_owned()),
+            ..KernelEdge::default()
+        }
+    }
 }

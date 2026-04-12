@@ -20,18 +20,19 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::semantic::{semantic_embedder, SemanticEmbedConfig};
-use crate::semantic_graph_causal_gap::collect_missing_intermediate_cause_edges_from_store;
+use crate::semantic_graph_causal_gap::collect_missing_intermediate_cause_edges;
 use crate::semantic_graph_contradiction::collect_contradictory_support_region_edges;
-use crate::semantic_graph_event::collect_related_event_edges_from_store;
+use crate::semantic_graph_event::collect_related_event_edges;
 use crate::semantic_graph_nli::{
     adjudicate_candidates_with_nli, needs_nli_review, SemanticNliConfig,
 };
-use crate::semantic_graph_process::collect_same_process_edges_from_store;
-use crate::semantic_graph_soft::collect_same_slot_family_edges_from_store;
+use crate::semantic_graph_process::collect_same_process_edges;
+use crate::semantic_graph_soft::collect_same_slot_family_edges;
 use crate::semantic_graph_support::{
     build_prototypes, family_label, neighbor_families, node_kind_label, resolve_family,
     status_label, truth_planes_compatible, Prototype,
 };
+use crate::semantic_graph_workspace::SemanticNeighborWorkspace;
 
 const SEMANTIC_MODEL_ID: &str = "Snowflake/snowflake-arctic-embed-xs";
 
@@ -214,25 +215,22 @@ where
             updated_at: created_at,
         })
         .collect::<Vec<_>>();
-    store.upsert_semantic_node_vectors_native(&rows)?;
+    let mut workspace =
+        SemanticNeighborWorkspace::new(scope.folder_id.clone(), &prototypes, &embeddings);
     let mut candidates = collect_candidate_edges(
-        store,
-        scope,
+        &mut workspace,
         &prototypes,
-        &embeddings,
         config.neighbor_limit.max(1),
         config.oversample.max(config.neighbor_limit.max(1)),
         config.min_score_millis,
-    )?;
-    candidates.extend(collect_same_slot_family_edges_from_store(
-        store,
-        scope,
+    );
+    candidates.extend(collect_same_slot_family_edges(
+        &mut workspace,
         &prototypes,
-        &embeddings,
         config.neighbor_limit.max(1),
         config.oversample.max(config.neighbor_limit.max(1)),
         config.min_score_millis,
-    )?);
+    ));
     candidates.extend(collect_contradictory_support_region_edges(
         &prototypes,
         &embeddings,
@@ -240,34 +238,38 @@ where
         config.neighbor_limit.max(1),
         config.min_score_millis,
     ));
-    candidates.extend(collect_same_process_edges_from_store(
-        store,
-        scope,
+    candidates.extend(collect_same_process_edges(
+        &mut workspace,
         &prototypes,
-        &embeddings,
         config.neighbor_limit.max(1),
         config.oversample.max(config.neighbor_limit.max(1)),
         config.min_score_millis,
-    )?);
-    candidates.extend(collect_related_event_edges_from_store(
-        store,
-        scope,
+    ));
+    candidates.extend(collect_related_event_edges(
+        &mut workspace,
         &prototypes,
-        &embeddings,
         config.neighbor_limit.max(1),
         config.oversample.max(config.neighbor_limit.max(1)),
         config.min_score_millis,
-    )?);
-    candidates.extend(collect_missing_intermediate_cause_edges_from_store(
-        store,
-        scope,
+    ));
+    candidates.extend(collect_missing_intermediate_cause_edges(
+        &mut workspace,
         &prototypes,
-        &embeddings,
         graph_sidecar,
         config.neighbor_limit.max(1),
         config.oversample.max(config.neighbor_limit.max(1)),
         config.min_score_millis,
-    )?);
+    ));
+    store.upsert_semantic_node_vectors_native(&rows)?;
+    let mut warmed_kinds = prototypes
+        .iter()
+        .map(|prototype| prototype.ann_kind)
+        .collect::<Vec<_>>();
+    warmed_kinds.sort_unstable();
+    warmed_kinds.dedup();
+    for kind in warmed_kinds {
+        store.warm_semantic_node_index(scope, kind)?;
+    }
     if candidates
         .iter()
         .any(|candidate| needs_nli_review(candidate.family))
@@ -303,34 +305,30 @@ where
     })
 }
 
-fn collect_candidate_edges<S>(
-    store: &S,
-    scope: &ScopeKey,
+fn collect_candidate_edges(
+    workspace: &mut SemanticNeighborWorkspace<'_>,
     prototypes: &[Prototype],
-    embeddings: &[Vec<f32>],
     neighbor_limit: usize,
     oversample: usize,
     min_score_millis: u32,
-) -> Result<Vec<SemanticGraphEdgeCandidate>, SemanticGraphError>
-where
-    S: PhoenixSemanticIndexStore,
-{
+) -> Vec<SemanticGraphEdgeCandidate> {
     let prototype_by_id = prototypes
         .iter()
         .map(|prototype| (prototype.node_id.as_str(), prototype))
         .collect::<HashMap<_, _>>();
     let mut seen = HashSet::new();
     let mut edges = Vec::new();
-    for (prototype, embedding) in prototypes.iter().zip(embeddings.iter()) {
+    for (source_index, prototype) in prototypes.iter().enumerate() {
         for (target_kind, family) in neighbor_families(prototype.node_kind) {
-            for hit in store.query_semantic_node_neighbors(
-                embedding,
-                scope,
+            if target_kind.is_empty() || family == SemanticEdgeFamily::Unknown {
+                continue;
+            }
+            for hit in workspace.query_semantic_node_neighbors(
+                source_index,
                 target_kind,
-                Some(&prototype.node_id),
                 neighbor_limit,
                 oversample,
-            )? {
+            ) {
                 let Some(target) = prototype_by_id.get(hit.node_id.as_str()) else {
                     continue;
                 };
@@ -373,7 +371,7 @@ where
         }
     }
     edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-    Ok(edges)
+    edges
 }
 
 pub(crate) fn compile_candidate_graph_batch(

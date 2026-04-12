@@ -5,11 +5,11 @@ use phoenix_semantic_v2::{
     CausalDecisionRecord, CausalEdgeAddition, CausalEdgeAliasRecord, CausalInvalidationRecord,
     CausalMemoryCard, CausalMetricsSnapshot, CausalReviewQueueItem, CausalScopeSidecar,
     CounterfactualReviewRecord, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef,
-    ErScopePatchSidecar, EventIdentityScopeSidecar, ScopeOrd, SessionArchive,
+    ErScopePatchSidecar, EventIdentityScopeSidecar, ScopeOrd, SessionArchive, TemporalScopeSidecar,
 };
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore,
-    PhoenixEventIdentityPatchStore, StoreError,
+    PhoenixEventIdentityPatchStore, PhoenixTemporalPatchStore, StoreError,
 };
 use phoenix_types::{ScopeKey, SessionId};
 use rustc_hash::FxHashMap;
@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     build_causal_memory_cards, build_chain_records, build_counterfactual_reviews,
-    draft_causal_decisions, normalize::semantic_node_id, normalize_causal_inputs, CausalDecision,
-    CausalEventProfile, CausalReviewCase,
+    draft_causal_decisions, normalize::semantic_node_id, normalize_causal_inputs_with_sidecars,
+    CausalDecision, CausalEventProfile, CausalReviewCase,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +78,16 @@ pub fn derive_scope_review_batch(
     dirty: Option<&DirtyScopeRecord>,
     er_sidecar: Option<&ErScopePatchSidecar>,
 ) -> CausalScopeReviewBatch {
+    derive_scope_review_batch_with_sidecars(archives, session, dirty, er_sidecar, None)
+}
+
+pub fn derive_scope_review_batch_with_sidecars(
+    archives: &[DocumentArchive],
+    session: Option<&SessionArchive>,
+    dirty: Option<&DirtyScopeRecord>,
+    er_sidecar: Option<&ErScopePatchSidecar>,
+    temporal_sidecar: Option<&TemporalScopeSidecar>,
+) -> CausalScopeReviewBatch {
     let scope = archives
         .first()
         .map(|archive| archive.manifest.scope.clone())
@@ -107,7 +117,7 @@ pub fn derive_scope_review_batch(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let normalized = normalize_causal_inputs(archives, er_sidecar);
+    let normalized = normalize_causal_inputs_with_sidecars(archives, er_sidecar, temporal_sidecar);
 
     CausalScopeReviewBatch {
         scope,
@@ -149,11 +159,19 @@ where
     S: PhoenixArchiveStoreV2
         + PhoenixErPatchStore
         + PhoenixCausalPatchStore
-        + PhoenixEventIdentityPatchStore,
+        + PhoenixEventIdentityPatchStore
+        + PhoenixTemporalPatchStore,
 {
     let archives = store.load_latest_document_archives(Some(&dirty.scope))?;
     let er_sidecar = store.load_er_patch_sidecar(&dirty.scope)?;
-    let mut batch = derive_scope_review_batch(&archives, session, Some(dirty), er_sidecar.as_ref());
+    let temporal_sidecar = store.load_temporal_patch_sidecar(&dirty.scope)?;
+    let mut batch = derive_scope_review_batch_with_sidecars(
+        &archives,
+        session,
+        Some(dirty),
+        er_sidecar.as_ref(),
+        temporal_sidecar.as_ref(),
+    );
     let event_identity_sidecar = store.load_event_identity_patch_sidecar(&dirty.scope)?;
     if let Some(sidecar) = event_identity_sidecar.as_ref() {
         annotate_causal_batch_with_event_identity(&mut batch, sidecar);
@@ -175,7 +193,8 @@ where
     S: PhoenixArchiveStoreV2
         + PhoenixErPatchStore
         + PhoenixCausalPatchStore
-        + PhoenixEventIdentityPatchStore,
+        + PhoenixEventIdentityPatchStore
+        + PhoenixTemporalPatchStore,
 {
     let session = match session_id {
         Some(value) => store.load_latest_session_archive(value)?,

@@ -1,5 +1,8 @@
 pub mod api;
 
+mod bench;
+mod execution_plan;
+mod execution_runtime;
 mod gliclass;
 mod gliclass_instruct;
 mod gliclass_instruct_format;
@@ -17,6 +20,16 @@ mod seed_worker;
 mod tests;
 mod worker;
 
+pub use bench::{
+    benchmark_scope_review_pipeline, RelationBenchmarkCounts, RelationBenchmarkReport,
+};
+pub use execution_plan::{
+    RelationExecutionPlan, RelationExecutionSchemaGroup, RelationExecutionWindow,
+};
+pub use execution_runtime::{
+    prepare_stage_input as prepare_relation_stage_input, relation_spec_signature, RelationModelJob,
+    RelationPreparedStageInput,
+};
 pub use gliclass::{
     GliclassClassificationType, GliclassError, GliclassLabelScore, GliclassModel,
     GliclassModelMetadata, GliclassPredictOptions, GliclassPrediction,
@@ -55,9 +68,10 @@ pub use worker::{
     build_relation_hypotheses, build_relation_patch_sidecar, default_relation_type_specs,
     derive_dirty_scope_review_batches, derive_dirty_scope_review_batches_with_seeder,
     derive_relation_entity_profiles, derive_scope_review_batch,
-    derive_scope_review_batch_from_store, derive_scope_review_batch_from_store_with_seeder,
-    derive_scope_review_batch_with_seeder, draft_relation_decisions,
-    persist_relation_patch_sidecar, run_glirel_over_batch, run_primary_relation_lane,
-    GlirelWorkerError, RelationDecision, RelationDecisionKind, RelationEntityProfile,
-    RelationReviewCase, RelationScopeReviewBatch, RelationWindowEntity, RelationWindowRecord,
+    derive_scope_review_batch_from_analysis, derive_scope_review_batch_from_store,
+    derive_scope_review_batch_from_store_with_seeder, derive_scope_review_batch_with_seeder,
+    draft_relation_decisions, persist_relation_patch_sidecar, run_glirel_over_batch,
+    run_primary_relation_lane, GlirelWorkerError, RelationDecision, RelationDecisionKind,
+    RelationEntityProfile, RelationReviewCase, RelationScopeReviewBatch, RelationWindowBuildStats,
+    RelationWindowEntity, RelationWindowRecord,
 };

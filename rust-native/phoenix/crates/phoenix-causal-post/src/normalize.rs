@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use phoenix_semantic_v2::{
     CanonicalEventId, CausalClaimAtom, CausalClaimId, CausalClaimPolarity, CausalClaimSourceKind,
     CausalEdgeId, CausalEvidenceClass, CausalRelationKind, DocumentArchive,
-    DocumentCausalSubstrate, ErScopePatchSidecar,
+    DocumentCausalSubstrate, ErScopePatchSidecar, TemporalScopeSidecar,
 };
 use phoenix_types::{
     BiTemporalWindow, CausalCandidate, CausalKind, EntityId, Polarity, Proposition, ProvenanceRef,
@@ -11,6 +11,8 @@ use phoenix_types::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+
+const MAX_SOURCE_CLAIM_TRACE_SAMPLES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,16 +136,63 @@ pub struct CausalNormalizedInputs {
     #[serde(default)]
     pub shadow_local_pair_claim_atoms: Vec<CausalClaimAtom>,
     #[serde(default)]
+    pub source_claim_trace: CausalSourceClaimTraceSummary,
+    #[serde(default)]
     pub diagnostics: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CausalSourceClaimTraceSummary {
+    pub total_source_claim_case_count: usize,
+    pub with_event_sibling_count: usize,
+    pub with_state_sibling_count: usize,
+    pub with_both_siblings_count: usize,
+    pub without_richer_sibling_count: usize,
+    #[serde(default)]
+    pub reason_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub seed_source_counts: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub samples: Vec<CausalSourceClaimTrace>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CausalSourceClaimTrace {
+    pub document_id: String,
+    pub seed_source: String,
+    pub claim_id: String,
+    pub claim_label: String,
+    pub proposition_id: String,
+    pub proposition_predicate: String,
+    pub target_node_kind: String,
+    pub target_label: String,
+    pub sibling_event_count: usize,
+    pub sibling_event_id: Option<String>,
+    pub sibling_event_label: Option<String>,
+    pub sibling_state_count: usize,
+    pub sibling_state_id: Option<String>,
+    pub sibling_state_label: Option<String>,
+    pub trace_reason: String,
 }
 
 pub fn normalize_causal_inputs(
     archives: &[DocumentArchive],
     er_sidecar: Option<&ErScopePatchSidecar>,
 ) -> CausalNormalizedInputs {
+    normalize_causal_inputs_with_sidecars(archives, er_sidecar, None)
+}
+
+pub fn normalize_causal_inputs_with_sidecars(
+    archives: &[DocumentArchive],
+    er_sidecar: Option<&ErScopePatchSidecar>,
+    temporal_sidecar: Option<&TemporalScopeSidecar>,
+) -> CausalNormalizedInputs {
     let mut event_profiles = Vec::new();
     let mut raw_cases = Vec::new();
     let mut shadow_local_pair_cases = Vec::new();
+    let mut source_claim_trace = CausalSourceClaimTraceSummary::default();
     let mut diagnostics = BTreeMap::<String, usize>::new();
 
     for archive in archives {
@@ -154,7 +203,13 @@ pub fn normalize_causal_inputs(
             continue;
         };
 
-        let profile_map = build_event_profile_map(archive, substrate, er_sidecar, &mut diagnostics);
+        let profile_map = build_event_profile_map(
+            archive,
+            substrate,
+            er_sidecar,
+            temporal_sidecar,
+            &mut diagnostics,
+        );
         if profile_map.is_empty() {
             *diagnostics
                 .entry("empty_causal_profiles".to_owned())
@@ -166,6 +221,7 @@ pub fn normalize_causal_inputs(
         let graph_stats = build_degree_map(substrate);
         let mut seen_case_keys = FxHashSet::default();
         let mut seen_shadow_case_keys = FxHashSet::default();
+        let archive_case_start = raw_cases.len();
 
         for link in &substrate.causal_links {
             if let Some(case) = build_review_case(
@@ -208,6 +264,15 @@ pub fn normalize_causal_inputs(
             }
         }
 
+        accumulate_source_claim_trace(
+            &mut source_claim_trace,
+            archive,
+            substrate,
+            &raw_cases[archive_case_start..],
+            &profile_map,
+            &mut diagnostics,
+        );
+
         let local_cases = build_local_fallback_cases(archive, &profile_map, &graph_stats);
         for case in local_cases {
             let case_key = review_case_key(&case);
@@ -246,6 +311,7 @@ pub fn normalize_causal_inputs(
         claim_atoms,
         shadow_local_pair_cases,
         shadow_local_pair_claim_atoms,
+        source_claim_trace,
         diagnostics,
     }
 }
@@ -254,6 +320,7 @@ fn build_event_profile_map(
     archive: &DocumentArchive,
     substrate: &DocumentCausalSubstrate,
     er_sidecar: Option<&ErScopePatchSidecar>,
+    temporal_sidecar: Option<&TemporalScopeSidecar>,
     diagnostics: &mut BTreeMap<String, usize>,
 ) -> FxHashMap<String, CausalEventProfile> {
     let proposition_by_id = substrate
@@ -285,6 +352,10 @@ fn build_event_profile_map(
             (proposition.proposition_id.to_string(), temporal)
         })
         .collect::<FxHashMap<_, _>>();
+    let temporal_by_node = build_temporal_profile_override_map(
+        archive.manifest.document_id.as_str(),
+        temporal_sidecar,
+    );
     let mention_ranges_by_id = archive
         .resolved_mentions
         .iter()
@@ -315,6 +386,7 @@ fn build_event_profile_map(
             event.label.to_string(),
             event.proposition_id.to_string(),
             &proposition_by_id,
+            &temporal_by_node,
             &temporal_by_proposition,
             er_sidecar,
             &mention_ranges_by_id,
@@ -331,6 +403,7 @@ fn build_event_profile_map(
             state.label.to_string(),
             state.proposition_id.to_string(),
             &proposition_by_id,
+            &temporal_by_node,
             &temporal_by_proposition,
             er_sidecar,
             &mention_ranges_by_id,
@@ -347,6 +420,7 @@ fn build_event_profile_map(
             claim.label.to_string(),
             claim.proposition_id.to_string(),
             &proposition_by_id,
+            &temporal_by_node,
             &temporal_by_proposition,
             er_sidecar,
             &mention_ranges_by_id,
@@ -360,12 +434,170 @@ fn build_event_profile_map(
     profiles
 }
 
+fn build_temporal_profile_override_map(
+    document_id: &str,
+    temporal_sidecar: Option<&TemporalScopeSidecar>,
+) -> FxHashMap<String, BiTemporalWindow> {
+    let Some(sidecar) = temporal_sidecar else {
+        return FxHashMap::default();
+    };
+
+    let mut rows = FxHashMap::<String, BiTemporalWindow>::default();
+    for interval in &sidecar.intervals {
+        if interval.document_id == document_id {
+            rows.insert(interval.event_id.clone(), interval.temporal.clone());
+        }
+    }
+    for card in &sidecar.memory_cards {
+        if card.document_id != document_id {
+            continue;
+        }
+        if let Some(interval) = card.strongest_interval.as_ref() {
+            rows.entry(card.event_id.clone())
+                .or_insert_with(|| interval.clone());
+        }
+    }
+    for anchor in &sidecar.anchors {
+        if anchor.document_id != document_id {
+            continue;
+        }
+        let Some(event_id) = anchor.event_id.as_ref() else {
+            continue;
+        };
+        rows.entry(event_id.clone())
+            .or_insert_with(|| anchor.temporal.clone());
+    }
+    rows
+}
+
+fn accumulate_source_claim_trace(
+    summary: &mut CausalSourceClaimTraceSummary,
+    archive: &DocumentArchive,
+    substrate: &DocumentCausalSubstrate,
+    cases: &[CausalReviewCase],
+    profile_map: &FxHashMap<String, CausalEventProfile>,
+    diagnostics: &mut BTreeMap<String, usize>,
+) {
+    let sibling_events = sibling_event_index(substrate);
+    let sibling_states = sibling_state_index(substrate);
+    for case in cases {
+        let SemanticNodeRef::Claim(claim_id) = &case.source else {
+            continue;
+        };
+        let Some(source_profile) = profile_map.get(&node_key(&case.source)) else {
+            *diagnostics
+                .entry("source_claim_trace_missing_source_profile".to_owned())
+                .or_default() += 1;
+            continue;
+        };
+        let target_profile = profile_map.get(&node_key(&case.target));
+        let proposition_id = source_profile.proposition_id.as_str();
+        let sibling_event = sibling_events.get(proposition_id);
+        let sibling_state = sibling_states.get(proposition_id);
+        let trace_reason =
+            claim_source_trace_reason(sibling_event.is_some(), sibling_state.is_some()).to_owned();
+
+        summary.total_source_claim_case_count += 1;
+        summary.with_event_sibling_count += sibling_event.is_some() as usize;
+        summary.with_state_sibling_count += sibling_state.is_some() as usize;
+        summary.with_both_siblings_count +=
+            (sibling_event.is_some() && sibling_state.is_some()) as usize;
+        summary.without_richer_sibling_count +=
+            (!sibling_event.is_some() && !sibling_state.is_some()) as usize;
+        *summary
+            .reason_counts
+            .entry(trace_reason.clone())
+            .or_default() += 1;
+        *summary
+            .seed_source_counts
+            .entry(case.seed_source.clone())
+            .or_default() += 1;
+        *diagnostics
+            .entry(format!("source_claim_trace:{}", trace_reason))
+            .or_default() += 1;
+
+        if summary.samples.len() >= MAX_SOURCE_CLAIM_TRACE_SAMPLES {
+            continue;
+        }
+        summary.samples.push(CausalSourceClaimTrace {
+            document_id: archive.manifest.document_id.clone(),
+            seed_source: case.seed_source.clone(),
+            claim_id: claim_id.0.clone(),
+            claim_label: source_profile.label.clone(),
+            proposition_id: source_profile.proposition_id.clone(),
+            proposition_predicate: source_profile.normalized_predicate.clone(),
+            target_node_kind: semantic_node_kind(&case.target).to_owned(),
+            target_label: target_profile
+                .map(|profile| profile.label.clone())
+                .unwrap_or_else(|| semantic_node_id(&case.target).to_owned()),
+            sibling_event_count: sibling_event.map(|entry| entry.count).unwrap_or_default(),
+            sibling_event_id: sibling_event.and_then(|entry| entry.node_id.clone()),
+            sibling_event_label: sibling_event.and_then(|entry| entry.label.clone()),
+            sibling_state_count: sibling_state.map(|entry| entry.count).unwrap_or_default(),
+            sibling_state_id: sibling_state.and_then(|entry| entry.node_id.clone()),
+            sibling_state_label: sibling_state.and_then(|entry| entry.label.clone()),
+            trace_reason,
+        });
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PropositionSiblingSummary {
+    count: usize,
+    node_id: Option<String>,
+    label: Option<String>,
+}
+
+fn sibling_event_index(
+    substrate: &DocumentCausalSubstrate,
+) -> FxHashMap<String, PropositionSiblingSummary> {
+    let mut rows = FxHashMap::<String, PropositionSiblingSummary>::default();
+    for event in &substrate.semantic_events {
+        let entry = rows.entry(event.proposition_id.to_string()).or_default();
+        entry.count += 1;
+        if entry.node_id.is_none() {
+            entry.node_id = event.event_id.as_ref().map(|value| value.0.clone());
+        }
+        if entry.label.is_none() && !event.label.is_empty() {
+            entry.label = Some(event.label.to_string());
+        }
+    }
+    rows
+}
+
+fn sibling_state_index(
+    substrate: &DocumentCausalSubstrate,
+) -> FxHashMap<String, PropositionSiblingSummary> {
+    let mut rows = FxHashMap::<String, PropositionSiblingSummary>::default();
+    for state in &substrate.semantic_states {
+        let entry = rows.entry(state.proposition_id.to_string()).or_default();
+        entry.count += 1;
+        if entry.node_id.is_none() {
+            entry.node_id = state.state_id.as_ref().map(|value| value.0.clone());
+        }
+        if entry.label.is_none() && !state.label.is_empty() {
+            entry.label = Some(state.label.to_string());
+        }
+    }
+    rows
+}
+
+fn claim_source_trace_reason(has_event_sibling: bool, has_state_sibling: bool) -> &'static str {
+    match (has_event_sibling, has_state_sibling) {
+        (true, true) => "claim_with_event_and_state_sibling",
+        (true, false) => "claim_with_event_sibling",
+        (false, true) => "claim_with_state_sibling",
+        (false, false) => "claim_only",
+    }
+}
+
 fn build_profile_from_record(
     archive: &DocumentArchive,
     node: Option<SemanticNodeRef>,
     label: String,
     proposition_id: String,
     proposition_by_id: &FxHashMap<String, &Proposition>,
+    temporal_by_node: &FxHashMap<String, BiTemporalWindow>,
     temporal_by_proposition: &FxHashMap<String, BiTemporalWindow>,
     er_sidecar: Option<&ErScopePatchSidecar>,
     mention_ranges_by_id: &FxHashMap<String, SourceRange>,
@@ -374,6 +606,33 @@ fn build_profile_from_record(
 ) -> Option<CausalEventProfile> {
     let node = node?;
     let proposition = proposition_by_id.get(&proposition_id)?;
+    let temporal = match temporal_by_node.get(semantic_node_id(&node)) {
+        Some(window) => {
+            *diagnostics
+                .entry("profile_temporal:temporal_sidecar".to_owned())
+                .or_default() += 1;
+            window.clone()
+        }
+        None => match temporal_by_proposition.get(&proposition.proposition_id.to_string()) {
+            Some(window) => {
+                *diagnostics
+                    .entry("profile_temporal:archive_binding".to_owned())
+                    .or_default() += 1;
+                window.clone()
+            }
+            None => {
+                *diagnostics
+                    .entry("profile_temporal:recorded_fallback".to_owned())
+                    .or_default() += 1;
+                BiTemporalWindow {
+                    valid_from: Some(archive.manifest.created_at),
+                    valid_to: None,
+                    recorded_from: Some(archive.manifest.created_at),
+                    recorded_to: None,
+                }
+            }
+        },
+    };
     let proposition_window = proposition_window(proposition, mention_ranges_by_index);
     let mut participants = proposition
         .arguments
@@ -446,15 +705,7 @@ fn build_profile_from_record(
         proposition_id,
         label,
         sentence_index: proposition.sentence_index,
-        temporal: temporal_by_proposition
-            .get(&proposition.proposition_id.to_string())
-            .cloned()
-            .unwrap_or(BiTemporalWindow {
-                valid_from: Some(archive.manifest.created_at),
-                valid_to: None,
-                recorded_from: Some(archive.manifest.created_at),
-                recorded_to: None,
-            }),
+        temporal,
         participant_entity_ids: participants,
         attributed_to: proposition
             .attribution
@@ -755,6 +1006,14 @@ pub(crate) fn semantic_node_id(node: &SemanticNodeRef) -> &str {
         SemanticNodeRef::Event(id) => id.0.as_str(),
         SemanticNodeRef::Claim(id) => id.0.as_str(),
         SemanticNodeRef::State(id) => id.0.as_str(),
+    }
+}
+
+fn semantic_node_kind(node: &SemanticNodeRef) -> &'static str {
+    match node {
+        SemanticNodeRef::Event(_) => "event",
+        SemanticNodeRef::Claim(_) => "claim",
+        SemanticNodeRef::State(_) => "state",
     }
 }
 

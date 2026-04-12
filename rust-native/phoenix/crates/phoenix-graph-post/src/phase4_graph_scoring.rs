@@ -1,4 +1,7 @@
-use phoenix_graph_kernel::{KernelGraphSnapshot, KernelStructuralAnalytics, KernelStructuralScore};
+use phoenix_graph_kernel::{
+    KernelGraphSnapshot, KernelLocalDiffusionKind, KernelStructuralAnalytics,
+    KernelStructuralProfile, KernelStructuralScore,
+};
 
 use crate::api::{
     GraphRankedCausalExplanationAnswer, GraphRankedHistoryAnswer, GraphRankedHistoryCandidate,
@@ -16,10 +19,29 @@ pub(crate) fn apply_graph_structural_world_state(
     snapshot: &KernelGraphSnapshot,
     answer: &mut GraphRankedSlotAnswer,
 ) {
+    apply_graph_structural_world_state_with_diffusion(
+        anchor_vertex_ids,
+        snapshot,
+        answer,
+        KernelLocalDiffusionKind::PersonalizedPagerank,
+    );
+}
+
+pub(crate) fn apply_graph_structural_world_state_with_diffusion(
+    anchor_vertex_ids: &[String],
+    snapshot: &KernelGraphSnapshot,
+    answer: &mut GraphRankedSlotAnswer,
+    diffusion_kind: KernelLocalDiffusionKind,
+) {
     if phase4_structural_disabled() || answer.candidates.is_empty() {
         return;
     }
-    let analytics = KernelStructuralAnalytics::from_snapshot(snapshot, anchor_vertex_ids);
+    let analytics = KernelStructuralAnalytics::from_snapshot_with_profile(
+        snapshot,
+        anchor_vertex_ids,
+        KernelStructuralProfile::WorldState,
+        diffusion_kind,
+    );
     if !analytics.is_active() {
         return;
     }
@@ -52,10 +74,29 @@ pub(crate) fn apply_graph_structural_history(
     snapshot: &KernelGraphSnapshot,
     answer: &mut GraphRankedHistoryAnswer,
 ) {
+    apply_graph_structural_history_with_diffusion(
+        anchor_vertex_ids,
+        snapshot,
+        answer,
+        KernelLocalDiffusionKind::PersonalizedPagerank,
+    );
+}
+
+pub(crate) fn apply_graph_structural_history_with_diffusion(
+    anchor_vertex_ids: &[String],
+    snapshot: &KernelGraphSnapshot,
+    answer: &mut GraphRankedHistoryAnswer,
+    diffusion_kind: KernelLocalDiffusionKind,
+) {
     if phase4_structural_disabled() || answer.candidates.is_empty() {
         return;
     }
-    let analytics = KernelStructuralAnalytics::from_snapshot(snapshot, anchor_vertex_ids);
+    let analytics = KernelStructuralAnalytics::from_snapshot_with_profile(
+        snapshot,
+        anchor_vertex_ids,
+        KernelStructuralProfile::History,
+        diffusion_kind,
+    );
     if !analytics.is_active() {
         return;
     }
@@ -93,10 +134,29 @@ pub(crate) fn apply_graph_structural_causal(
     snapshot: &KernelGraphSnapshot,
     answer: &mut GraphRankedCausalExplanationAnswer,
 ) {
+    apply_graph_structural_causal_with_diffusion(
+        anchor_vertex_ids,
+        snapshot,
+        answer,
+        KernelLocalDiffusionKind::HeatKernel,
+    );
+}
+
+pub(crate) fn apply_graph_structural_causal_with_diffusion(
+    anchor_vertex_ids: &[String],
+    snapshot: &KernelGraphSnapshot,
+    answer: &mut GraphRankedCausalExplanationAnswer,
+    diffusion_kind: KernelLocalDiffusionKind,
+) {
     if phase4_structural_disabled() || answer.candidates.is_empty() {
         return;
     }
-    let analytics = KernelStructuralAnalytics::from_snapshot(snapshot, anchor_vertex_ids);
+    let analytics = KernelStructuralAnalytics::from_snapshot_with_profile(
+        snapshot,
+        anchor_vertex_ids,
+        KernelStructuralProfile::Causal,
+        diffusion_kind,
+    );
     if !analytics.is_active() {
         return;
     }
@@ -144,7 +204,10 @@ fn structural_delta(delta_millis: i32) -> f64 {
 
 fn contract_score(score: KernelStructuralScore) -> GraphStructuralRerankScore {
     GraphStructuralRerankScore {
-        model: "scirs2_retrieved_graph_structure".to_owned(),
+        model: match score.diffusion_kind {
+            KernelLocalDiffusionKind::PersonalizedPagerank => "scirs2_local_ppr".to_owned(),
+            KernelLocalDiffusionKind::HeatKernel => "scirs2_local_heat_kernel".to_owned(),
+        },
         anchor_component: score.anchor_component,
         proximity_score_millis: score.proximity_score_millis,
         component_size: score.component_size,

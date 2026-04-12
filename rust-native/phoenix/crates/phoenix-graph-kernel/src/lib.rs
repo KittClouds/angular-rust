@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod borrowed;
 mod causal;
 mod causal_view;
+mod chrono_region;
+mod pcst_region;
 mod query_view;
 mod region;
 mod snapshot_query;
@@ -26,13 +28,17 @@ pub use causal_view::{
     causal_path_candidate_views_from_snapshot, KernelCausalPathCandidateView,
     KernelCausalPathFeatures,
 };
+pub use chrono_region::KernelRegionProfile;
 pub use query_view::KernelQueryView;
 pub use region::{expand_snapshot_region, KernelExpandedRegion};
 pub use snapshot_query::{
     entity_timeline_from_snapshot, slot_at_snapshot, unresolved_from_snapshot,
     what_changed_from_snapshot,
 };
-pub use structural::{KernelStructuralAnalytics, KernelStructuralScore};
+pub use structural::{
+    KernelLocalDiffusionKind, KernelStructuralAnalytics, KernelStructuralProfile,
+    KernelStructuralScore,
+};
 
 #[cfg(test)]
 mod causal_view_tests;

@@ -2,7 +2,6 @@ use std::env;
 use std::path::PathBuf;
 
 use phoenix_api::PhoenixPipelineApi;
-use phoenix_memory_post::api as memory_api;
 use phoenix_store_overgraph::PhoenixOvergraphStore;
 use serde::Serialize;
 
@@ -68,23 +67,9 @@ fn run(config: Config) -> Result<YieldSmokeReport, String> {
     let causal = api
         .run_causal_scope(None, config.created_at)
         .map_err(|error| error.to_string())?;
-    let state_schema = api
-        .run_state_schema_scope(None, config.created_at)
+    let late_sidecars = api
+        .run_late_sidecar_scope(None, config.created_at)
         .map_err(|error| error.to_string())?;
-
-    let memory_batches =
-        memory_api::derive_batches(api.store(), None).map_err(|error| error.to_string())?;
-    let mut memory_sidecar = SidecarCounts::default();
-    for batch in &memory_batches {
-        let sidecar = memory_api::persist_patch_sidecar(api.store(), batch, config.created_at)
-            .map_err(|error| error.to_string())?;
-        memory_sidecar.states += sidecar.states.len();
-        memory_sidecar.events += sidecar.events.len();
-        memory_sidecar.claims += sidecar.claims.len();
-        memory_sidecar.gaps += sidecar.gaps.len();
-        memory_sidecar.conflicts += sidecar.conflicts.len();
-        memory_sidecar.cards += sidecar.entity_cards.len();
-    }
 
     let graph = api
         .run_graph_scope(None, config.created_at)
@@ -96,9 +81,16 @@ fn run(config: Config) -> Result<YieldSmokeReport, String> {
         event_identity,
         temporal,
         causal,
-        state_schema,
-        memory_scope_count: memory_batches.len(),
-        memory_sidecar,
+        state_schema: late_sidecars.state_schema,
+        memory_scope_count: late_sidecars.memory_scope_count,
+        memory_sidecar: SidecarCounts {
+            states: late_sidecars.memory_state_count,
+            events: late_sidecars.memory_event_count,
+            claims: late_sidecars.memory_claim_count,
+            gaps: late_sidecars.memory_gap_count,
+            conflicts: late_sidecars.memory_conflict_count,
+            cards: late_sidecars.memory_card_count,
+        },
         graph,
     })
 }

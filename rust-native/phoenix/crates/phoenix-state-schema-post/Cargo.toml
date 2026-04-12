@@ -10,6 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 rustc-hash.workspace = true
+phoenix-scope-analysis = { path = "../phoenix-scope-analysis" }
 phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
 phoenix-store-native-core = { path = "../phoenix-store-native-core" }
 phoenix-store-overgraph = { path = "../phoenix-store-overgraph" }

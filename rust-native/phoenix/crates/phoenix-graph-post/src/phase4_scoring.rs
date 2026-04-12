@@ -155,7 +155,11 @@ impl Phase4Scorer for GliclassPhase4Scorer {
 }
 
 pub(crate) fn apply_phase4_world_state(query_text: &str, answer: &mut GraphRankedSlotAnswer) {
-    if phase4_disabled() {
+    if phase4_disabled()
+        || query_text.trim().is_empty()
+        || answer.candidates.is_empty()
+        || !should_phase4_world_state(answer)
+    {
         return;
     }
     with_default_scorer(|scorer| {
@@ -166,7 +170,11 @@ pub(crate) fn apply_phase4_world_state(query_text: &str, answer: &mut GraphRanke
 }
 
 pub(crate) fn apply_phase4_history(query_text: &str, answer: &mut GraphRankedHistoryAnswer) {
-    if phase4_disabled() {
+    if phase4_disabled()
+        || query_text.trim().is_empty()
+        || answer.candidates.is_empty()
+        || !should_phase4_history(answer)
+    {
         return;
     }
     with_default_scorer(|scorer| {
@@ -181,7 +189,11 @@ pub(crate) fn apply_phase4_causal(
     vertices: &[KernelVertex],
     answer: &mut GraphRankedCausalExplanationAnswer,
 ) {
-    if phase4_disabled() {
+    if phase4_disabled()
+        || query_text.trim().is_empty()
+        || answer.candidates.is_empty()
+        || !should_phase4_causal(answer)
+    {
         return;
     }
     with_default_scorer(|scorer| {
@@ -196,7 +208,10 @@ pub(crate) fn apply_phase4_world_state_with_scorer(
     answer: &mut GraphRankedSlotAnswer,
     scorer: &impl Phase4Scorer,
 ) {
-    if query_text.trim().is_empty() || answer.candidates.is_empty() {
+    if query_text.trim().is_empty()
+        || answer.candidates.is_empty()
+        || !should_phase4_world_state(answer)
+    {
         return;
     }
     for candidate in answer.candidates.iter_mut().take(MAX_RERANK_CANDIDATES) {
@@ -227,7 +242,10 @@ pub(crate) fn apply_phase4_history_with_scorer(
     answer: &mut GraphRankedHistoryAnswer,
     scorer: &impl Phase4Scorer,
 ) {
-    if query_text.trim().is_empty() || answer.candidates.is_empty() {
+    if query_text.trim().is_empty()
+        || answer.candidates.is_empty()
+        || !should_phase4_history(answer)
+    {
         return;
     }
     for candidate in answer.candidates.iter_mut().take(MAX_RERANK_CANDIDATES) {
@@ -264,7 +282,8 @@ pub(crate) fn apply_phase4_causal_with_scorer(
     answer: &mut GraphRankedCausalExplanationAnswer,
     scorer: &impl Phase4Scorer,
 ) {
-    if query_text.trim().is_empty() || answer.candidates.is_empty() {
+    if query_text.trim().is_empty() || answer.candidates.is_empty() || !should_phase4_causal(answer)
+    {
         return;
     }
     apply_phase5_path_rerank_with_scorer(query_text, answer, scorer);
@@ -323,4 +342,34 @@ fn event_labels() -> Vec<phoenix_rel_post::GliclassInstructLabel> {
             "This event is weak, incidental, or unsafe to center.",
         ),
     ]
+}
+
+fn should_phase4_world_state(answer: &GraphRankedSlotAnswer) -> bool {
+    if answer.candidates.len() > 1 {
+        return true;
+    }
+    if answer.selected.is_none() {
+        return false;
+    }
+    answer.abstain
+}
+
+fn should_phase4_history(answer: &GraphRankedHistoryAnswer) -> bool {
+    if answer.candidates.len() > 1 {
+        return true;
+    }
+    if answer.selected.is_none() {
+        return false;
+    }
+    answer.abstain
+}
+
+fn should_phase4_causal(answer: &GraphRankedCausalExplanationAnswer) -> bool {
+    if answer.candidates.len() > 1 {
+        return true;
+    }
+    if answer.selected.is_none() {
+        return false;
+    }
+    answer.abstain
 }

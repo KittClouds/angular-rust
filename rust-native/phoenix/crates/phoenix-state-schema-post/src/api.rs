@@ -5,6 +5,7 @@
 //! writes `StateSchemaScopeSidecar` records. Prefer these functions when
 //! driving schema growth ahead of memory compilation.
 
+use phoenix_scope_analysis::ScopeAnalysisContext;
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixRelationPatchStore, PhoenixStateSchemaPatchStore, StoreError,
 };
@@ -40,6 +41,13 @@ pub fn normalize_inputs(
     relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
 ) -> StateSchemaNormalizedInputs {
     normalize_state_schema_inputs(archives, relation_sidecar)
+}
+
+pub fn derive_batch_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
+) -> StateSchemaScopeReviewBatch {
+    crate::derive_scope_review_batch_from_analysis(analysis, relation_sidecar)
 }
 
 pub fn run_batch(batch: &mut StateSchemaScopeReviewBatch, created_at: i64) {

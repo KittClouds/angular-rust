@@ -64,3 +64,12 @@ GoKitt/.gocache/
 *.zip
 *.exe
 *.bin
+
+# Custom build targets & Cache
+.codex-target-*/
+target-codex-*/
+manifest.current
+manifest.prev
+**/.pip-cache-*/
+**/.pydeps-*/
+*.wal

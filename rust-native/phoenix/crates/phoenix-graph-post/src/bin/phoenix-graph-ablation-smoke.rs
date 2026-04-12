@@ -1,6 +1,10 @@
 use std::env;
 use std::path::PathBuf;
 
+use phoenix_graph_post::diffusion_eval::{
+    default_diffusion_cases, evaluate_causal_diffusion_cases, evaluate_history_diffusion_cases,
+    evaluate_world_state_diffusion_cases, GraphDiffusionCaseResult,
+};
 use phoenix_graph_post::eval::{
     default_ablation_cases, evaluate_causal_cases, evaluate_history_cases,
     evaluate_world_state_cases, GraphAblationCaseResult, GraphSoftFamily,
@@ -79,6 +83,15 @@ struct AblationCaseReport {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DiffusionCaseReport {
+    case_name: String,
+    diffusion: String,
+    metrics: phoenix_graph_post::eval::GraphEvalMetrics,
+    vs_ppr: Option<AblationDelta>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AblationReport {
     store_path: String,
     scope_key: String,
@@ -88,6 +101,12 @@ struct AblationReport {
     node_ann_metric: Option<String>,
     world_anchor: Option<WorldAnchorReport>,
     causal_target: Option<CausalTargetReport>,
+    #[serde(default)]
+    world_state_diffusion: Vec<DiffusionCaseReport>,
+    #[serde(default)]
+    history_diffusion: Vec<DiffusionCaseReport>,
+    #[serde(default)]
+    causal_explanation_diffusion: Vec<DiffusionCaseReport>,
     #[serde(default)]
     world_state: Vec<AblationCaseReport>,
     #[serde(default)]
@@ -139,6 +158,7 @@ fn run(config: SmokeConfig) -> Result<AblationReport, String> {
                 .map(|manifest| manifest.metric)
         });
     let cases = default_ablation_cases();
+    let diffusion_cases = default_diffusion_cases();
     let world_anchor = config
         .world_anchor
         .clone()
@@ -170,6 +190,28 @@ fn run(config: SmokeConfig) -> Result<AblationReport, String> {
         .unwrap_or_default(),
         None => Vec::new(),
     };
+    let world_state_diffusion = match world_anchor.as_ref() {
+        Some(anchor) => evaluate_world_state_diffusion_cases(
+            &store,
+            &scope,
+            &phoenix_graph_post::api::GraphRetrievedWorldStateQueryRequest {
+                query_text: anchor.query_text.clone(),
+                entity_id: anchor.entity_id.clone(),
+                slot_key: anchor.slot_key.clone(),
+                valid_at: None,
+                recorded_at: None,
+                include_candidate_graph: true,
+                seed_limit: config.seed_limit,
+                oversample: config.oversample,
+                expansion_hops: config.expansion_hops,
+                region_node_limit: config.region_node_limit,
+            },
+            &diffusion_cases,
+        )
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
     let history = match world_anchor.as_ref() {
         Some(anchor) => evaluate_history_cases(
             &store,
@@ -190,6 +232,31 @@ fn run(config: SmokeConfig) -> Result<AblationReport, String> {
                 region_node_limit: config.region_node_limit.max(128),
             },
             &cases,
+        )
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let history_diffusion = match world_anchor.as_ref() {
+        Some(anchor) => evaluate_history_diffusion_cases(
+            &store,
+            &scope,
+            &phoenix_graph_post::api::GraphRetrievedHistoryQueryRequest {
+                query_text: format!("history of {} for {}", anchor.slot_key, anchor.entity_id),
+                entity_id: anchor.entity_id.clone(),
+                slot_key: Some(anchor.slot_key.clone()),
+                since_valid_at: 0,
+                until_valid_at: None,
+                recorded_at: None,
+                include_candidate_graph: true,
+                truth_plane: phoenix_graph_post::api::GraphTruthPlane::WorldState,
+                limit: Some(config.history_limit),
+                seed_limit: config.seed_limit,
+                oversample: config.oversample,
+                expansion_hops: config.expansion_hops,
+                region_node_limit: config.region_node_limit.max(128),
+            },
+            &diffusion_cases,
         )
         .map_err(|error| error.to_string())?
         .unwrap_or_default(),
@@ -219,6 +286,30 @@ fn run(config: SmokeConfig) -> Result<AblationReport, String> {
         .unwrap_or_default(),
         None => Vec::new(),
     };
+    let causal_explanation_diffusion = match causal_target.as_ref() {
+        Some(target) => evaluate_causal_diffusion_cases(
+            &store,
+            &scope,
+            &phoenix_graph_post::api::GraphRetrievedCausalExplanationQueryRequest {
+                query_text: target.query_text.clone(),
+                target_vertex_id: target.vertex_id.clone(),
+                valid_at: None,
+                recorded_at: None,
+                include_candidate_graph: true,
+                max_depth: 3,
+                limit: Some(config.causal_limit),
+                truth_plane: phoenix_graph_post::api::GraphTruthPlane::WorldState,
+                seed_limit: config.seed_limit,
+                oversample: config.oversample,
+                expansion_hops: config.expansion_hops.max(3),
+                region_node_limit: config.region_node_limit.max(144),
+            },
+            &diffusion_cases,
+        )
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     Ok(AblationReport {
         store_path: config.store_path.display().to_string(),
@@ -236,6 +327,9 @@ fn run(config: SmokeConfig) -> Result<AblationReport, String> {
             vertex_id: target.vertex_id,
             query_text: target.query_text,
         }),
+        world_state_diffusion: decorate_diffusion_cases(world_state_diffusion),
+        history_diffusion: decorate_diffusion_cases(history_diffusion),
+        causal_explanation_diffusion: decorate_diffusion_cases(causal_explanation_diffusion),
         world_state: decorate_cases(world_state),
         history: decorate_cases(history),
         causal_explanation: decorate_cases(causal_explanation),
@@ -262,20 +356,43 @@ fn decorate_cases(rows: Vec<GraphAblationCaseResult>) -> Vec<AblationCaseReport>
         .collect()
 }
 
+fn decorate_diffusion_cases(rows: Vec<GraphDiffusionCaseResult>) -> Vec<DiffusionCaseReport> {
+    let ppr = rows
+        .iter()
+        .find(|row| row.case_name == "personalized_pagerank")
+        .cloned();
+    rows.into_iter()
+        .map(|row| DiffusionCaseReport {
+            vs_ppr: ppr
+                .as_ref()
+                .map(|base| delta_between_metrics(&base.metrics, &row.metrics)),
+            case_name: row.case_name,
+            diffusion: row.diffusion.label().to_owned(),
+            metrics: row.metrics,
+        })
+        .collect()
+}
+
 fn delta_between(
     base: &GraphAblationCaseResult,
     current: &GraphAblationCaseResult,
 ) -> AblationDelta {
+    delta_between_metrics(&base.metrics, &current.metrics)
+}
+
+fn delta_between_metrics(
+    base: &phoenix_graph_post::eval::GraphEvalMetrics,
+    current: &phoenix_graph_post::eval::GraphEvalMetrics,
+) -> AblationDelta {
     AblationDelta {
-        changed_selected: base.metrics.selected_id != current.metrics.selected_id,
-        abstain_changed: base.metrics.abstain != current.metrics.abstain,
-        candidate_edge_delta: current.metrics.region.candidate_edge_count as i64
-            - base.metrics.region.candidate_edge_count as i64,
-        vertex_delta: current.metrics.region.vertex_count as i64
-            - base.metrics.region.vertex_count as i64,
+        changed_selected: base.selected_id != current.selected_id,
+        abstain_changed: base.abstain != current.abstain,
+        candidate_edge_delta: current.region.candidate_edge_count as i64
+            - base.region.candidate_edge_count as i64,
+        vertex_delta: current.region.vertex_count as i64 - base.region.vertex_count as i64,
         selected_score_delta_millis: match (
-            base.metrics.selected_score_millis,
-            current.metrics.selected_score_millis,
+            base.selected_score_millis,
+            current.selected_score_millis,
         ) {
             (Some(left), Some(right)) => Some(right - left),
             _ => None,

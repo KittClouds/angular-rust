@@ -4,7 +4,6 @@ members = [
     "crates/phoenix-alex",
     "crates/phoenix-analytics",
     "crates/phoenix-automata",
-    "crates/phoenix-chat",
     "crates/phoenix-causality",
     "crates/phoenix-causal-post",
     "crates/phoenix-event-identity-post",
@@ -16,19 +15,13 @@ members = [
     "crates/phoenix-graph-kernel",
     "crates/phoenix-hyperbolic",
     "crates/phoenix-ingest-overgraph",
-    "crates/phoenix-lex",
     "crates/phoenix-machine",
     "crates/phoenix-memory-post",
     "crates/phoenix-mentions",
-    "crates/phoenix-om",
     "crates/phoenix-proposition",
-    "crates/phoenix-qgram",
-    "crates/phoenix-query",
     "crates/phoenix-rel-post",
     "crates/phoenix-reference",
-    "crates/phoenix-scanner",
-    "crates/phoenix-store-cozo",
-    "crates/phoenix-store-native",
+    "crates/phoenix-scope-analysis",
     "crates/phoenix-store-native-core",
     "crates/phoenix-store-overgraph",
     "crates/phoenix-structure",
@@ -38,7 +31,6 @@ members = [
     "crates/phoenix-temporal-post",
     "crates/phoenix-time",
     "crates/phoenix-types",
-    "crates/phoenix-index",
     "crates/phoenix-kernel",
 ]
 default-members = [
@@ -52,6 +44,7 @@ default-members = [
     "crates/phoenix-ingest-overgraph",
     "crates/phoenix-memory-post",
     "crates/phoenix-rel-post",
+    "crates/phoenix-scope-analysis",
     "crates/phoenix-semantic-v2",
     "crates/phoenix-state-schema-post",
     "crates/phoenix-store-native-core",
@@ -102,5 +95,4 @@ panic = "abort"
 strip = "symbols"
 
 [patch.crates-io]
-graph_builder = { path = "vendor/graph_builder" }
 esaxx-rs = { path = "../phoenix-gliner-smoke/vendor/esaxx-rs" }

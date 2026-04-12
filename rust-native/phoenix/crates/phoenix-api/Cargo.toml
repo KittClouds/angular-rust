@@ -13,8 +13,10 @@ phoenix-er-post = { path = "../phoenix-er-post" }
 phoenix-event-identity-post = { path = "../phoenix-event-identity-post" }
 phoenix-graph-kernel = { path = "../phoenix-graph-kernel" }
 phoenix-graph-post = { path = "../phoenix-graph-post" }
+phoenix-ingest-overgraph = { path = "../phoenix-ingest-overgraph" }
 phoenix-memory-post = { path = "../phoenix-memory-post" }
 phoenix-rel-post = { path = "../phoenix-rel-post" }
+phoenix-scope-analysis = { path = "../phoenix-scope-analysis" }
 phoenix-state-schema-post = { path = "../phoenix-state-schema-post" }
 phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
 phoenix-temporal-post = { path = "../phoenix-temporal-post" }

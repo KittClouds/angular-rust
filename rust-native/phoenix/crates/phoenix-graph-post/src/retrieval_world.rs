@@ -1,16 +1,24 @@
-use phoenix_graph_kernel::{slot_at_snapshot, KernelEdge, KernelQueryView, KernelSlotQueryRequest, KernelViewRequest};
+use phoenix_graph_kernel::{
+    slot_at_snapshot, KernelEdge, KernelQueryView, KernelRegionProfile, KernelSlotQueryRequest,
+    KernelViewRequest,
+};
 use phoenix_store_native_core::{
     PhoenixGraphPatchStore, PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore,
 };
 use phoenix_types::ScopeKey;
 
-use crate::api::{
-    load_projection_kernel, rank_world_state_answer, GraphQueryError, GraphWorldStateQueryRequest,
-};
+use crate::api::{rank_world_state_answer, GraphQueryError, GraphWorldStateQueryRequest};
 use crate::phase4_graph_scoring::apply_graph_structural_world_state;
 use crate::phase4_scoring::apply_phase4_world_state;
-use crate::retrieval::{GraphRetrievedWorldStateAnswer, GraphRetrievedWorldStateQueryRequest};
-use crate::retrieval_common::{build_region_from_snapshot, build_region_from_view, retrieve_query_seeds};
+use crate::query_session::ScopeQuerySession;
+use crate::retrieval::{
+    open_retrieved_query_session, GraphRetrievedWorldStateAnswer,
+    GraphRetrievedWorldStateQueryRequest,
+};
+use crate::retrieval_common::{
+    build_region_from_snapshot, build_region_from_view_profile, retrieve_query_seeds,
+};
+use crate::runtime_telemetry::{measure_graph_runtime, GraphRuntimeMetric};
 
 const WORLD_RETRIEVAL_KINDS: [&str; 5] = ["state", "claim", "event", "chunk", "entity"];
 
@@ -22,18 +30,30 @@ pub(crate) fn retrieved_world_state_impl<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore + PhoenixSemanticIndexStore,
 {
-    let Some(kernel) = load_projection_kernel(store, scope)? else {
+    let Some(session) = open_retrieved_query_session(store, scope)? else {
         return Ok(None);
     };
+    retrieved_world_state_with_session_impl(store, &session, request)
+}
+
+pub(crate) fn retrieved_world_state_with_session_impl<S>(
+    store: &S,
+    session: &ScopeQuerySession,
+    request: &GraphRetrievedWorldStateQueryRequest,
+) -> Result<Option<GraphRetrievedWorldStateAnswer>, GraphQueryError>
+where
+    S: PhoenixSemanticIndexStore,
+{
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RetrievedWorldState);
     let seeds = retrieve_query_seeds(
         store,
-        scope,
+        session.scope(),
         request.query_text.as_str(),
         &WORLD_RETRIEVAL_KINDS,
         request.seed_limit,
         request.oversample,
     )?;
-    let view = kernel.query_view(KernelViewRequest {
+    let view = session.kernel().query_view(KernelViewRequest {
         valid_at: request.valid_at,
         recorded_at: request.recorded_at,
         include_candidate_graph: request.include_candidate_graph,
@@ -119,13 +139,14 @@ pub(crate) fn build_world_state_region_from_view(
         })
         .map(|vertex| vertex.id.0.clone())
         .collect::<Vec<_>>();
-    build_region_from_view(
+    build_region_from_view_profile(
         view,
         anchors,
         seeds,
         request.region_node_limit,
         request.expansion_hops,
         world_state_edge_allowed,
+        KernelRegionProfile::WorldState,
     )
 }
 

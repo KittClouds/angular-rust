@@ -1,20 +1,23 @@
-use phoenix_graph_kernel::{KernelEdge, KernelQueryView, KernelViewRequest};
+use phoenix_graph_kernel::{KernelEdge, KernelQueryView, KernelRegionProfile, KernelViewRequest};
 use phoenix_store_native_core::{
     PhoenixGraphPatchStore, PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore,
 };
 use phoenix_types::ScopeKey;
 
 use crate::api::{
-    load_projection_kernel, rank_causal_explanation_answer, GraphCausalExplanationQueryRequest,
-    GraphQueryError,
+    rank_causal_explanation_answer, GraphCausalExplanationQueryRequest, GraphQueryError,
 };
 use crate::phase4_graph_scoring::apply_graph_structural_causal;
 use crate::phase4_scoring::apply_phase4_causal;
+use crate::query_session::ScopeQuerySession;
 use crate::retrieval::{
-    GraphRetrievedCausalExplanationAnswer, GraphRetrievedCausalExplanationQueryRequest,
-    GraphRetrievedSeed,
+    open_retrieved_query_session, GraphRetrievedCausalExplanationAnswer,
+    GraphRetrievedCausalExplanationQueryRequest, GraphRetrievedSeed,
 };
-use crate::retrieval_common::{build_region_from_snapshot, build_region_from_view, retrieve_query_seeds};
+use crate::retrieval_common::{
+    build_region_from_snapshot, build_region_from_view_profile, retrieve_query_seeds,
+};
+use crate::runtime_telemetry::{measure_graph_runtime, GraphRuntimeMetric};
 
 const CAUSAL_RETRIEVAL_KINDS: [&str; 5] = ["event", "claim", "entity", "chunk", "state"];
 
@@ -26,18 +29,30 @@ pub(crate) fn retrieved_causal_explanation_impl<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore + PhoenixSemanticIndexStore,
 {
-    let Some(kernel) = load_projection_kernel(store, scope)? else {
+    let Some(session) = open_retrieved_query_session(store, scope)? else {
         return Ok(None);
     };
+    retrieved_causal_explanation_with_session_impl(store, &session, request)
+}
+
+pub(crate) fn retrieved_causal_explanation_with_session_impl<S>(
+    store: &S,
+    session: &ScopeQuerySession,
+    request: &GraphRetrievedCausalExplanationQueryRequest,
+) -> Result<Option<GraphRetrievedCausalExplanationAnswer>, GraphQueryError>
+where
+    S: PhoenixSemanticIndexStore,
+{
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RetrievedCausalExplanation);
     let seeds = retrieve_query_seeds(
         store,
-        scope,
+        session.scope(),
         request.query_text.as_str(),
         &CAUSAL_RETRIEVAL_KINDS,
         request.seed_limit,
         request.oversample,
     )?;
-    let view = kernel.query_view(KernelViewRequest {
+    let view = session.kernel().query_view(KernelViewRequest {
         valid_at: request.valid_at,
         recorded_at: request.recorded_at,
         include_candidate_graph: request.include_candidate_graph,
@@ -133,13 +148,14 @@ pub(crate) fn build_causal_region_from_view(
     }
     anchors.sort();
     anchors.dedup();
-    build_region_from_view(
+    build_region_from_view_profile(
         view,
         anchors,
         seeds,
         request.region_node_limit,
         request.expansion_hops,
         causal_edge_allowed,
+        KernelRegionProfile::Causal,
     )
 }
 

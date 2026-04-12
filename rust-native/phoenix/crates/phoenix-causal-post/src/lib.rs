@@ -10,7 +10,9 @@ pub mod worker;
 
 pub use graph::{build_chain_records, build_counterfactual_reviews, CausalGraphStats};
 pub use normalize::{
-    normalize_causal_inputs, CausalEventProfile, CausalNormalizedInputs, CausalReviewCase,
+    normalize_causal_inputs, normalize_causal_inputs_with_sidecars, CausalEventProfile,
+    CausalNormalizedInputs, CausalReviewCase, CausalSourceClaimTrace,
+    CausalSourceClaimTraceSummary,
 };
 pub use validate::{draft_causal_decisions, CausalDecision, CausalDecisionKind};
 pub use views::build_causal_memory_cards;

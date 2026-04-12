@@ -22,12 +22,18 @@ use serde::{Deserialize, Serialize};
 use crate::phase4_contract::{
     GraphPathRerankScore, GraphPhase4RerankScore, GraphStructuralRerankScore,
 };
+pub use crate::query_session::{open_scope_query_session, ScopeQuerySession};
 pub use crate::retrieval::{
-    retrieved_causal_explanation, retrieved_history, retrieved_query, retrieved_world_state,
+    open_retrieved_query_session, retrieved_causal_explanation,
+    retrieved_causal_explanation_with_session, retrieved_history, retrieved_history_with_session,
+    retrieved_query, retrieved_world_state, retrieved_world_state_with_session,
     GraphRetrievedCausalExplanationAnswer, GraphRetrievedCausalExplanationQueryRequest,
     GraphRetrievedHistoryAnswer, GraphRetrievedHistoryQueryRequest, GraphRetrievedQueryAnswer,
     GraphRetrievedQueryRequest, GraphRetrievedRegion, GraphRetrievedSeed,
     GraphRetrievedWorldStateAnswer, GraphRetrievedWorldStateQueryRequest,
+};
+use crate::runtime_telemetry::{
+    measure_graph_runtime, record_projection_kernel_load, GraphRuntimeMetric,
 };
 use crate::{
     build_graph_patch_sidecar, compile_graph_projection, derive_dirty_scope_review_batches,
@@ -405,6 +411,7 @@ pub fn slot_at<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore,
 {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RankedWorldState);
     let Some(kernel) = load_projection_kernel(store, scope)? else {
         return Ok(None);
     };
@@ -463,15 +470,11 @@ pub fn history<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore,
 {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RankedHistory);
     let Some(kernel) = load_projection_kernel(store, scope)? else {
         return Ok(None);
     };
     let until_valid_at = request.until_valid_at.unwrap_or_else(now_ms);
-    let snapshot = kernel.view_as_of(KernelViewRequest {
-        valid_at: Some(until_valid_at),
-        recorded_at: request.recorded_at,
-        include_candidate_graph: request.include_candidate_graph,
-    });
     let timeline = kernel.entity_timeline(
         &request.entity_id,
         Some((request.since_valid_at, until_valid_at)),
@@ -501,7 +504,9 @@ where
         request,
         until_valid_at,
         &timeline.vertices,
-        &snapshot.candidate_edges,
+        &timeline.vertices,
+        &timeline.asserted_edges,
+        &timeline.candidate_edges,
         &changes,
         &conflicts,
         &gaps,
@@ -516,6 +521,7 @@ pub fn causal_explanation<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore,
 {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RankedCausalExplanation);
     let Some(kernel) = load_projection_kernel(store, scope)? else {
         return Ok(None);
     };
@@ -638,21 +644,25 @@ pub(crate) fn rank_world_state_answer(
 pub fn rank_history_answer(
     request: &GraphHistoryQueryRequest,
     until_valid_at: i64,
-    vertices: &[KernelVertex],
+    _timeline_vertices: &[KernelVertex],
+    graph_vertices: &[KernelVertex],
+    asserted_edges: &[KernelEdge],
     candidate_edges: &[KernelEdge],
     changes: &[KernelStateChange],
     conflicts: &[KernelStateIssue],
     gaps: &[KernelStateIssue],
 ) -> GraphRankedHistoryAnswer {
-    let claim_by_id = claim_vertex_index(vertices);
+    let claim_by_id = claim_vertex_index(graph_vertices);
     let mut candidates = changes
         .iter()
         .map(|change| {
             rank_history_candidate(
                 change,
+                graph_vertices,
+                asserted_edges,
+                candidate_edges,
                 conflicts,
                 gaps,
-                candidate_edges,
                 &claim_by_id,
                 request.truth_plane,
                 request.since_valid_at,
@@ -713,6 +723,14 @@ pub fn rank_history_answer(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct HistoryTemporalPathFeatures {
+    temporal_path_support: f64,
+    query_time_coverage: f64,
+    predecessor_coverage: f64,
+    pattern_strength: f64,
+}
+
 pub fn rank_causal_explanation_answer(
     request: &GraphCausalExplanationQueryRequest,
     snapshot: &phoenix_graph_kernel::KernelGraphSnapshot,
@@ -744,6 +762,7 @@ pub fn rank_causal_explanation_answer(
     .into_iter()
     .map(|candidate| rank_causal_path(request, &vertex_by_id, &candidate))
     .collect::<Vec<_>>();
+    apply_causal_temporal_agreement(&mut causal_candidates);
     causal_candidates.sort_by(|left, right| {
         right
             .answer_score
@@ -816,14 +835,20 @@ pub(crate) fn load_projection_kernel<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore,
 {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::LoadProjectionKernel);
     let Some(sidecar) = store.load_graph_patch_sidecar(scope)? else {
         return Ok(None);
     };
     let mut kernel = PhoenixGraphKernel::new();
+    let asserted_vertices = sidecar.graph_batch.vertices.len();
+    let asserted_edges = sidecar.graph_batch.edges.len();
     kernel.apply_kernel_batch(sidecar.graph_batch)?;
+    let mut candidate_edges = 0usize;
     if let Some(semantic_sidecar) = store.load_semantic_graph_patch_sidecar(scope)? {
+        candidate_edges = semantic_sidecar.candidate_graph_batch.edges.len();
         kernel.apply_kernel_batch(semantic_sidecar.candidate_graph_batch)?;
     }
+    record_projection_kernel_load(asserted_vertices, asserted_edges, candidate_edges);
     Ok(Some(kernel))
 }
 
@@ -1008,9 +1033,11 @@ fn claim_context_for_supporting_claims<'a>(
 
 fn rank_history_candidate(
     change: &KernelStateChange,
+    graph_vertices: &[KernelVertex],
+    asserted_edges: &[KernelEdge],
+    candidate_edges: &[KernelEdge],
     conflicts: &[KernelStateIssue],
     gaps: &[KernelStateIssue],
-    candidate_edges: &[KernelEdge],
     claim_by_id: &std::collections::BTreeMap<String, &KernelVertex>,
     requested_plane: GraphTruthPlane,
     since_valid_at: i64,
@@ -1027,6 +1054,14 @@ fn rank_history_candidate(
     let status_prior = status_prior(change.state.status.as_deref());
     let support_strength = support_strength(&change.state, claim_vertices.as_slice());
     let temporal_fitness = temporal_fitness(&change.state.temporal);
+    let temporal_path = history_temporal_path_features(
+        change,
+        graph_vertices,
+        asserted_edges,
+        candidate_edges,
+        since_valid_at,
+        until_valid_at,
+    );
     let recency_score =
         history_recency_score(&change.state.temporal, since_valid_at, until_valid_at);
     let relevant_conflict_count = relevant_timeline_issue_count(conflicts, &change.state);
@@ -1040,12 +1075,19 @@ fn rank_history_candidate(
     let gap_penalty = (relevant_gap_count as f64 * 0.12).min(0.4);
     let contradiction_region_penalty = (contradiction_region_count as f64 * 0.11).min(0.33);
     let speculative_penalty = speculative_penalty(truth_plane);
-    let answer_score =
-        plane_gate + status_prior + support_strength + temporal_fitness + recency_score
-            - conflict_penalty
-            - gap_penalty
-            - contradiction_region_penalty
-            - speculative_penalty;
+    let answer_score = plane_gate
+        + status_prior
+        + support_strength
+        + temporal_fitness
+        + recency_score
+        + (temporal_path.temporal_path_support * 0.45)
+        + (temporal_path.query_time_coverage * 0.20)
+        + (temporal_path.predecessor_coverage * 0.20)
+        + (temporal_path.pattern_strength * 0.15)
+        - conflict_penalty
+        - gap_penalty
+        - contradiction_region_penalty
+        - speculative_penalty;
 
     GraphRankedHistoryCandidate {
         change: change.clone(),
@@ -1105,6 +1147,160 @@ fn contradiction_region_count(
         .count()
 }
 
+fn history_temporal_path_features(
+    change: &KernelStateChange,
+    graph_vertices: &[KernelVertex],
+    asserted_edges: &[KernelEdge],
+    candidate_edges: &[KernelEdge],
+    since_valid_at: i64,
+    until_valid_at: i64,
+) -> HistoryTemporalPathFeatures {
+    let vertex_by_id = vertex_index(graph_vertices);
+    let Some(state_vertex) = vertex_by_id
+        .get(change.state.state_vertex_id.as_str())
+        .copied()
+    else {
+        return HistoryTemporalPathFeatures::default();
+    };
+    let claim_vertex_ids = change
+        .state
+        .supporting_claim_ids
+        .iter()
+        .map(|claim_id| format!("graph::claim::{claim_id}"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut relevant = claim_vertex_ids.clone();
+    relevant.insert(change.state.state_vertex_id.clone());
+
+    let mut predecessor_vertices = std::collections::BTreeSet::<String>::new();
+    let mut query_covering_vertices = std::collections::BTreeSet::<String>::new();
+    let mut pattern_total = 0.0;
+    let mut observed_edges = 0usize;
+    let mut ordered_edges = 0usize;
+    let mut temporal_edges = 0usize;
+
+    for edge in asserted_edges.iter().chain(candidate_edges.iter()) {
+        let source_relevant = relevant.contains(edge.source_id.0.as_str());
+        let target_relevant = relevant.contains(edge.target_id.0.as_str());
+        if !source_relevant && !target_relevant {
+            continue;
+        }
+
+        observed_edges += 1;
+        pattern_total += history_pattern_strength(edge);
+        let other_id = if source_relevant && !target_relevant {
+            edge.target_id.0.as_str()
+        } else if target_relevant && !source_relevant {
+            edge.source_id.0.as_str()
+        } else {
+            continue;
+        };
+        let Some(other_vertex) = vertex_by_id.get(other_id).copied() else {
+            continue;
+        };
+        if history_path_vertex_allowed(other_vertex)
+            && is_history_predecessor(other_vertex, state_vertex)
+        {
+            predecessor_vertices.insert(other_id.to_owned());
+        }
+        if history_path_vertex_allowed(other_vertex)
+            && temporal_overlaps_window(&other_vertex.temporal, since_valid_at, until_valid_at)
+        {
+            query_covering_vertices.insert(other_id.to_owned());
+        }
+        if history_path_vertex_allowed(other_vertex)
+            && (has_temporal_hint(other_vertex) || has_temporal_hint(state_vertex))
+        {
+            temporal_edges += 1;
+            if temporal_pair_forward(other_vertex, state_vertex) {
+                ordered_edges += 1;
+            }
+        }
+    }
+
+    if observed_edges == 0 {
+        return HistoryTemporalPathFeatures::default();
+    }
+
+    let predecessor_coverage = predecessor_vertices.len().min(4) as f64 / 4.0;
+    let query_time_coverage = query_covering_vertices.len() as f64 / observed_edges.max(1) as f64;
+    let temporal_order_ratio = if temporal_edges == 0 {
+        0.6
+    } else {
+        ordered_edges as f64 / temporal_edges as f64
+    };
+    HistoryTemporalPathFeatures {
+        temporal_path_support: ((predecessor_coverage * 0.45)
+            + (query_time_coverage * 0.30)
+            + (temporal_order_ratio * 0.25))
+            .clamp(0.0, 1.0),
+        query_time_coverage: query_time_coverage.clamp(0.0, 1.0),
+        predecessor_coverage,
+        pattern_strength: (pattern_total / observed_edges as f64).clamp(0.0, 1.0),
+    }
+}
+
+fn history_pattern_strength(edge: &KernelEdge) -> f64 {
+    let mut score = match edge.edge_type.0.as_str() {
+        "semantic::same_process" => 1.0,
+        "semantic::related_event" => 0.88,
+        "supported_by" => 0.82,
+        "state_of" | "state_value" => 0.76,
+        "about" => 0.56,
+        "under_view" => 0.32,
+        _ => 0.18,
+    };
+    if matches!(edge.layer, KernelGraphLayer::Candidate) {
+        score *= 0.88;
+    }
+    score
+}
+
+fn history_path_vertex_allowed(vertex: &KernelVertex) -> bool {
+    matches!(vertex.kind.as_str(), "event" | "state" | "entity")
+}
+
+fn has_temporal_hint(vertex: &KernelVertex) -> bool {
+    vertex.temporal.valid_from.is_some() || vertex.temporal.valid_to.is_some()
+}
+
+fn is_history_predecessor(other: &KernelVertex, state: &KernelVertex) -> bool {
+    let other_start = other
+        .temporal
+        .valid_from
+        .or(other.temporal.valid_to)
+        .unwrap_or(i64::MIN);
+    let state_start = state
+        .temporal
+        .valid_from
+        .or(state.temporal.valid_to)
+        .unwrap_or(i64::MAX);
+    other.kind != "chunk" && other_start <= state_start
+}
+
+fn temporal_pair_forward(source: &KernelVertex, target: &KernelVertex) -> bool {
+    let source_start = source
+        .temporal
+        .valid_from
+        .or(source.temporal.valid_to)
+        .unwrap_or(i64::MIN);
+    let target_start = target
+        .temporal
+        .valid_from
+        .or(target.temporal.valid_to)
+        .unwrap_or(i64::MAX);
+    source_start <= target_start
+}
+
+fn temporal_overlaps_window(
+    temporal: &phoenix_graph_kernel::KernelBiTemporal,
+    since_valid_at: i64,
+    until_valid_at: i64,
+) -> bool {
+    let start = temporal.valid_from.unwrap_or(i64::MIN);
+    let end = temporal.valid_to.unwrap_or(i64::MAX);
+    start < until_valid_at && end > since_valid_at
+}
+
 fn edge_touches_state_or_support_claims(
     edge: &KernelEdge,
     state_vertex_id: &str,
@@ -1148,9 +1344,17 @@ fn rank_causal_path(
     let path_stability = candidate.features.path_stability;
     let support_strength = candidate.features.support_strength;
     let temporal_fitness = candidate.features.temporal_consistency_ratio;
+    let query_time_alignment =
+        causal_query_time_alignment(request, vertex_by_id, candidate).clamp(0.0, 1.0);
+    let pattern_strength = candidate.features.pattern_strength.clamp(0.0, 1.0);
     let depth_penalty = (candidate.features.depth.saturating_sub(1) as f64 * 0.12).min(0.48);
     let speculative_penalty = speculative_penalty(truth_plane);
-    let answer_score = plane_gate + path_stability + support_strength + temporal_fitness
+    let answer_score = plane_gate
+        + path_stability
+        + support_strength
+        + temporal_fitness
+        + (query_time_alignment * 0.30)
+        + (pattern_strength * 0.25)
         - depth_penalty
         - speculative_penalty;
     let mut evidence_refs = candidate
@@ -1217,6 +1421,85 @@ fn rank_causal_path(
         query_rerank: None,
         event_rerank: None,
         graph_structural_rerank: None,
+    }
+}
+
+fn causal_query_time_alignment(
+    request: &GraphCausalExplanationQueryRequest,
+    vertex_by_id: &std::collections::BTreeMap<&str, &KernelVertex>,
+    candidate: &KernelCausalPathCandidateView<'_>,
+) -> f64 {
+    let query_at = request.valid_at.or_else(|| {
+        candidate
+            .path_vertex_ids
+            .last()
+            .and_then(|vertex_id| vertex_by_id.get(vertex_id).copied())
+            .and_then(|vertex| vertex.temporal.valid_from.or(vertex.temporal.valid_to))
+    });
+    let Some(query_at) = query_at else {
+        return 0.7;
+    };
+    let scale = candidate.features.path_span_ms.max(1) as f64;
+    let total = candidate
+        .path_vertex_ids
+        .iter()
+        .filter_map(|vertex_id| vertex_by_id.get(vertex_id).copied())
+        .map(|vertex| temporal_alignment_score(&vertex.temporal, query_at, scale))
+        .sum::<f64>();
+    total / candidate.path_vertex_ids.len().max(1) as f64
+}
+
+fn temporal_alignment_score(
+    temporal: &phoenix_graph_kernel::KernelBiTemporal,
+    query_at: i64,
+    scale: f64,
+) -> f64 {
+    let start = temporal.valid_from.unwrap_or(i64::MIN);
+    let end = temporal.valid_to.unwrap_or(i64::MAX);
+    if start <= query_at && query_at < end {
+        return 1.0;
+    }
+    let distance = if query_at < start {
+        (start - query_at) as f64
+    } else {
+        (query_at - end) as f64
+    };
+    (1.0 / (1.0 + (distance / scale.max(1.0)))).clamp(0.0, 1.0)
+}
+
+fn apply_causal_temporal_agreement(candidates: &mut [GraphRankedCausalPath]) {
+    if candidates.len() < 2 {
+        return;
+    }
+    let signatures = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .path_vertex_ids
+                .iter()
+                .skip(1)
+                .take(candidate.path_vertex_ids.len().saturating_sub(2))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .collect::<Vec<_>>();
+    for index in 0..candidates.len() {
+        let mut overlaps = 0usize;
+        for other in 0..candidates.len() {
+            if index == other {
+                continue;
+            }
+            if !signatures[index].is_empty()
+                && signatures[index]
+                    .intersection(&signatures[other])
+                    .next()
+                    .is_some()
+            {
+                overlaps += 1;
+            }
+        }
+        let bonus = overlaps as f64 / (candidates.len() - 1) as f64;
+        candidates[index].answer_score += bonus * 0.18;
     }
 }
 
@@ -1549,6 +1832,14 @@ mod tests {
         )
         .expect("query")
         .expect("ranked history");
+        eprintln!(
+            "history candidates: {:?}",
+            answer
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.change.state.value.clone(), candidate.answer_score))
+                .collect::<Vec<_>>()
+        );
 
         assert!(!answer.abstain);
         assert_eq!(
@@ -1617,6 +1908,133 @@ mod tests {
                 .as_ref()
                 .map(|candidate| candidate.truth_plane),
             Some(GraphTruthPlane::WorldState)
+        );
+    }
+
+    #[test]
+    fn history_prefers_temporally_grounded_change_when_base_scores_tie() {
+        let scope = ScopeKey::default();
+        let grounded_state = "graph::state::state-grounded";
+        let bare_state = "graph::state::state-bare";
+        let grounded_event = "graph::event::history-grounded";
+        let store = TestGraphStore {
+            sidecar: Some(sidecar_for_projection(
+                vec![
+                    test_claim("claim-bare", "asserted"),
+                    test_claim("claim-grounded", "asserted"),
+                    test_state_with_temporal(
+                        "state-bare",
+                        "alice",
+                        "entity.employer",
+                        "BareCo",
+                        0.78,
+                        "claim-bare",
+                        Some(40),
+                        None,
+                    ),
+                    test_state_with_temporal(
+                        "state-grounded",
+                        "alice",
+                        "entity.employer",
+                        "GroundedCo",
+                        0.78,
+                        "claim-grounded",
+                        Some(40),
+                        None,
+                    ),
+                    test_event(grounded_event, "alice", Some(25), Some(39)),
+                ],
+                vec![
+                    support_edge(bare_state, "claim-bare"),
+                    support_edge(grounded_state, "claim-grounded"),
+                    support_edge(grounded_event, "claim-grounded"),
+                    semantic_edge(grounded_event, grounded_state, "semantic::same_process"),
+                ],
+            )),
+        };
+
+        let answer = history(
+            &store,
+            &scope,
+            &GraphHistoryQueryRequest {
+                entity_id: "alice".to_owned(),
+                slot_key: Some("entity.employer".to_owned()),
+                since_valid_at: 0,
+                until_valid_at: Some(80),
+                recorded_at: Some(100),
+                include_candidate_graph: false,
+                truth_plane: GraphTruthPlane::WorldState,
+                limit: Some(4),
+            },
+        )
+        .expect("query")
+        .expect("ranked history");
+
+        assert!(!answer.abstain);
+        assert_eq!(
+            answer
+                .selected
+                .as_ref()
+                .map(|candidate| candidate.change.state.value.as_str()),
+            Some("GroundedCo"),
+            "scores: {:?}",
+            answer
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.change.state.value.clone(), candidate.answer_score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn causal_explanation_prefers_query_aligned_path_when_base_scores_tie() {
+        let scope = ScopeKey::default();
+        let stale_cause = "graph::event::memory::cause-a-stale";
+        let fresh_cause = "graph::event::memory::cause-z-fresh";
+        let effect = "graph::event::memory::effect-recent";
+        let store = TestGraphStore {
+            sidecar: Some(sidecar_for_projection(
+                vec![
+                    test_claim("claim-stale", "asserted"),
+                    test_claim("claim-fresh", "asserted"),
+                    test_claim("claim-effect", "asserted"),
+                    test_event(stale_cause, "alice", Some(0), Some(5)),
+                    test_event(fresh_cause, "alice", Some(28), Some(29)),
+                    test_event(effect, "alice", Some(30), None),
+                ],
+                vec![
+                    support_edge(stale_cause, "claim-stale"),
+                    support_edge(fresh_cause, "claim-fresh"),
+                    support_edge(effect, "claim-effect"),
+                    causal_edge(stale_cause, effect, "supported", 0.82),
+                    causal_edge(fresh_cause, effect, "supported", 0.82),
+                ],
+            )),
+        };
+
+        let answer = causal_explanation(
+            &store,
+            &scope,
+            &GraphCausalExplanationQueryRequest {
+                target_vertex_id: effect.to_owned(),
+                valid_at: Some(30),
+                recorded_at: Some(100),
+                include_candidate_graph: false,
+                max_depth: 3,
+                limit: Some(4),
+                truth_plane: GraphTruthPlane::WorldState,
+            },
+        )
+        .expect("query")
+        .expect("ranked explanation");
+
+        assert!(!answer.abstain);
+        assert_eq!(
+            answer
+                .selected
+                .as_ref()
+                .map(|candidate| candidate.source_vertex_id.as_str()),
+            Some(fresh_cause)
         );
     }
 
@@ -1861,6 +2279,29 @@ mod tests {
                 evidence_refs: vec!["evidence://1".to_owned()],
                 ..KernelProvenance::default()
             },
+            resolution_facet: None,
+        }
+    }
+
+    fn semantic_edge(source_id: &str, target_id: &str, edge_type: &str) -> KernelEdge {
+        KernelEdge {
+            source_id: KernelVertexId(source_id.to_owned()),
+            target_id: KernelVertexId(target_id.to_owned()),
+            edge_type: KernelEdgeType(edge_type.to_owned()),
+            relation_class: KernelRelationClass::Semantic,
+            weight: 1,
+            attributes: serde_json::json!({}),
+            data: None,
+            document_id: None,
+            narrative_id: None,
+            layer: KernelGraphLayer::Asserted,
+            temporal: KernelBiTemporal {
+                valid_from: Some(0),
+                valid_to: None,
+                recorded_at: Some(100),
+                expired_at: None,
+            },
+            provenance: KernelProvenance::default(),
             resolution_facet: None,
         }
     }

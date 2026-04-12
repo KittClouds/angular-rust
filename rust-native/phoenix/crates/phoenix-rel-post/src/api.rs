@@ -6,6 +6,7 @@
 //! archives plus ER/lexical sidecars and emits `RelationScopeReviewBatch`
 //! and `RelationScopePatchSidecar` records.
 
+use phoenix_scope_analysis::ScopeAnalysisContext;
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixErPatchStore, PhoenixRelationMentionSeedStore,
     PhoenixRelationPatchStore, StoreError,
@@ -17,7 +18,8 @@ use crate::{
     build_relation_patch_sidecar, default_relation_type_specs, derive_dirty_scope_review_batches,
     derive_dirty_scope_review_batches_with_seeder, draft_relation_decisions,
     persist_relation_patch_sidecar, run_glirel_over_batch, GlirelModel, GlirelRelationTypeSpec,
-    GlirelWorkerError, NliModel, RelationDecision, RelationMentionSeeder, RelationScopeReviewBatch,
+    GlirelWorkerError, NliModel, RelationDecision, RelationExecutionPlan, RelationMentionSeeder,
+    RelationModelJob, RelationPreparedStageInput, RelationScopeReviewBatch,
 };
 
 /// Canonical Alex-first relation batch derivation. This path does not invoke
@@ -52,12 +54,50 @@ pub fn relation_specs() -> Vec<GlirelRelationTypeSpec> {
     default_relation_type_specs()
 }
 
+pub fn derive_batch_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
+) -> Result<RelationScopeReviewBatch, GlirelWorkerError> {
+    crate::derive_scope_review_batch_from_analysis(analysis, relation_sidecar, None, None)
+}
+
 pub fn run_glirel(
     batch: &mut RelationScopeReviewBatch,
     model: &GlirelModel,
     relation_specs: &[GlirelRelationTypeSpec],
 ) -> Result<(), GlirelWorkerError> {
     run_glirel_over_batch(batch, model, relation_specs)
+}
+
+pub fn build_execution_plan(
+    batch: &RelationScopeReviewBatch,
+    relation_specs: &[GlirelRelationTypeSpec],
+) -> RelationExecutionPlan {
+    RelationExecutionPlan::build(batch, relation_specs)
+}
+
+pub fn prepare_stage_input_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_specs: &[GlirelRelationTypeSpec],
+) -> Result<RelationPreparedStageInput, GlirelWorkerError> {
+    crate::prepare_relation_stage_input(analysis, relation_specs)
+}
+
+pub fn run_glirel_with_plan(
+    batch: &mut RelationScopeReviewBatch,
+    plan: &RelationExecutionPlan,
+    model: &GlirelModel,
+) -> Result<(), GlirelWorkerError> {
+    plan.apply_glirel(batch, model)
+}
+
+pub fn run_glirel_job_with_input(
+    batch: &mut RelationScopeReviewBatch,
+    prepared: &RelationPreparedStageInput,
+    model: &GlirelModel,
+    job: &RelationModelJob,
+) -> Result<(), GlirelWorkerError> {
+    prepared.apply_model_job(batch, model, job)
 }
 
 pub fn draft_decisions(

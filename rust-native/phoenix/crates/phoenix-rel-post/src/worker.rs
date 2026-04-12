@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use phoenix_alex::{
     api as alex_api, split_sentence_ranges as alex_sentence_ranges, AlexError, Lexicon,
 };
+use phoenix_scope_analysis::{ScopeAnalysisContext, ScopeEntityProfile};
 use phoenix_semantic_v2::{
     scope_storage_key, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef, ErScopePatchSidecar,
     RelationDecisionOutcome, RelationDecisionRecord, RelationEdgeAddition, RelationJudgmentKind,
@@ -22,10 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::gliner_seed::RelationMentionSeeder;
 use crate::glirel::{
-    extract_heuristic_relations, seed_relation_pairs, GlirelEntity, GlirelModel,
-    GlirelProposalConfig, GlirelRelationPrediction, GlirelRelationTypeSpec,
+    seed_relation_pairs, GlirelEntity, GlirelModel, GlirelProposalConfig, GlirelRelationPrediction,
+    GlirelRelationTypeSpec,
 };
 use crate::nli::NliModel;
+use crate::RelationExecutionPlan;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +168,49 @@ pub(crate) struct RelationSyntheticSentence {
     pub(crate) chunk_id: String,
     pub(crate) range: TextRange,
     pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RelationMentionSentenceIndex {
+    mentions_by_sentence: Vec<Vec<usize>>,
+}
+
+impl RelationMentionSentenceIndex {
+    fn build(mentions: &[RelationMention], sentence_count: usize) -> Self {
+        let mut mentions_by_sentence = vec![Vec::new(); sentence_count];
+        for (mention_index, mention) in mentions.iter().enumerate() {
+            if let Some(bucket) = mentions_by_sentence.get_mut(mention.sentence_index) {
+                bucket.push(mention_index);
+            }
+        }
+        Self {
+            mentions_by_sentence,
+        }
+    }
+
+    fn collect_window_mentions(
+        &self,
+        mentions: &[RelationMention],
+        start_index: usize,
+        end_index: usize,
+    ) -> Vec<RelationMention> {
+        let capacity = (start_index..=end_index)
+            .filter_map(|sentence_index| self.mentions_by_sentence.get(sentence_index))
+            .map(Vec::len)
+            .sum();
+        let mut rows = Vec::with_capacity(capacity);
+        for sentence_index in start_index..=end_index {
+            let Some(bucket) = self.mentions_by_sentence.get(sentence_index) else {
+                continue;
+            };
+            rows.extend(
+                bucket
+                    .iter()
+                    .map(|mention_index| mentions[*mention_index].clone()),
+            );
+        }
+        rows
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,73 +436,170 @@ fn derive_scope_review_batch_internal(
     relation_seed_sidecar: Option<&RelationMentionSeedScopeSidecar>,
     mention_seeder: Option<&RelationMentionSeeder>,
 ) -> Result<RelationScopeReviewBatch, GlirelWorkerError> {
-    let scope = archives
-        .first()
-        .map(|archive| archive.manifest.scope.clone())
-        .or_else(|| dirty.as_ref().map(|record| record.scope.clone()))
-        .or_else(|| sidecar.as_ref().map(|value| value.scope.clone()))
-        .unwrap_or_default();
-    let scope_key = archives
-        .first()
-        .map(|archive| archive.manifest.scope_key.clone())
-        .or_else(|| dirty.as_ref().map(|record| record.scope_key.clone()))
-        .or_else(|| sidecar.as_ref().map(|value| value.scope_key.clone()))
-        .unwrap_or_default();
-    let scope_ord = archives
-        .first()
-        .map(|archive| archive.manifest.scope_ord)
-        .or_else(|| dirty.as_ref().map(|record| record.scope_ord))
-        .or_else(|| sidecar.as_ref().and_then(|value| value.scope_ord))
-        .unwrap_or_default();
-    let session_id = archives
-        .iter()
-        .find_map(|archive| archive.manifest.session_id.clone())
-        .or_else(|| session.map(|value| value.session_id.clone()));
-    let document_refs = session
-        .map(|value| {
-            value
-                .document_refs
-                .iter()
-                .filter(|reference| scope_storage_key(&reference.scope) == scope_key)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
     let persisted_relations = build_persisted_relations(archives);
     let entity_profiles = build_entity_profiles(archives, sidecar, er_sidecar, session);
-    let (windows, mut window_build_stats) = build_windows(
+    let profile_by_entity = entity_profile_by_id(&entity_profiles);
+    let continuity_hints = continuity_relation_map(&persisted_relations);
+    build_scope_review_batch(
+        ScopeReviewBatchMeta {
+            scope: archives
+                .first()
+                .map(|archive| archive.manifest.scope.clone())
+                .or_else(|| dirty.as_ref().map(|record| record.scope.clone()))
+                .or_else(|| sidecar.as_ref().map(|value| value.scope.clone()))
+                .unwrap_or_default(),
+            scope_key: archives
+                .first()
+                .map(|archive| archive.manifest.scope_key.clone())
+                .or_else(|| dirty.as_ref().map(|record| record.scope_key.clone()))
+                .or_else(|| sidecar.as_ref().map(|value| value.scope_key.clone()))
+                .unwrap_or_default(),
+            scope_ord: archives
+                .first()
+                .map(|archive| archive.manifest.scope_ord)
+                .or_else(|| dirty.as_ref().map(|record| record.scope_ord))
+                .or_else(|| sidecar.as_ref().and_then(|value| value.scope_ord))
+                .unwrap_or_default(),
+            session_id: archives
+                .iter()
+                .find_map(|archive| archive.manifest.session_id.clone())
+                .or_else(|| session.map(|value| value.session_id.clone())),
+            dirty: dirty.cloned(),
+            document_refs: session
+                .map(|value| {
+                    value
+                        .document_refs
+                        .iter()
+                        .filter(|reference| {
+                            scope_storage_key(&reference.scope)
+                                == archives
+                                    .first()
+                                    .map(|archive| archive.manifest.scope_key.as_str())
+                                    .or_else(|| {
+                                        dirty.as_ref().map(|record| record.scope_key.as_str())
+                                    })
+                                    .or_else(|| {
+                                        sidecar.as_ref().map(|value| value.scope_key.as_str())
+                                    })
+                                    .unwrap_or_default()
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        },
         archives,
-        sidecar,
         er_sidecar,
         &persisted_relations,
         &entity_profiles,
+        &profile_by_entity,
+        &continuity_hints,
+        relation_seed_sidecar,
+        mention_seeder,
+        relation_sidecar,
+        sidecar.map(|value| value.generation),
+        er_sidecar.map(|value| value.generation),
+    )
+}
+
+pub fn derive_scope_review_batch_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&RelationScopePatchSidecar>,
+    relation_seed_sidecar: Option<&RelationMentionSeedScopeSidecar>,
+    mention_seeder: Option<&RelationMentionSeeder>,
+) -> Result<RelationScopeReviewBatch, GlirelWorkerError> {
+    let entity_profiles = relation_entity_profiles_from_scope(analysis);
+    let profile_by_entity = entity_profile_by_id(&entity_profiles);
+    build_scope_review_batch(
+        ScopeReviewBatchMeta {
+            scope: analysis.scope.clone(),
+            scope_key: analysis.scope_key.clone(),
+            scope_ord: analysis.dirty.scope_ord,
+            session_id: analysis.session_id.clone(),
+            dirty: Some(analysis.dirty.clone()),
+            document_refs: analysis.document_refs.as_ref().to_vec(),
+        },
+        analysis.archives(),
+        analysis.runtime.sidecars.er.as_ref(),
+        analysis.persisted_relations.as_ref(),
+        &entity_profiles,
+        &profile_by_entity,
+        analysis.continuity_hints.as_ref(),
+        relation_seed_sidecar,
+        mention_seeder,
+        relation_sidecar,
+        analysis
+            .runtime
+            .sidecars
+            .lexical
+            .as_ref()
+            .map(|value| value.generation),
+        analysis
+            .runtime
+            .sidecars
+            .er
+            .as_ref()
+            .map(|value| value.generation),
+    )
+}
+
+struct ScopeReviewBatchMeta {
+    scope: ScopeKey,
+    scope_key: String,
+    scope_ord: ScopeOrd,
+    session_id: Option<SessionId>,
+    dirty: Option<DirtyScopeRecord>,
+    document_refs: Vec<DocumentRevisionRef>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_scope_review_batch(
+    meta: ScopeReviewBatchMeta,
+    archives: &[DocumentArchive],
+    er_sidecar: Option<&ErScopePatchSidecar>,
+    persisted_relations: &[SemanticRelationRecord],
+    entity_profiles: &[RelationEntityProfile],
+    profile_by_entity: &FxHashMap<String, &RelationEntityProfile>,
+    continuity_hints: &FxHashMap<(String, String), BTreeSet<String>>,
+    relation_seed_sidecar: Option<&RelationMentionSeedScopeSidecar>,
+    mention_seeder: Option<&RelationMentionSeeder>,
+    relation_sidecar: Option<&RelationScopePatchSidecar>,
+    lexical_generation: Option<u64>,
+    er_generation: Option<u64>,
+) -> Result<RelationScopeReviewBatch, GlirelWorkerError> {
+    let (windows, mut window_build_stats) = build_windows(
+        archives,
+        er_sidecar,
+        persisted_relations,
+        entity_profiles,
+        profile_by_entity,
+        continuity_hints,
         relation_seed_sidecar,
         mention_seeder,
     )?;
     let review_cases = build_review_cases(
-        &scope,
-        &scope_key,
-        scope_ord,
-        session_id.clone(),
+        &meta.scope,
+        &meta.scope_key,
+        meta.scope_ord,
+        meta.session_id.clone(),
         &windows,
-        &entity_profiles,
+        profile_by_entity,
     );
     window_build_stats.seeded_pair_count = review_cases.len();
 
     let mut batch = RelationScopeReviewBatch {
-        scope,
-        scope_key,
-        scope_ord,
-        session_id,
-        dirty: dirty.cloned(),
-        document_refs,
+        scope: meta.scope,
+        scope_key: meta.scope_key,
+        scope_ord: meta.scope_ord,
+        session_id: meta.session_id,
+        dirty: meta.dirty,
+        document_refs: meta.document_refs,
         windows,
         review_cases,
-        entity_profiles,
-        persisted_relations,
-        lexical_generation: sidecar.map(|value| value.generation),
-        er_generation: er_sidecar.map(|value| value.generation),
+        entity_profiles: entity_profiles.to_vec(),
+        persisted_relations: persisted_relations.to_vec(),
+        lexical_generation,
+        er_generation,
         relation_generation: relation_sidecar.map(|value| value.generation),
         window_build_stats,
     };
@@ -573,6 +715,56 @@ where
         .collect()
 }
 
+pub(crate) fn select_window_relation_specs(
+    window: &RelationWindowRecord,
+    relation_specs: &[GlirelRelationTypeSpec],
+) -> Vec<GlirelRelationTypeSpec> {
+    if window.candidate_relation_types.is_empty() {
+        return relation_specs.to_vec();
+    }
+
+    let spec_by_label = relation_specs
+        .iter()
+        .map(|spec| (spec.label.as_str(), spec))
+        .collect::<FxHashMap<_, _>>();
+    let mut selected_labels = BTreeSet::<String>::new();
+    for label in &window.candidate_relation_types {
+        selected_labels.insert(label.clone());
+        if let Some(spec) = spec_by_label.get(label.as_str()) {
+            for conflict in &spec.conflicts_with {
+                selected_labels.insert(conflict.clone());
+            }
+        }
+    }
+
+    let selected = relation_specs
+        .iter()
+        .filter(|spec| selected_labels.contains(spec.label.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        relation_specs.to_vec()
+    } else {
+        selected
+    }
+}
+
+pub(crate) fn build_window_glirel_entities(window: &RelationWindowRecord) -> Vec<GlirelEntity> {
+    window
+        .entities
+        .iter()
+        .map(|entity| GlirelEntity {
+            text: entity.surface.clone(),
+            entity_type: entity.entity_type.clone(),
+            span_start: entity
+                .span_start
+                .saturating_sub(window.range.start as usize),
+            span_end: entity.span_end.saturating_sub(window.range.start as usize),
+            entity_id: Some(entity.entity_id.0.clone()),
+        })
+        .collect()
+}
+
 pub fn run_glirel_over_batch(
     batch: &mut RelationScopeReviewBatch,
     model: &GlirelModel,
@@ -582,99 +774,7 @@ pub fn run_glirel_over_batch(
         return Ok(());
     }
 
-    let mut case_indices_by_window = BTreeMap::<String, Vec<usize>>::new();
-    for (index, case) in batch.review_cases.iter().enumerate() {
-        case_indices_by_window
-            .entry(case.window_id.clone())
-            .or_default()
-            .push(index);
-    }
-
-    let min_threshold = relation_specs
-        .iter()
-        .map(|spec| spec.review_threshold_millis)
-        .min()
-        .unwrap_or(450)
-        .min(300) as f32
-        / 1000.0;
-
-    let windows_by_id = batch
-        .windows
-        .iter()
-        .map(|window| (window.window_id.as_str(), window))
-        .collect::<FxHashMap<_, _>>();
-
-    for (window_id, case_indices) in case_indices_by_window {
-        let Some(window) = windows_by_id.get(window_id.as_str()) else {
-            continue;
-        };
-        if window.entities.len() < 2 {
-            continue;
-        }
-        let entities = window
-            .entities
-            .iter()
-            .map(|entity| GlirelEntity {
-                text: entity.surface.clone(),
-                entity_type: entity.entity_type.clone(),
-                span_start: entity
-                    .span_start
-                    .saturating_sub(window.range.start as usize),
-                span_end: entity.span_end.saturating_sub(window.range.start as usize),
-                entity_id: Some(entity.entity_id.0.clone()),
-            })
-            .collect::<Vec<_>>();
-        let model_predictions = model
-            .extract_with_schema(&window.text, &entities, relation_specs, min_threshold)
-            .map_err(GlirelWorkerError::Model)?;
-        let heuristic_predictions = extract_heuristic_relations(
-            &window.text,
-            &entities,
-            relation_specs,
-            &GlirelProposalConfig::default(),
-        );
-        let filtered_predictions = filter_relation_predictions(
-            &window.text,
-            &window.entities,
-            window.range.start as usize,
-            relation_specs,
-            merge_relation_prediction_lanes(model_predictions, heuristic_predictions),
-        );
-
-        let predictions_by_pair = filtered_predictions.into_iter().fold(
-            FxHashMap::<(String, String), Vec<GlirelRelationPrediction>>::default(),
-            |mut acc, prediction| {
-                let head_id = entities[prediction.head_index]
-                    .entity_id
-                    .clone()
-                    .unwrap_or_default();
-                let tail_id = entities[prediction.tail_index]
-                    .entity_id
-                    .clone()
-                    .unwrap_or_default();
-                acc.entry((head_id, tail_id)).or_default().push(prediction);
-                acc
-            },
-        );
-
-        for case_index in case_indices {
-            let case = &mut batch.review_cases[case_index];
-            let key = (
-                case.source_entity_id.0.clone(),
-                case.target_entity_id.0.clone(),
-            );
-            let mut rows = predictions_by_pair.get(&key).cloned().unwrap_or_default();
-            rows.sort_by(|left, right| {
-                right
-                    .confidence
-                    .partial_cmp(&left.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            case.glirel_predictions = rows;
-        }
-    }
-
-    Ok(())
+    RelationExecutionPlan::build(batch, relation_specs).apply_glirel(batch, model)
 }
 
 pub(crate) fn merge_relation_prediction_lanes(
@@ -744,85 +844,7 @@ pub fn run_primary_relation_lane(
         return run_glirel_over_batch(batch, model, relation_specs);
     }
 
-    let windows_by_id = batch
-        .windows
-        .iter()
-        .map(|window| (window.window_id.as_str(), window))
-        .collect::<FxHashMap<_, _>>();
-    let mut case_indices_by_window = BTreeMap::<String, Vec<usize>>::new();
-    for (index, case) in batch.review_cases.iter().enumerate() {
-        case_indices_by_window
-            .entry(case.window_id.clone())
-            .or_default()
-            .push(index);
-    }
-
-    for (window_id, case_indices) in case_indices_by_window {
-        let Some(window) = windows_by_id.get(window_id.as_str()) else {
-            continue;
-        };
-        let entities = window
-            .entities
-            .iter()
-            .map(|entity| GlirelEntity {
-                text: entity.surface.clone(),
-                entity_type: entity.entity_type.clone(),
-                span_start: entity
-                    .span_start
-                    .saturating_sub(window.range.start as usize),
-                span_end: entity.span_end.saturating_sub(window.range.start as usize),
-                entity_id: Some(entity.entity_id.0.clone()),
-            })
-            .collect::<Vec<_>>();
-        let predictions = extract_heuristic_relations(
-            &window.text,
-            &entities,
-            relation_specs,
-            &GlirelProposalConfig::default(),
-        );
-        let filtered_predictions = filter_relation_predictions(
-            &window.text,
-            &window.entities,
-            window.range.start as usize,
-            relation_specs,
-            predictions,
-        );
-        let predictions_by_pair = filtered_predictions.into_iter().fold(
-            FxHashMap::<(String, String), Vec<GlirelRelationPrediction>>::default(),
-            |mut acc, mut prediction| {
-                prediction
-                    .evidence
-                    .push("proposal_engine:heuristic".to_owned());
-                let head_id = entities[prediction.head_index]
-                    .entity_id
-                    .clone()
-                    .unwrap_or_default();
-                let tail_id = entities[prediction.tail_index]
-                    .entity_id
-                    .clone()
-                    .unwrap_or_default();
-                acc.entry((head_id, tail_id)).or_default().push(prediction);
-                acc
-            },
-        );
-
-        for case_index in case_indices {
-            let case = &mut batch.review_cases[case_index];
-            let key = (
-                case.source_entity_id.0.clone(),
-                case.target_entity_id.0.clone(),
-            );
-            let mut rows = predictions_by_pair.get(&key).cloned().unwrap_or_default();
-            rows.sort_by(|left, right| {
-                right
-                    .confidence
-                    .partial_cmp(&left.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            case.glirel_predictions = rows;
-        }
-    }
-
+    RelationExecutionPlan::build(batch, relation_specs).apply_heuristic(batch);
     Ok(())
 }
 
@@ -918,6 +940,11 @@ pub fn adjudicate_relation_decisions_with_nli(
         .iter()
         .map(|case| (case.case_id.as_str(), case))
         .collect::<FxHashMap<_, _>>();
+    let window_text_by_id = batch
+        .windows
+        .iter()
+        .map(|window| (window.window_id.as_str(), window.text.as_str()))
+        .collect::<FxHashMap<_, _>>();
     let mut adjudicated = Vec::with_capacity(decisions.len());
     for decision in decisions {
         let Some(case) = case_by_id.get(decision.case_id.as_str()) else {
@@ -943,8 +970,15 @@ pub fn adjudicate_relation_decisions_with_nli(
         } else {
             Vec::new()
         };
-        let judgment =
-            nli.judge_relation(&case.window_text, &forward_templates, &reverse_templates)?;
+        let window_text = if case.window_text.is_empty() {
+            window_text_by_id
+                .get(case.window_id.as_str())
+                .copied()
+                .unwrap_or_default()
+        } else {
+            case.window_text.as_str()
+        };
+        let judgment = nli.judge_relation(window_text, &forward_templates, &reverse_templates)?;
         let chosen_scores = if judgment.used_reverse {
             judgment.reverse.unwrap_or(judgment.forward)
         } else {
@@ -1350,7 +1384,7 @@ fn dedupe_relation_patch_sidecar(sidecar: &mut RelationScopePatchSidecar) {
     });
 }
 
-fn build_entity_profiles(
+pub(crate) fn build_entity_profiles(
     archives: &[DocumentArchive],
     sidecar: Option<&ScopeLexSidecar>,
     er_sidecar: Option<&ErScopePatchSidecar>,
@@ -1411,6 +1445,57 @@ pub fn derive_relation_entity_profiles(
     session: Option<&SessionArchive>,
 ) -> Vec<RelationEntityProfile> {
     build_entity_profiles(archives, sidecar, er_sidecar, session)
+}
+
+fn relation_entity_profiles_from_scope(
+    analysis: &ScopeAnalysisContext,
+) -> Vec<RelationEntityProfile> {
+    analysis
+        .entity_profiles
+        .iter()
+        .map(|profile| RelationEntityProfile {
+            entity_id: profile.entity_id.clone(),
+            scope: analysis.scope.clone(),
+            scope_key: analysis.scope_key.clone(),
+            scope_ord: analysis.dirty.scope_ord,
+            session_id: analysis.session_id.clone(),
+            canonical_name: profile.canonical_name.clone(),
+            aliases: profile.aliases.clone(),
+            kind: profile.effective_kind.clone(),
+            mention_count: profile.mention_count,
+            document_ids: profile.document_ids.clone(),
+            chunk_ids: profile.chunk_ids.clone(),
+            continuity_score_millis: profile.continuity_score_millis,
+            serialized: serialize_profile_like(
+                &profile.canonical_name,
+                &profile.aliases,
+                profile.effective_kind.as_ref(),
+                &profile.document_ids,
+            ),
+            blocking_keys: relation_profile_blocking_keys(profile),
+        })
+        .collect()
+}
+
+pub(crate) fn entity_profile_by_id<'a>(
+    profiles: &'a [RelationEntityProfile],
+) -> FxHashMap<String, &'a RelationEntityProfile> {
+    profiles
+        .iter()
+        .map(|profile| (profile.entity_id.0.clone(), profile))
+        .collect::<FxHashMap<_, _>>()
+}
+
+fn relation_profile_blocking_keys(profile: &ScopeEntityProfile) -> Vec<String> {
+    let mut keys = vec![format!("entity:{}", profile.entity_id.0)];
+    keys.push(format!(
+        "canonical:{}",
+        profile.canonical_name.to_lowercase().replace(' ', "_")
+    ));
+    if let Some(kind) = profile.effective_kind.as_ref() {
+        keys.push(format!("kind:{kind:?}").to_lowercase());
+    }
+    keys
 }
 
 fn entity_profile_from_record(
@@ -1487,21 +1572,17 @@ fn merge_entity_profile(
     );
 }
 
-fn build_windows(
+pub(crate) fn build_windows(
     archives: &[DocumentArchive],
-    _sidecar: Option<&ScopeLexSidecar>,
     er_sidecar: Option<&ErScopePatchSidecar>,
     persisted_relations: &[SemanticRelationRecord],
     profiles: &[RelationEntityProfile],
+    profile_by_entity: &FxHashMap<String, &RelationEntityProfile>,
+    continuity_hints: &FxHashMap<(String, String), BTreeSet<String>>,
     relation_seed_sidecar: Option<&RelationMentionSeedScopeSidecar>,
     mention_seeder: Option<&RelationMentionSeeder>,
 ) -> Result<(Vec<RelationWindowRecord>, RelationWindowBuildStats), GlirelWorkerError> {
-    let profile_by_entity = profiles
-        .iter()
-        .map(|profile| (profile.entity_id.0.clone(), profile))
-        .collect::<FxHashMap<_, _>>();
     let er_view = ErPatchView::from_sidecar(er_sidecar);
-    let continuity_hints = continuity_relation_map(persisted_relations);
     let alex_lexicon = build_relation_alex_lexicon(profiles)?;
     let mut windows = Vec::new();
     let mut stats = RelationWindowBuildStats::default();
@@ -1537,14 +1618,15 @@ fn build_windows(
                 }
             }
         }
+        let mention_sentence_index =
+            RelationMentionSentenceIndex::build(&mentions, archive.sentences.len());
         let before = windows.len();
         if archive.sentences.is_empty() {
             append_synthetic_sentence_windows(
                 &mut windows,
                 &mut stats,
                 archive,
-                profiles,
-                &alex_lexicon,
+                &mentions,
                 persisted_relations,
                 &continuity_hints,
             );
@@ -1589,13 +1671,8 @@ fn build_windows(
             let end_index = (sentence_index + 1).min(archive.sentences.len() - 1);
             let start = archive.sentences[start_index].range.start;
             let end = archive.sentences[end_index].range.end;
-            let mut entities = mentions
-                .iter()
-                .filter(|mention| {
-                    mention.sentence_index >= start_index && mention.sentence_index <= end_index
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut entities =
+                mention_sentence_index.collect_window_mentions(&mentions, start_index, end_index);
             dedupe_window_entities(&mut entities, &profile_by_entity);
             if entities.len() < 2 {
                 record_stat(
@@ -1821,7 +1898,7 @@ fn record_stat(map: &mut BTreeMap<String, usize>, key: String) {
     *map.entry(key).or_default() += 1;
 }
 
-fn continuity_relation_map(
+pub(crate) fn continuity_relation_map(
     persisted_relations: &[SemanticRelationRecord],
 ) -> FxHashMap<(String, String), BTreeSet<String>> {
     let mut rows = FxHashMap::<(String, String), BTreeSet<String>>::default();
@@ -1843,34 +1920,45 @@ fn append_synthetic_sentence_windows(
     windows: &mut Vec<RelationWindowRecord>,
     stats: &mut RelationWindowBuildStats,
     archive: &DocumentArchive,
-    profiles: &[RelationEntityProfile],
-    alex_lexicon: &Lexicon,
+    mentions: &[RelationMention],
     _persisted_relations: &[SemanticRelationRecord],
     continuity_hints: &FxHashMap<(String, String), BTreeSet<String>>,
 ) {
+    let sentence_count = mentions
+        .iter()
+        .map(|mention| mention.sentence_index)
+        .max()
+        .map(|value| value + 1)
+        .unwrap_or_default();
+    let mention_sentence_index = RelationMentionSentenceIndex::build(mentions, sentence_count);
     let mut sentence_index = 0usize;
     for chunk in &archive.chunks {
         let mut chunk_built_any = false;
         let synthetic = split_chunk_into_synthetic_sentences(chunk, sentence_index);
         sentence_index += synthetic.len();
-        let candidate_profiles = candidate_profiles_for_chunk(archive, chunk, profiles);
         let mut sentence_mentions =
             Vec::<(RelationSyntheticSentence, Vec<RelationMention>, Vec<String>)>::new();
         for sentence in synthetic {
-            let (mentions, labels) = rebuild_sentence_mentions(
-                &sentence,
-                &archive.manifest.scope,
-                &candidate_profiles,
-                alex_lexicon,
+            let mut sentence_window_mentions = mention_sentence_index.collect_window_mentions(
+                mentions,
+                sentence.index,
+                sentence.index,
             );
-            if mentions.len() < 2 {
+            dedupe_relation_mentions_by_entity(&mut sentence_window_mentions);
+            if sentence_window_mentions.len() < 2 {
                 record_stat(
                     &mut stats.rejected_window_reason_counts,
                     "too_few_entities".to_owned(),
                 );
                 continue;
             }
-            sentence_mentions.push((sentence, mentions, labels));
+            let mut labels = sentence_window_mentions
+                .iter()
+                .filter_map(|mention| mention.evidence_label.clone())
+                .collect::<Vec<_>>();
+            labels.sort();
+            labels.dedup();
+            sentence_mentions.push((sentence, sentence_window_mentions, labels));
         }
         for (sentence, mentions, labels) in &sentence_mentions {
             let before = windows.len();
@@ -2033,6 +2121,7 @@ fn rebuild_sentence_mentions(
             span_start: sentence.range.start as usize + known_match.range.start as usize,
             span_end: sentence.range.start as usize + known_match.range.end as usize,
             mention_index: None,
+            evidence_label: Some(relation_match_source_label(known_match.source.as_ref())),
         });
         evidence_labels.push(relation_match_source_label(known_match.source.as_ref()));
     }
@@ -2119,9 +2208,11 @@ fn collect_alex_relation_mentions(
     alex_lexicon: &Lexicon,
 ) -> Vec<RelationMention> {
     let mut mentions = Vec::new();
+    let mut sentence_index = 0usize;
     for chunk in &archive.chunks {
         let candidate_profiles = candidate_profiles_for_chunk(archive, chunk, profiles);
-        let synthetic = split_chunk_into_synthetic_sentences(chunk, 0);
+        let synthetic = split_chunk_into_synthetic_sentences(chunk, sentence_index);
+        sentence_index += synthetic.len();
         for sentence in synthetic {
             let (mut sentence_mentions, _) = rebuild_sentence_mentions(
                 &sentence,
@@ -2129,8 +2220,10 @@ fn collect_alex_relation_mentions(
                 &candidate_profiles,
                 alex_lexicon,
             );
-            for mention in &mut sentence_mentions {
-                mention.sentence_index = mention_sentence_index(archive, mention.span_start);
+            if !archive.sentences.is_empty() {
+                for mention in &mut sentence_mentions {
+                    mention.sentence_index = mention_sentence_index(archive, mention.span_start);
+                }
             }
             mentions.extend(sentence_mentions);
         }
@@ -2200,20 +2293,36 @@ fn dedupe_relation_mentions_by_entity(mentions: &mut Vec<RelationMention>) {
 }
 
 fn render_archive_window_text(archive: &DocumentArchive, range: TextRange) -> String {
-    let mut slices = archive
-        .chunks
-        .iter()
-        .filter_map(|chunk| {
-            let start = range.start.max(chunk.range.start);
-            let end = range.end.min(chunk.range.end);
-            if end <= start {
-                return None;
-            }
-            slice_text_range(&chunk.text, TextRange { start, end }, chunk.range)
-        })
-        .collect::<Vec<_>>();
-    slices.dedup();
-    slices.join(" ").trim().to_owned()
+    let mut rendered = String::with_capacity(
+        range.end.saturating_sub(range.start) as usize + archive.chunks.len().min(4),
+    );
+    let mut previous_slice = "";
+    for chunk in &archive.chunks {
+        if chunk.range.end <= range.start {
+            continue;
+        }
+        if chunk.range.start >= range.end {
+            break;
+        }
+        let start = range.start.max(chunk.range.start);
+        let end = range.end.min(chunk.range.end);
+        if end <= start {
+            continue;
+        }
+        let Some(slice) = slice_text_range_view(&chunk.text, TextRange { start, end }, chunk.range)
+        else {
+            continue;
+        };
+        if slice == previous_slice {
+            continue;
+        }
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push_str(slice);
+        previous_slice = slice;
+    }
+    rendered.trim().to_owned()
 }
 
 fn has_type_compatible_pair(entities: &[RelationMention]) -> bool {
@@ -2386,6 +2495,7 @@ fn append_relation_candidate_windows(
                     span_start: entity.span_start,
                     span_end: entity.span_end,
                     mention_index: entity.mention_index,
+                    evidence_label: None,
                 })
                 .collect::<Vec<_>>(),
         ) {
@@ -2482,6 +2592,7 @@ fn append_archive_relation_windows(
                     span_start: entity.span_start,
                     span_end: entity.span_end,
                     mention_index: entity.mention_index,
+                    evidence_label: None,
                 })
                 .collect::<Vec<_>>(),
         ) {
@@ -2969,6 +3080,14 @@ fn text_from_archive_range(archive: &DocumentArchive, range: TextRange) -> Optio
 }
 
 fn slice_text_range(text: &str, target: TextRange, container: TextRange) -> Option<String> {
+    slice_text_range_view(text, target, container).map(ToOwned::to_owned)
+}
+
+fn slice_text_range_view<'a>(
+    text: &'a str,
+    target: TextRange,
+    container: TextRange,
+) -> Option<&'a str> {
     if target.start < container.start || target.end > container.end || target.end <= target.start {
         return None;
     }
@@ -2977,7 +3096,6 @@ fn slice_text_range(text: &str, target: TextRange, container: TextRange) -> Opti
     text.get(local_start..local_end)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_owned())
 }
 
 fn render_relation_candidate_text(
@@ -3069,6 +3187,7 @@ struct RelationMention {
     span_start: usize,
     span_end: usize,
     mention_index: Option<usize>,
+    evidence_label: Option<String>,
 }
 
 fn collect_relation_mentions(
@@ -3105,6 +3224,7 @@ fn collect_relation_mentions(
             span_start: resolved.range.start as usize,
             span_end: resolved.range.end as usize,
             mention_index: Some(resolved.mention_index),
+            evidence_label: None,
         });
     }
     mentions
@@ -3135,6 +3255,7 @@ fn collect_relation_seed_mentions(
             span_start: seed.range.start as usize,
             span_end: seed.range.end as usize,
             mention_index: None,
+            evidence_label: Some(format!("anchor_evidence:seed:{}", seed.seed_label)),
         })
         .collect::<Vec<_>>();
     dedupe_relation_mentions(&mut mentions);
@@ -3185,6 +3306,7 @@ fn collect_gliner_seed_mentions(
             span_start: chunk.range.start as usize + span.span_start,
             span_end: chunk.range.start as usize + span.span_end,
             mention_index: None,
+            evidence_label: Some("anchor_evidence:gliner_seed".to_owned()),
         });
     }
     dedupe_relation_mentions(&mut mentions);
@@ -3440,7 +3562,9 @@ fn dedupe_window_entities(
     entities.sort_by(|left, right| left.span_start.cmp(&right.span_start));
 }
 
-fn build_persisted_relations(archives: &[DocumentArchive]) -> Vec<SemanticRelationRecord> {
+pub(crate) fn build_persisted_relations(
+    archives: &[DocumentArchive],
+) -> Vec<SemanticRelationRecord> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for archive in archives {
@@ -3459,18 +3583,14 @@ fn build_persisted_relations(archives: &[DocumentArchive]) -> Vec<SemanticRelati
     rows
 }
 
-fn build_review_cases(
+pub(crate) fn build_review_cases(
     scope: &ScopeKey,
     scope_key: &str,
     scope_ord: ScopeOrd,
     session_id: Option<SessionId>,
     windows: &[RelationWindowRecord],
-    profiles: &[RelationEntityProfile],
+    profile_by_entity: &FxHashMap<String, &RelationEntityProfile>,
 ) -> Vec<RelationReviewCase> {
-    let profile_by_entity = profiles
-        .iter()
-        .map(|profile| (profile.entity_id.0.clone(), profile))
-        .collect::<FxHashMap<_, _>>();
     let config = GlirelProposalConfig::default();
     let mut cases = Vec::new();
 
@@ -3546,7 +3666,7 @@ fn build_review_cases(
                 window_range: window.range,
                 sentence_indices: window.sentence_indices.clone(),
                 chunk_ids: window.chunk_ids.clone(),
-                window_text: window.text.clone(),
+                window_text: String::new(),
                 source_entity_id: source.entity_id.clone(),
                 target_entity_id: target.entity_id.clone(),
                 source_name,
@@ -3574,7 +3694,7 @@ fn build_review_cases(
                     )])
                     .collect(),
                 serialized: serialize_case_like(
-                    &window.text,
+                    &window.window_id,
                     &source.surface,
                     &target.surface,
                     source.kind.as_ref(),
@@ -3655,7 +3775,7 @@ fn serialize_profile_like(
 }
 
 fn serialize_case_like(
-    window_text: &str,
+    window_id: &str,
     source_surface: &str,
     target_surface: &str,
     source_kind: Option<&EntityKind>,
@@ -3664,7 +3784,7 @@ fn serialize_case_like(
     let mut parts = vec![
         format!("source:{source_surface}"),
         format!("target:{target_surface}"),
-        format!("context:{window_text}"),
+        format!("window:{window_id}"),
     ];
     if let Some(kind) = source_kind {
         parts.push(format!("sourceKind:{kind:?}"));
@@ -3675,7 +3795,7 @@ fn serialize_case_like(
     parts.join(" ")
 }
 
-fn filter_relation_predictions(
+pub(crate) fn filter_relation_predictions(
     window_text: &str,
     entities: &[RelationWindowEntity],
     window_start: usize,
@@ -4195,4 +4315,177 @@ fn profile_blocking_keys(entity: &SemanticEntityRecord) -> Vec<String> {
         keys.push(format!("kind:{kind:?}").to_lowercase());
     }
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_scope() -> ScopeKey {
+        ScopeKey {
+            world_id: Some("world".to_owned()),
+            narrative_id: Some("narrative".to_owned()),
+            folder_id: None,
+            folder_path: None,
+        }
+    }
+
+    fn sample_window(
+        window_id: &str,
+        text: &str,
+        candidate_relation_types: Vec<String>,
+        entities: Vec<RelationWindowEntity>,
+    ) -> RelationWindowRecord {
+        RelationWindowRecord {
+            window_id: window_id.to_owned(),
+            document_id: "doc-1".to_owned(),
+            revision: 1,
+            window_index: 0,
+            range: TextRange {
+                start: 0,
+                end: text.len() as u32,
+            },
+            sentence_indices: vec![0],
+            chunk_ids: vec!["chunk-1".to_owned()],
+            candidate_relation_types,
+            evidence_labels: Vec::new(),
+            text: text.to_owned(),
+            entities,
+        }
+    }
+
+    fn sample_entity(
+        entity_id: &str,
+        surface: &str,
+        entity_type: &str,
+        kind: Option<EntityKind>,
+        span_start: usize,
+        span_end: usize,
+    ) -> RelationWindowEntity {
+        RelationWindowEntity {
+            entity_id: EntityId(entity_id.to_owned()),
+            surface: surface.to_owned(),
+            kind,
+            entity_type: entity_type.to_owned(),
+            span_start,
+            span_end,
+            sentence_index: 0,
+            mention_index: Some(0),
+        }
+    }
+
+    fn sample_case(
+        scope: &ScopeKey,
+        scope_key: &str,
+        window_id: &str,
+        source_entity_id: &str,
+        target_entity_id: &str,
+    ) -> RelationReviewCase {
+        RelationReviewCase {
+            case_id: format!("{window_id}:{source_entity_id}:{target_entity_id}"),
+            scope: scope.clone(),
+            scope_key: scope_key.to_owned(),
+            scope_ord: ScopeOrd(7),
+            session_id: None,
+            document_id: "doc-1".to_owned(),
+            revision: 1,
+            window_id: window_id.to_owned(),
+            window_index: 0,
+            window_range: TextRange { start: 0, end: 32 },
+            sentence_indices: vec![0],
+            chunk_ids: vec!["chunk-1".to_owned()],
+            window_text: String::new(),
+            source_entity_id: EntityId(source_entity_id.to_owned()),
+            target_entity_id: EntityId(target_entity_id.to_owned()),
+            source_name: source_entity_id.to_owned(),
+            target_name: target_entity_id.to_owned(),
+            source_kind: None,
+            target_kind: None,
+            seed_score_millis: 500,
+            seed_evidence: Vec::new(),
+            serialized: String::new(),
+            blocking_keys: Vec::new(),
+            glirel_predictions: Vec::new(),
+            accepted_relations: Vec::new(),
+            decision_status: "relation_pending".to_owned(),
+        }
+    }
+
+    #[test]
+    fn relation_execution_plan_uses_dense_window_case_mapping() {
+        let scope = test_scope();
+        let scope_key = scope_storage_key(&scope);
+        let batch = RelationScopeReviewBatch {
+            scope: scope.clone(),
+            scope_key: scope_key.clone(),
+            scope_ord: ScopeOrd(7),
+            windows: vec![
+                sample_window(
+                    "window-1",
+                    "Alice joined Dynamis.",
+                    vec!["member_of".to_owned()],
+                    vec![
+                        sample_entity(
+                            "e1",
+                            "Alice",
+                            "Character",
+                            Some(EntityKind::Character),
+                            0,
+                            5,
+                        ),
+                        sample_entity(
+                            "e2",
+                            "Dynamis",
+                            "Organization",
+                            Some(EntityKind::Organization),
+                            13,
+                            20,
+                        ),
+                    ],
+                ),
+                sample_window(
+                    "window-2",
+                    "Dynamis is in New Rome.",
+                    vec!["located_in".to_owned()],
+                    vec![
+                        sample_entity(
+                            "e2",
+                            "Dynamis",
+                            "Organization",
+                            Some(EntityKind::Organization),
+                            0,
+                            7,
+                        ),
+                        sample_entity(
+                            "e3",
+                            "New Rome",
+                            "Location",
+                            Some(EntityKind::Location),
+                            14,
+                            22,
+                        ),
+                    ],
+                ),
+            ],
+            review_cases: vec![
+                sample_case(&scope, &scope_key, "window-1", "e1", "e2"),
+                sample_case(&scope, &scope_key, "window-1", "e2", "e1"),
+                sample_case(&scope, &scope_key, "window-2", "e2", "e3"),
+            ],
+            ..Default::default()
+        };
+
+        let plan = crate::RelationExecutionPlan::build(&batch, &default_relation_type_specs());
+        assert_eq!(plan.executions.len(), 2);
+        assert_eq!(plan.executions[0].case_indices, vec![0, 1]);
+        assert_eq!(
+            plan.schema_groups[plan.executions[0].schema_group_index].schema_labels,
+            vec!["works_for".to_owned(), "member_of".to_owned()]
+        );
+        assert_eq!(plan.executions[1].case_indices, vec![2]);
+        assert_eq!(
+            plan.schema_groups[plan.executions[1].schema_group_index].schema_labels,
+            vec!["located_in".to_owned()]
+        );
+    }
 }

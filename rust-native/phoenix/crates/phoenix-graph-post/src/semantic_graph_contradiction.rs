@@ -6,6 +6,7 @@ use phoenix_semantic_v2::{
 
 use crate::semantic_graph_contradiction_ledger::collect_relationship_ledger_edges;
 use crate::semantic_graph_support::{truth_planes_compatible, Prototype};
+use crate::semantic_graph_workspace::embedding_distance;
 
 pub(crate) fn collect_contradictory_support_region_edges(
     prototypes: &[Prototype],
@@ -431,16 +432,6 @@ fn node_kind_name(kind: SemanticGraphNodeKind) -> &'static str {
         SemanticGraphNodeKind::State => "state",
         _ => "unknown",
     }
-}
-
-fn embedding_distance(left: &[f32], right: &[f32]) -> f64 {
-    let len = left.len().min(right.len());
-    let mut sum = 0.0f64;
-    for index in 0..len {
-        let delta = left[index] as f64 - right[index] as f64;
-        sum += delta * delta;
-    }
-    sum.sqrt()
 }
 
 fn neighbor_score_millis(distance: f64) -> u32 {

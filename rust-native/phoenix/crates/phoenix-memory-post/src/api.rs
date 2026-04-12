@@ -6,6 +6,7 @@
 //! records. Prefer these functions when driving memory compilation from
 //! orchestration code.
 
+use phoenix_scope_analysis::ScopeAnalysisContext;
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixErPatchStore, PhoenixEventIdentityPatchStore,
     PhoenixMemoryPatchStore, PhoenixRelationPatchStore, PhoenixStateSchemaPatchStore, StoreError,
@@ -13,9 +14,9 @@ use phoenix_store_native_core::{
 use phoenix_types::SessionId;
 
 use crate::{
-    build_memory_patch_sidecar, compile_memory, derive_dirty_scope_review_batches,
-    derive_scope_review_batch, normalize_memory_inputs, persist_memory_patch_sidecar,
-    CompiledMemory, MemoryScopeReviewBatch,
+    apply_memory_patch_sidecar, build_memory_patch_sidecar, compile_memory,
+    derive_dirty_scope_review_batches, derive_scope_review_batch, normalize_memory_inputs,
+    persist_memory_patch_sidecar, CompiledMemory, MemoryScopeReviewBatch,
 };
 
 pub fn derive_batches<S>(
@@ -51,6 +52,74 @@ pub fn derive_batch(
         relation_sidecar,
         state_schema_sidecar,
     )
+}
+
+pub fn derive_batch_with_runtime_sidecars(
+    archives: &[phoenix_semantic_v2::DocumentArchive],
+    session: Option<&phoenix_semantic_v2::SessionArchive>,
+    dirty: Option<&phoenix_semantic_v2::DirtyScopeRecord>,
+    lexical: Option<&phoenix_semantic_v2::ScopeLexSidecar>,
+    er_sidecar: Option<&phoenix_semantic_v2::ErScopePatchSidecar>,
+    relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&phoenix_semantic_v2::StateSchemaScopeSidecar>,
+    event_identity_sidecar: Option<&phoenix_semantic_v2::EventIdentityScopeSidecar>,
+    memory_sidecar: Option<&phoenix_semantic_v2::MemoryScopeSidecar>,
+) -> MemoryScopeReviewBatch {
+    let mut batch = derive_scope_review_batch(
+        archives,
+        session,
+        dirty,
+        lexical,
+        er_sidecar,
+        relation_sidecar,
+        state_schema_sidecar,
+    );
+    if let Some(sidecar) = event_identity_sidecar {
+        crate::worker::annotate_memory_batch_with_event_identity(&mut batch, sidecar);
+    }
+    if let Some(sidecar) = memory_sidecar {
+        batch.memory_generation = Some(sidecar.generation);
+        if batch.claims.is_empty() && batch.states.is_empty() && batch.events.is_empty() {
+            apply_memory_patch_sidecar(&mut batch, sidecar);
+            if let Some(event_identity_sidecar) = event_identity_sidecar {
+                crate::worker::annotate_memory_batch_with_event_identity(
+                    &mut batch,
+                    event_identity_sidecar,
+                );
+            }
+        }
+    }
+    batch
+}
+
+pub fn derive_batch_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&phoenix_semantic_v2::RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&phoenix_semantic_v2::StateSchemaScopeSidecar>,
+    event_identity_sidecar: Option<&phoenix_semantic_v2::EventIdentityScopeSidecar>,
+    memory_sidecar: Option<&phoenix_semantic_v2::MemoryScopeSidecar>,
+) -> MemoryScopeReviewBatch {
+    let mut batch = crate::derive_scope_review_batch_from_analysis(
+        analysis,
+        relation_sidecar,
+        state_schema_sidecar,
+    );
+    if let Some(sidecar) = event_identity_sidecar {
+        crate::worker::annotate_memory_batch_with_event_identity(&mut batch, sidecar);
+    }
+    if let Some(sidecar) = memory_sidecar {
+        batch.memory_generation = Some(sidecar.generation);
+        if batch.claims.is_empty() && batch.states.is_empty() && batch.events.is_empty() {
+            apply_memory_patch_sidecar(&mut batch, sidecar);
+            if let Some(event_identity_sidecar) = event_identity_sidecar {
+                crate::worker::annotate_memory_batch_with_event_identity(
+                    &mut batch,
+                    event_identity_sidecar,
+                );
+            }
+        }
+    }
+    batch
 }
 
 pub fn compile_from_inputs(

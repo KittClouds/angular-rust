@@ -3,7 +3,7 @@ use phoenix_embed::{
 };
 use phoenix_graph::GraphBackendError;
 use phoenix_graph_kernel::{
-    expand_snapshot_region, KernelEdge, KernelGraphSnapshot, KernelQueryView,
+    expand_snapshot_region, KernelEdge, KernelGraphSnapshot, KernelQueryView, KernelRegionProfile,
 };
 #[cfg(test)]
 use phoenix_graph_kernel::{
@@ -18,6 +18,7 @@ use std::cell::RefCell;
 
 use crate::api::GraphQueryError;
 use crate::retrieval::{GraphRetrievedRegion, GraphRetrievedSeed};
+use crate::runtime_telemetry::{measure_graph_runtime, record_region_build, GraphRuntimeMetric};
 use crate::semantic::ensure_ort_dylib_path;
 
 thread_local! {
@@ -31,6 +32,12 @@ struct QueryEmbedderCache {
     embedder: Option<OrtTextEmbedder>,
 }
 
+pub(crate) fn clear_query_embedder_cache() {
+    QUERY_EMBEDDER_CACHE.with(|cell| {
+        *cell.borrow_mut() = QueryEmbedderCache::default();
+    });
+}
+
 pub(crate) fn retrieve_query_seeds<S>(
     store: &S,
     scope: &ScopeKey,
@@ -42,6 +49,7 @@ pub(crate) fn retrieve_query_seeds<S>(
 where
     S: PhoenixSemanticIndexStore,
 {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RetrieveQuerySeeds);
     if query_text.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -81,6 +89,7 @@ pub(crate) fn build_region_from_snapshot(
     expansion_hops: usize,
     edge_allowed: fn(&KernelEdge) -> bool,
 ) -> (KernelGraphSnapshot, GraphRetrievedRegion) {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::BuildRegionFromSnapshot);
     let seed_vertex_ids = seeds
         .iter()
         .filter(|seed| {
@@ -108,9 +117,15 @@ pub(crate) fn build_region_from_snapshot(
         seed_vertex_ids: expanded.seed_vertex_ids,
         included_vertex_ids: expanded.included_vertex_ids,
     };
+    record_region_build(
+        region.vertex_count,
+        region.asserted_edge_count,
+        region.candidate_edge_count,
+    );
     (expanded.snapshot, region)
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_region_from_view(
     view: &KernelQueryView<'_>,
     anchor_vertex_ids: Vec<String>,
@@ -119,17 +134,39 @@ pub(crate) fn build_region_from_view(
     expansion_hops: usize,
     edge_allowed: fn(&KernelEdge) -> bool,
 ) -> (KernelGraphSnapshot, GraphRetrievedRegion) {
+    build_region_from_view_profile(
+        view,
+        anchor_vertex_ids,
+        seeds,
+        region_node_limit,
+        expansion_hops,
+        edge_allowed,
+        KernelRegionProfile::Generic,
+    )
+}
+
+pub(crate) fn build_region_from_view_profile(
+    view: &KernelQueryView<'_>,
+    anchor_vertex_ids: Vec<String>,
+    seeds: &[GraphRetrievedSeed],
+    region_node_limit: usize,
+    expansion_hops: usize,
+    edge_allowed: fn(&KernelEdge) -> bool,
+    profile: KernelRegionProfile,
+) -> (KernelGraphSnapshot, GraphRetrievedRegion) {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::BuildRegionFromView);
     let seed_vertex_ids = seeds
         .iter()
         .filter(|seed| view.find_vertex(seed.node_id.as_str()).is_some())
         .map(|seed| seed.node_id.clone())
         .collect::<Vec<_>>();
-    let expanded = view.expand_region(
+    let expanded = view.expand_region_with_profile(
         anchor_vertex_ids.as_slice(),
         seed_vertex_ids.as_slice(),
         region_node_limit,
         expansion_hops,
         edge_allowed,
+        profile,
     );
     let region = GraphRetrievedRegion {
         vertex_count: expanded.snapshot.vertices.len(),
@@ -140,6 +177,11 @@ pub(crate) fn build_region_from_view(
         seed_vertex_ids: expanded.seed_vertex_ids,
         included_vertex_ids: expanded.included_vertex_ids,
     };
+    record_region_build(
+        region.vertex_count,
+        region.asserted_edge_count,
+        region.candidate_edge_count,
+    );
     (expanded.snapshot, region)
 }
 
@@ -200,6 +242,7 @@ fn seed_from_neighbor(hit: SemanticNodeNeighbor) -> GraphRetrievedSeed {
 }
 
 fn embed_query(query_text: &str) -> Result<Vec<f32>, GraphQueryError> {
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::EmbedQuery);
     with_query_embedder(|embedder| {
         let rows = embedder.embed_texts(&[query_text]).map_err(|error| {
             GraphBackendError::Operation(format!("query embed inference failed: {error}"))
@@ -218,6 +261,7 @@ fn with_query_embedder<R>(
     QUERY_EMBEDDER_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
         if !cache.attempted {
+            let _timer = measure_graph_runtime(GraphRuntimeMetric::QueryEmbedderLoad);
             cache.attempted = true;
             let _ = ensure_ort_dylib_path();
             cache.embedder = Some(

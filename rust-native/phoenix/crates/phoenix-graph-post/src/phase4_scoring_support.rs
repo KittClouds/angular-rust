@@ -20,6 +20,12 @@ struct ScorerCache {
     scorer: Option<GliclassPhase4Scorer>,
 }
 
+pub(crate) fn clear_phase4_scorer_cache() {
+    SCORER_CACHE.with(|cell| {
+        *cell.borrow_mut() = ScorerCache::default();
+    });
+}
+
 pub(crate) struct GliclassPhase4Scorer {
     model: GliclassInstructModel,
 }

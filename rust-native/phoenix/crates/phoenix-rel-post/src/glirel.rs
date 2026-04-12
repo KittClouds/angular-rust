@@ -1,10 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use half::f16;
 use ort::session::Session;
 use ort::value::Tensor;
+use rustc_hash::{FxHashMap, FxHasher};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -14,6 +17,11 @@ const PROJECTION_DIM: usize = 768;
 const CLS_ID: i64 = 1;
 const SEP_ID: i64 = 2;
 const REL_ID: i64 = 128002;
+const MAX_PROMPT_SCHEMA_CACHE_ENTRIES: usize = 256;
+const MAX_WORDPIECE_CACHE_ENTRIES: usize = 8_192;
+const MAX_SCHEMA_BATCH_WINDOWS: usize = 8;
+const MAX_SCHEMA_BATCH_SEQUENCE_TOKENS: usize = 4_096;
+const MAX_SCHEMA_BATCH_PAIR_SLOTS: usize = 512;
 
 #[derive(Debug, Error)]
 pub enum GlirelError {
@@ -113,6 +121,53 @@ pub struct GlirelModel {
     tokenizer: Tokenizer,
     projection_weight: Vec<f32>,
     projection_bias: Vec<f32>,
+    token_cache: Mutex<GlirelTokenCache>,
+}
+
+#[derive(Clone, Debug)]
+struct PromptSchemaCacheEntry {
+    relation_labels: Vec<String>,
+    prompt_word_count: usize,
+    input_ids_prefix: Vec<i64>,
+    word_ids_prefix: Vec<Option<usize>>,
+}
+
+#[derive(Default)]
+struct GlirelTokenCache {
+    prompt_prefixes: FxHashMap<u64, Vec<PromptSchemaCacheEntry>>,
+    wordpiece_ids: FxHashMap<String, Box<[i64]>>,
+}
+
+pub(crate) struct GlirelBatchItem<'a> {
+    pub text: &'a str,
+    pub entities: &'a [GlirelEntity],
+}
+
+struct PreparedSchemaBatchRow<'a> {
+    output_index: usize,
+    text: &'a str,
+    entities: &'a [GlirelEntity],
+    prompt_word_count: usize,
+    text_word_count: usize,
+    input_ids: Vec<i64>,
+    attention_mask: Vec<i64>,
+    word_ids: Vec<Option<usize>>,
+    span_index: Vec<(i64, i64)>,
+    relation_pairs: Vec<i64>,
+    pair_map: Vec<(usize, usize)>,
+}
+
+struct PreparedScoringBatchRow<'a> {
+    output_index: usize,
+    text: &'a str,
+    entities: &'a [GlirelEntity],
+    text_word_count: usize,
+    text_word_representations: Vec<f32>,
+    word_mask: Vec<i64>,
+    span_index: Vec<(i64, i64)>,
+    relation_pairs: Vec<i64>,
+    relation_representations: Vec<f32>,
+    pair_map: Vec<(usize, usize)>,
 }
 
 impl GlirelModel {
@@ -158,6 +213,7 @@ impl GlirelModel {
             tokenizer,
             projection_weight,
             projection_bias,
+            token_cache: Mutex::new(GlirelTokenCache::default()),
         })
     }
 
@@ -177,10 +233,9 @@ impl GlirelModel {
             return Ok(Vec::new());
         }
 
-        let prompt_words = build_prompt_words(relation_labels);
-        let prompt_word_count = prompt_words.len();
         let (input_ids, attention_mask, word_ids) =
-            self.tokenize_words(&prompt_words, &text_words)?;
+            self.tokenize_words(relation_labels, &text_words)?;
+        let prompt_word_count = relation_labels.len() * 2 + 1;
         let hidden = self.run_encoder(&input_ids, &attention_mask)?;
         let projected = self.project(&hidden, input_ids.len());
         let word_representations = first_subword_pool(
@@ -217,7 +272,7 @@ impl GlirelModel {
             entities,
             relation_labels,
             &pair_map,
-            score_tensor,
+            &score_tensor,
             threshold,
         )?;
         boost_context_matches(text, &mut predictions);
@@ -247,46 +302,65 @@ impl GlirelModel {
         ))
     }
 
-    fn tokenize_words(
+    pub(crate) fn extract_many_with_schema<'a>(
         &self,
-        prompt_words: &[String],
-        text_words: &[&str],
-    ) -> Result<(Vec<i64>, Vec<i64>, Vec<Option<usize>>), GlirelError> {
-        let mut input_ids = vec![CLS_ID];
-        let mut word_ids = vec![None];
-        let mut word_index = 0usize;
-
-        for word in prompt_words {
-            if word == "[REL]" {
-                input_ids.push(REL_ID);
-                word_ids.push(Some(word_index));
-            } else if word == "[SEP]" {
-                input_ids.push(SEP_ID);
-                word_ids.push(Some(word_index));
-            } else {
-                let encoding = self
-                    .tokenizer
-                    .encode(word.as_str(), false)
-                    .map_err(|error| {
-                        GlirelError::Inference(format!("tokenize '{word}': {error}"))
-                    })?;
-                for &id in encoding.get_ids() {
-                    input_ids.push(id as i64);
-                    word_ids.push(Some(word_index));
-                }
-            }
-            word_index += 1;
+        items: &[GlirelBatchItem<'a>],
+        relation_specs: &[GlirelRelationTypeSpec],
+        threshold: f32,
+    ) -> Result<Vec<Vec<GlirelRelationPrediction>>, GlirelError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
         }
 
-        for &word in text_words {
-            let encoding = self
-                .tokenizer
-                .encode(word, false)
-                .map_err(|error| GlirelError::Inference(format!("tokenize '{word}': {error}")))?;
-            for &id in encoding.get_ids() {
-                input_ids.push(id as i64);
-                word_ids.push(Some(word_index));
+        let labels = relation_specs
+            .iter()
+            .map(|spec| spec.label.as_str())
+            .collect::<Vec<_>>();
+        let mut outputs = vec![Vec::new(); items.len()];
+        let prepared = self.prepare_schema_batch_rows(items, &labels)?;
+
+        let mut offset = 0usize;
+        while offset < prepared.len() {
+            let batch_len = next_schema_batch_len(&prepared[offset..]);
+            let rows = &prepared[offset..offset + batch_len];
+            let chunk_outputs =
+                match self.run_schema_batch(rows, relation_specs, &labels, threshold) {
+                    Ok(value) => value,
+                    Err(error) if rows.len() > 1 => rows
+                        .iter()
+                        .map(|row| {
+                            self.extract_with_schema(
+                                row.text,
+                                row.entities,
+                                relation_specs,
+                                threshold,
+                            )
+                            .map(|predictions| (row.output_index, predictions))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Err(error) => return Err(error),
+                };
+            for (output_index, predictions) in chunk_outputs {
+                outputs[output_index] = predictions;
             }
+            offset += batch_len;
+        }
+
+        Ok(outputs)
+    }
+
+    fn tokenize_words(
+        &self,
+        relation_labels: &[&str],
+        text_words: &[&str],
+    ) -> Result<(Vec<i64>, Vec<i64>, Vec<Option<usize>>), GlirelError> {
+        let prompt_schema = self.prompt_schema_prefix(relation_labels)?;
+        let mut input_ids = prompt_schema.input_ids_prefix.clone();
+        let mut word_ids = prompt_schema.word_ids_prefix.clone();
+        let mut word_index = prompt_schema.prompt_word_count;
+
+        for &word in text_words {
+            self.append_tokenized_word(word, word_index, &mut input_ids, &mut word_ids)?;
             word_index += 1;
         }
 
@@ -296,15 +370,145 @@ impl GlirelModel {
         Ok((input_ids, attention_mask, word_ids))
     }
 
+    fn prompt_schema_prefix(
+        &self,
+        relation_labels: &[&str],
+    ) -> Result<PromptSchemaCacheEntry, GlirelError> {
+        let signature = relation_label_signature(relation_labels);
+        if let Some(entry) = self.lookup_prompt_schema(signature, relation_labels) {
+            return Ok(entry);
+        }
+
+        let prompt_words = build_prompt_words(relation_labels);
+        let prompt_word_count = prompt_words.len();
+        let mut input_ids_prefix = vec![CLS_ID];
+        let mut word_ids_prefix = vec![None];
+        for (word_index, word) in prompt_words.iter().enumerate() {
+            self.append_tokenized_word(
+                word.as_str(),
+                word_index,
+                &mut input_ids_prefix,
+                &mut word_ids_prefix,
+            )?;
+        }
+
+        let entry = PromptSchemaCacheEntry {
+            relation_labels: relation_labels
+                .iter()
+                .map(|label| (*label).to_owned())
+                .collect(),
+            prompt_word_count,
+            input_ids_prefix,
+            word_ids_prefix,
+        };
+        self.store_prompt_schema(signature, entry.clone());
+        Ok(entry)
+    }
+
+    fn lookup_prompt_schema(
+        &self,
+        signature: u64,
+        relation_labels: &[&str],
+    ) -> Option<PromptSchemaCacheEntry> {
+        let cache = self.token_cache.lock().ok()?;
+        let entries = cache.prompt_prefixes.get(&signature)?;
+        entries
+            .iter()
+            .find(|entry| prompt_schema_matches_labels(entry, relation_labels))
+            .cloned()
+    }
+
+    fn store_prompt_schema(&self, signature: u64, entry: PromptSchemaCacheEntry) {
+        let Ok(mut cache) = self.token_cache.lock() else {
+            return;
+        };
+        if cache.prompt_prefixes.len() >= MAX_PROMPT_SCHEMA_CACHE_ENTRIES
+            && !cache.prompt_prefixes.contains_key(&signature)
+        {
+            return;
+        }
+        cache
+            .prompt_prefixes
+            .entry(signature)
+            .or_default()
+            .push(entry);
+    }
+
+    fn append_tokenized_word(
+        &self,
+        word: &str,
+        word_index: usize,
+        input_ids: &mut Vec<i64>,
+        word_ids: &mut Vec<Option<usize>>,
+    ) -> Result<(), GlirelError> {
+        match word {
+            "[REL]" => {
+                input_ids.push(REL_ID);
+                word_ids.push(Some(word_index));
+                return Ok(());
+            }
+            "[SEP]" => {
+                input_ids.push(SEP_ID);
+                word_ids.push(Some(word_index));
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        if let Ok(cache) = self.token_cache.lock() {
+            if let Some(cached) = cache.wordpiece_ids.get(word) {
+                append_token_ids(cached.as_ref(), word_index, input_ids, word_ids);
+                return Ok(());
+            }
+        }
+
+        let token_ids = self.tokenize_word_piece_ids(word)?;
+        self.store_wordpiece_ids(word, &token_ids);
+        append_token_ids(&token_ids, word_index, input_ids, word_ids);
+        Ok(())
+    }
+
+    fn store_wordpiece_ids(&self, word: &str, token_ids: &[i64]) {
+        let Ok(mut cache) = self.token_cache.lock() else {
+            return;
+        };
+        if cache.wordpiece_ids.len() >= MAX_WORDPIECE_CACHE_ENTRIES
+            && !cache.wordpiece_ids.contains_key(word)
+        {
+            return;
+        }
+        cache
+            .wordpiece_ids
+            .entry(word.to_owned())
+            .or_insert_with(|| token_ids.to_vec().into_boxed_slice());
+    }
+
+    fn tokenize_word_piece_ids(&self, word: &str) -> Result<Vec<i64>, GlirelError> {
+        let encoding = self
+            .tokenizer
+            .encode(word, false)
+            .map_err(|error| GlirelError::Inference(format!("tokenize '{word}': {error}")))?;
+        Ok(encoding.get_ids().iter().map(|&id| id as i64).collect())
+    }
+
     fn run_encoder(
         &self,
         input_ids: &[i64],
         attention_mask: &[i64],
     ) -> Result<Vec<f32>, GlirelError> {
-        let sequence_len = input_ids.len();
-        let ids = Tensor::from_array(([1, sequence_len], input_ids.to_vec()))
+        self.run_encoder_batch(input_ids, attention_mask, 1, input_ids.len())
+    }
+
+    fn run_encoder_batch(
+        &self,
+        input_ids: &[i64],
+        attention_mask: &[i64],
+        batch_size: usize,
+        sequence_len: usize,
+    ) -> Result<Vec<f32>, GlirelError> {
+        let ids = Tensor::from_array(([batch_size, sequence_len], input_ids.to_vec()))
             .map_err(|error| GlirelError::Inference(format!("input_ids tensor: {error}")))?;
-        let mask = Tensor::from_array(([1, sequence_len], attention_mask.to_vec()))
+        let mask = Tensor::from_array(([batch_size, sequence_len], attention_mask.to_vec()))
             .map_err(|error| GlirelError::Inference(format!("attention_mask tensor: {error}")))?;
 
         let inputs = ort::inputs! {
@@ -339,6 +543,27 @@ impl GlirelModel {
 
     fn project(&self, hidden: &[f32], token_count: usize) -> Vec<f32> {
         let mut output = vec![0.0f32; token_count * PROJECTION_DIM];
+        self.project_into(hidden, &mut output, token_count);
+        output
+    }
+
+    fn project_batch(&self, hidden: &[f32], batch_size: usize, token_count: usize) -> Vec<f32> {
+        let hidden_stride = token_count * ENCODER_DIM;
+        let output_stride = token_count * PROJECTION_DIM;
+        let mut output = vec![0.0f32; batch_size * output_stride];
+        for batch_index in 0..batch_size {
+            let src = batch_index * hidden_stride;
+            let dst = batch_index * output_stride;
+            self.project_into(
+                &hidden[src..src + hidden_stride],
+                &mut output[dst..dst + output_stride],
+                token_count,
+            );
+        }
+        output
+    }
+
+    fn project_into(&self, hidden: &[f32], output: &mut [f32], token_count: usize) {
         for token_index in 0..token_count {
             let input_offset = token_index * ENCODER_DIM;
             let output_offset = token_index * PROJECTION_DIM;
@@ -352,7 +577,6 @@ impl GlirelModel {
                 output[output_offset + output_index] = sum;
             }
         }
-        output
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -368,23 +592,53 @@ impl GlirelModel {
         pair_count: usize,
         relation_count: usize,
     ) -> Result<Vec<f32>, GlirelError> {
-        let word_rep = Tensor::from_array((
-            [1, text_word_count, PROJECTION_DIM],
-            text_word_representations.to_vec(),
-        ))
-        .map_err(|error| GlirelError::Inference(format!("word_rep tensor: {error}")))?;
-        let word_mask = Tensor::from_array(([1, text_word_count], word_mask.to_vec()))
-            .map_err(|error| GlirelError::Inference(format!("word_mask tensor: {error}")))?;
         let span_flat = span_index
             .iter()
             .flat_map(|&(start, end)| [start, end])
             .collect::<Vec<_>>();
-        let span_idx = Tensor::from_array(([1, entity_count, 2], span_flat))
+        self.run_scoring_head_batch(
+            text_word_representations,
+            word_mask,
+            &span_flat,
+            relation_pairs,
+            relation_representations,
+            1,
+            text_word_count,
+            entity_count,
+            pair_count,
+            relation_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_scoring_head_batch(
+        &self,
+        text_word_representations: &[f32],
+        word_mask: &[i64],
+        span_flat: &[i64],
+        relation_pairs: &[i64],
+        relation_representations: &[f32],
+        batch_size: usize,
+        text_word_count: usize,
+        entity_count: usize,
+        pair_count: usize,
+        relation_count: usize,
+    ) -> Result<Vec<f32>, GlirelError> {
+        let word_rep = Tensor::from_array((
+            [batch_size, text_word_count, PROJECTION_DIM],
+            text_word_representations.to_vec(),
+        ))
+        .map_err(|error| GlirelError::Inference(format!("word_rep tensor: {error}")))?;
+        let word_mask = Tensor::from_array(([batch_size, text_word_count], word_mask.to_vec()))
+            .map_err(|error| GlirelError::Inference(format!("word_mask tensor: {error}")))?;
+        let span_idx = Tensor::from_array(([batch_size, entity_count, 2], span_flat.to_vec()))
             .map_err(|error| GlirelError::Inference(format!("span_idx tensor: {error}")))?;
-        let relations_idx = Tensor::from_array(([1, pair_count, 2, 2], relation_pairs.to_vec()))
-            .map_err(|error| GlirelError::Inference(format!("relations_idx tensor: {error}")))?;
+        let relations_idx =
+            Tensor::from_array(([batch_size, pair_count, 2, 2], relation_pairs.to_vec())).map_err(
+                |error| GlirelError::Inference(format!("relations_idx tensor: {error}")),
+            )?;
         let rel_type_rep = Tensor::from_array((
-            [1, relation_count, PROJECTION_DIM],
+            [batch_size, relation_count, PROJECTION_DIM],
             relation_representations.to_vec(),
         ))
         .map_err(|error| GlirelError::Inference(format!("rel_type_rep tensor: {error}")))?;
@@ -412,6 +666,194 @@ impl GlirelModel {
         view.as_slice().map(ToOwned::to_owned).ok_or_else(|| {
             GlirelError::Inference("relation score tensor not contiguous".to_owned())
         })
+    }
+
+    fn prepare_schema_batch_rows<'a>(
+        &self,
+        items: &[GlirelBatchItem<'a>],
+        relation_labels: &[&str],
+    ) -> Result<Vec<PreparedSchemaBatchRow<'a>>, GlirelError> {
+        let mut rows = Vec::with_capacity(items.len());
+        for (output_index, item) in items.iter().enumerate() {
+            if item.text.trim().is_empty() || item.entities.len() < 2 {
+                continue;
+            }
+            let text_words = item.text.split_whitespace().collect::<Vec<_>>();
+            if text_words.is_empty() {
+                continue;
+            }
+            let (input_ids, attention_mask, word_ids) =
+                self.tokenize_words(relation_labels, &text_words)?;
+            let prompt_word_count = relation_labels.len() * 2 + 1;
+            let span_index = entities_to_word_spans(item.text, &text_words, item.entities);
+            let relation_pairs = build_relations_idx(&span_index);
+            let pair_map = directed_pair_map(item.entities.len());
+            rows.push(PreparedSchemaBatchRow {
+                output_index,
+                text: item.text,
+                entities: item.entities,
+                prompt_word_count,
+                text_word_count: text_words.len(),
+                input_ids,
+                attention_mask,
+                word_ids,
+                span_index,
+                relation_pairs,
+                pair_map,
+            });
+        }
+        Ok(rows)
+    }
+
+    fn run_schema_batch<'a>(
+        &self,
+        rows: &[PreparedSchemaBatchRow<'a>],
+        relation_specs: &[GlirelRelationTypeSpec],
+        relation_labels: &[&str],
+        threshold: f32,
+    ) -> Result<Vec<(usize, Vec<GlirelRelationPrediction>)>, GlirelError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = rows.len();
+        let relation_count = relation_labels.len();
+        let max_sequence_len = rows
+            .iter()
+            .map(|row| row.input_ids.len())
+            .max()
+            .unwrap_or_default();
+        let mut flat_input_ids = vec![0_i64; batch_size * max_sequence_len];
+        let mut flat_attention_mask = vec![0_i64; batch_size * max_sequence_len];
+        for (row_index, row) in rows.iter().enumerate() {
+            let offset = row_index * max_sequence_len;
+            flat_input_ids[offset..offset + row.input_ids.len()].copy_from_slice(&row.input_ids);
+            flat_attention_mask[offset..offset + row.attention_mask.len()]
+                .copy_from_slice(&row.attention_mask);
+        }
+
+        let hidden = self.run_encoder_batch(
+            &flat_input_ids,
+            &flat_attention_mask,
+            batch_size,
+            max_sequence_len,
+        )?;
+        let projected = self.project_batch(&hidden, batch_size, max_sequence_len);
+
+        let mut scoring_rows = Vec::with_capacity(batch_size);
+        for (row_index, row) in rows.iter().enumerate() {
+            let projected_stride = max_sequence_len * PROJECTION_DIM;
+            let projected_offset = row_index * projected_stride;
+            let projected_slice = &projected[projected_offset..projected_offset + projected_stride];
+            let mut word_ids = row.word_ids.clone();
+            word_ids.resize(max_sequence_len, None);
+            let word_representations = first_subword_pool(
+                projected_slice,
+                &word_ids,
+                row.prompt_word_count + row.text_word_count,
+                PROJECTION_DIM,
+            );
+            let relation_representations =
+                build_relation_type_representations(&word_representations, relation_count);
+            let text_start = row.prompt_word_count * PROJECTION_DIM;
+            let text_word_representations = word_representations
+                [text_start..text_start + row.text_word_count * PROJECTION_DIM]
+                .to_vec();
+            scoring_rows.push(PreparedScoringBatchRow {
+                output_index: row.output_index,
+                text: row.text,
+                entities: row.entities,
+                text_word_count: row.text_word_count,
+                text_word_representations,
+                word_mask: vec![1_i64; row.text_word_count],
+                span_index: row.span_index.clone(),
+                relation_pairs: row.relation_pairs.clone(),
+                relation_representations,
+                pair_map: row.pair_map.clone(),
+            });
+        }
+
+        let max_text_word_count = scoring_rows
+            .iter()
+            .map(|row| row.text_word_count)
+            .max()
+            .unwrap_or_default();
+        let max_entity_count = scoring_rows
+            .iter()
+            .map(|row| row.span_index.len())
+            .max()
+            .unwrap_or_default();
+        let max_pair_count = scoring_rows
+            .iter()
+            .map(|row| row.pair_map.len())
+            .max()
+            .unwrap_or_default();
+
+        let mut flat_word_rep = vec![0.0f32; batch_size * max_text_word_count * PROJECTION_DIM];
+        let mut flat_word_mask = vec![0_i64; batch_size * max_text_word_count];
+        let mut flat_span_idx = vec![0_i64; batch_size * max_entity_count * 2];
+        let mut flat_relations_idx = vec![0_i64; batch_size * max_pair_count * 4];
+        let mut flat_rel_type_rep = vec![0.0f32; batch_size * relation_count * PROJECTION_DIM];
+
+        for (row_index, row) in scoring_rows.iter().enumerate() {
+            let word_rep_offset = row_index * max_text_word_count * PROJECTION_DIM;
+            flat_word_rep[word_rep_offset..word_rep_offset + row.text_word_representations.len()]
+                .copy_from_slice(&row.text_word_representations);
+            let word_mask_offset = row_index * max_text_word_count;
+            flat_word_mask[word_mask_offset..word_mask_offset + row.word_mask.len()]
+                .copy_from_slice(&row.word_mask);
+
+            let span_offset = row_index * max_entity_count * 2;
+            for (entity_index, &(start, end)) in row.span_index.iter().enumerate() {
+                let dst = span_offset + entity_index * 2;
+                flat_span_idx[dst] = start;
+                flat_span_idx[dst + 1] = end;
+            }
+
+            let pair_offset = row_index * max_pair_count * 4;
+            flat_relations_idx[pair_offset..pair_offset + row.relation_pairs.len()]
+                .copy_from_slice(&row.relation_pairs);
+
+            let rel_type_offset = row_index * relation_count * PROJECTION_DIM;
+            flat_rel_type_rep
+                [rel_type_offset..rel_type_offset + row.relation_representations.len()]
+                .copy_from_slice(&row.relation_representations);
+        }
+
+        let score_tensor = self.run_scoring_head_batch(
+            &flat_word_rep,
+            &flat_word_mask,
+            &flat_span_idx,
+            &flat_relations_idx,
+            &flat_rel_type_rep,
+            batch_size,
+            max_text_word_count,
+            max_entity_count,
+            max_pair_count,
+            relation_count,
+        )?;
+
+        let score_stride = max_pair_count * relation_count;
+        let mut outputs = Vec::with_capacity(batch_size);
+        for (row_index, row) in scoring_rows.iter().enumerate() {
+            let score_offset = row_index * score_stride;
+            let score_len = row.pair_map.len() * relation_count;
+            let mut predictions = decode_predictions(
+                row.entities,
+                relation_labels,
+                &row.pair_map,
+                &score_tensor[score_offset..score_offset + score_len],
+                threshold,
+            )?;
+            boost_context_matches(row.text, &mut predictions);
+            dedupe_predictions(&mut predictions);
+            outputs.push((
+                row.output_index,
+                finalize_relation_predictions(row.text, row.entities, relation_specs, predictions),
+            ));
+        }
+
+        Ok(outputs)
     }
 }
 
@@ -738,6 +1180,35 @@ fn build_prompt_words(relation_labels: &[&str]) -> Vec<String> {
     words
 }
 
+fn relation_label_signature(relation_labels: &[&str]) -> u64 {
+    let mut hasher = FxHasher::default();
+    relation_labels.len().hash(&mut hasher);
+    for label in relation_labels {
+        label.hash(&mut hasher);
+        0xff_u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn prompt_schema_matches_labels(entry: &PromptSchemaCacheEntry, relation_labels: &[&str]) -> bool {
+    entry.relation_labels.len() == relation_labels.len()
+        && entry
+            .relation_labels
+            .iter()
+            .map(|label| label.as_str())
+            .eq(relation_labels.iter().copied())
+}
+
+fn append_token_ids(
+    token_ids: &[i64],
+    word_index: usize,
+    input_ids: &mut Vec<i64>,
+    word_ids: &mut Vec<Option<usize>>,
+) {
+    input_ids.extend_from_slice(token_ids);
+    word_ids.resize(word_ids.len() + token_ids.len(), Some(word_index));
+}
+
 fn build_relation_type_representations(
     word_representations: &[f32],
     relation_count: usize,
@@ -763,7 +1234,7 @@ fn decode_predictions(
     entities: &[GlirelEntity],
     relation_labels: &[&str],
     pair_map: &[(usize, usize)],
-    scores: Vec<f32>,
+    scores: &[f32],
     threshold: f32,
 ) -> Result<Vec<GlirelRelationPrediction>, GlirelError> {
     let relation_count = relation_labels.len();
@@ -802,6 +1273,29 @@ fn decode_predictions(
             .unwrap_or(Ordering::Equal)
     });
     Ok(predictions)
+}
+
+fn next_schema_batch_len(rows: &[PreparedSchemaBatchRow<'_>]) -> usize {
+    let mut count = 0usize;
+    let mut max_sequence_len = 0usize;
+    let mut max_pair_count = 0usize;
+
+    for row in rows {
+        let next_count = count + 1;
+        let next_max_sequence_len = max_sequence_len.max(row.input_ids.len());
+        let next_max_pair_count = max_pair_count.max(row.pair_map.len());
+        let exceeds_budget = next_count > MAX_SCHEMA_BATCH_WINDOWS
+            || next_max_sequence_len.saturating_mul(next_count) > MAX_SCHEMA_BATCH_SEQUENCE_TOKENS
+            || next_max_pair_count.saturating_mul(next_count) > MAX_SCHEMA_BATCH_PAIR_SLOTS;
+        if exceeds_budget && count > 0 {
+            break;
+        }
+        count = next_count;
+        max_sequence_len = next_max_sequence_len;
+        max_pair_count = next_max_pair_count;
+    }
+
+    count.max(1)
 }
 
 fn boost_context_matches(text: &str, predictions: &mut [GlirelRelationPrediction]) {
@@ -1274,7 +1768,7 @@ mod tests {
         let pair_map = vec![(0, 1), (1, 0)];
         let scores = vec![3.0, -4.0];
         let predictions =
-            decode_predictions(&entities, &["chose"], &pair_map, scores, 0.8).expect("decode");
+            decode_predictions(&entities, &["chose"], &pair_map, &scores, 0.8).expect("decode");
         assert_eq!(predictions.len(), 1);
         assert_eq!(predictions[0].head, "Alice");
         assert_eq!(predictions[0].tail, "PostgreSQL");
@@ -1331,6 +1825,15 @@ mod tests {
         assert_eq!(windows[0].text, "Alice met Bob.");
         assert_eq!(windows[1].text, "Carol argued back!");
         assert_eq!(windows[2].text, "Dave left?");
+    }
+
+    #[test]
+    fn relation_label_signature_tracks_schema_order() {
+        let left = relation_label_signature(&["works_for", "member_of"]);
+        let right = relation_label_signature(&["works_for", "member_of"]);
+        let flipped = relation_label_signature(&["member_of", "works_for"]);
+        assert_eq!(left, right);
+        assert_ne!(left, flipped);
     }
 
     #[test]
@@ -1467,5 +1970,24 @@ mod tests {
         suppress_relation_conflicts(&specs, &mut predictions);
         assert_eq!(predictions.len(), 1);
         assert_eq!(predictions[0].relation, "introduced");
+    }
+
+    #[test]
+    fn next_schema_batch_len_respects_token_budget() {
+        let row = |output_index| PreparedSchemaBatchRow {
+            output_index,
+            text: "Alice works for Dynamis.",
+            entities: &[],
+            prompt_word_count: 3,
+            text_word_count: 4,
+            input_ids: vec![1_i64; 1_800],
+            attention_mask: vec![1_i64; 1_800],
+            word_ids: vec![None; 1_800],
+            span_index: Vec::new(),
+            relation_pairs: Vec::new(),
+            pair_map: vec![(0, 1); 8],
+        };
+        let rows = vec![row(0), row(1), row(2)];
+        assert_eq!(next_schema_batch_len(&rows), 2);
     }
 }

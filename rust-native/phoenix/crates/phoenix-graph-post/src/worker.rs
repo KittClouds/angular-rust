@@ -9,7 +9,7 @@ use phoenix_store_native_core::{
 use phoenix_types::{ScopeKey, SessionId};
 use serde::{Deserialize, Serialize};
 
-use crate::{compile_graph_projection, CompiledGraphProjection};
+use crate::compile::{compile_graph_projection_with_archives, CompiledGraphProjection};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,8 +104,9 @@ pub fn derive_scope_review_batch(
     .into_iter()
     .flatten()
     .max();
-    let compiled = compile_graph_projection(
+    let compiled = compile_graph_projection_with_archives(
         &scope_key,
+        archives,
         event_identity_sidecar,
         temporal_sidecar,
         causal_sidecar,

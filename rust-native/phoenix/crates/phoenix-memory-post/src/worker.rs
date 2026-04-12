@@ -1,3 +1,4 @@
+use phoenix_scope_analysis::ScopeAnalysisContext;
 use phoenix_semantic_v2::{
     scope_storage_key, CanonicalEventId, DirtyScopeRecord, DocumentArchive, DocumentRevisionRef,
     EntityMemoryCard, ErScopePatchSidecar, EventIdentityScopeSidecar, MemoryClaimAtom,
@@ -14,7 +15,9 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::compile::compile_memory;
-use crate::normalize::{normalize_memory_inputs, MemoryEntityProfile};
+use crate::normalize::{
+    normalize_memory_inputs, normalize_memory_inputs_from_analysis, MemoryEntityProfile,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +128,55 @@ pub fn derive_scope_review_batch(
         relation_generation: relation_sidecar.map(|value| value.generation),
         state_schema_generation: state_schema_sidecar.map(|value| value.generation),
         memory_generation: None,
+        summary: compiled.summary,
+    }
+}
+
+pub fn derive_scope_review_batch_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&RelationScopePatchSidecar>,
+    state_schema_sidecar: Option<&StateSchemaScopeSidecar>,
+) -> MemoryScopeReviewBatch {
+    let normalized =
+        normalize_memory_inputs_from_analysis(analysis, relation_sidecar, state_schema_sidecar);
+    let compiled = compile_memory(&normalized);
+
+    MemoryScopeReviewBatch {
+        scope: analysis.scope.clone(),
+        scope_key: analysis.scope_key.clone(),
+        scope_ord: analysis.dirty.scope_ord,
+        session_id: analysis.session_id.clone(),
+        dirty: Some(analysis.dirty.clone()),
+        document_refs: analysis.document_refs.as_ref().to_vec(),
+        entity_profiles: normalized.entity_profiles,
+        claims: compiled.claims,
+        events: compiled.events,
+        states: compiled.states,
+        deltas: compiled.deltas,
+        conflicts: compiled.conflicts,
+        gaps: compiled.gaps,
+        entity_cards: compiled.entity_cards,
+        relationship_ledgers: compiled.relationship_ledgers,
+        lexical_generation: analysis
+            .runtime
+            .sidecars
+            .lexical
+            .as_ref()
+            .map(|value| value.generation),
+        er_generation: analysis
+            .runtime
+            .sidecars
+            .er
+            .as_ref()
+            .map(|value| value.generation),
+        relation_generation: relation_sidecar.map(|value| value.generation),
+        state_schema_generation: state_schema_sidecar.map(|value| value.generation),
+        memory_generation: analysis
+            .runtime
+            .sidecars
+            .memory
+            .as_ref()
+            .map(|value| value.generation),
         summary: compiled.summary,
     }
 }

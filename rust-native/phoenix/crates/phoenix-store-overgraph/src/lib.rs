@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lz4_flex::decompress_size_prepended;
 use overgraph::{
@@ -39,6 +39,8 @@ use phoenix_store_native_core::{
 };
 use phoenix_types::{IndexedSpan, IngestDocument, ScopeKey, SessionId};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+mod scope_runtime;
 
 const TYPE_SCOPE_ORD: u32 = 1;
 const TYPE_SESSION_ORD: u32 = 2;
@@ -169,6 +171,19 @@ struct AnnSourceNodeRecord {
     updated_at: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AnnQueryCacheKey {
+    index: AnnIndexKey,
+    generation: AnnGenerationId,
+}
+
+struct CachedAnnQueryState {
+    key: AnnQueryCacheKey,
+    manifest: AnnManifest,
+    payloads: Arc<[AnnPayload]>,
+    index_handle: Arc<HyperbolicDiskHnsw<AnnMetric>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OvergraphTuning {
     pub memtable_flush_threshold: usize,
@@ -242,6 +257,9 @@ pub struct PhoenixOvergraphStore {
     path: PathBuf,
     tuning: OvergraphTuning,
     engine: Mutex<Option<DatabaseEngine>>,
+    scope_runtime_document_cache: Mutex<Vec<Arc<scope_runtime::CachedScopeDocumentProjection>>>,
+    scope_runtime_image_cache: Mutex<Vec<Arc<scope_runtime::CachedScopeRuntimeImage>>>,
+    ann_query_state_cache: Mutex<HashMap<AnnQueryCacheKey, Arc<CachedAnnQueryState>>>,
     live_kernel_generation: AtomicU64,
     live_kernel_snapshot: Mutex<Option<KernelGraphSnapshot>>,
 }
@@ -266,6 +284,9 @@ impl PhoenixOvergraphStore {
             path,
             tuning,
             engine: Mutex::new(Some(engine)),
+            scope_runtime_document_cache: Mutex::new(Vec::new()),
+            scope_runtime_image_cache: Mutex::new(Vec::new()),
+            ann_query_state_cache: Mutex::new(HashMap::new()),
             live_kernel_generation: AtomicU64::new(u64::MAX),
             live_kernel_snapshot: Mutex::new(None),
         })
@@ -277,6 +298,19 @@ impl PhoenixOvergraphStore {
 
     pub fn tuning(&self) -> &OvergraphTuning {
         &self.tuning
+    }
+
+    pub fn clear_retained_runtime_state(&self) {
+        if let Ok(mut guard) = self.scope_runtime_document_cache.lock() {
+            *guard = Vec::new();
+        }
+        if let Ok(mut guard) = self.scope_runtime_image_cache.lock() {
+            *guard = Vec::new();
+        }
+        if let Ok(mut guard) = self.ann_query_state_cache.lock() {
+            *guard = HashMap::new();
+        }
+        self.invalidate_live_kernel_snapshot();
     }
 
     fn with_engine<T>(
@@ -330,12 +364,41 @@ impl PhoenixOvergraphStore {
         Ok(())
     }
 
+    fn load_cached_ann_query_state(
+        &self,
+        key: &AnnQueryCacheKey,
+    ) -> Option<Arc<CachedAnnQueryState>> {
+        self.ann_query_state_cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(key).cloned())
+    }
+
+    fn cache_ann_query_state(&self, state: Arc<CachedAnnQueryState>) -> Arc<CachedAnnQueryState> {
+        let Ok(mut guard) = self.ann_query_state_cache.lock() else {
+            return state;
+        };
+        if let Some(existing) = guard.get(&state.key).cloned() {
+            return existing;
+        }
+        guard.retain(|key, _| key.index != state.key.index);
+        guard.insert(state.key.clone(), state.clone());
+        state
+    }
+
+    fn invalidate_ann_query_state(&self, index: &AnnIndexKey) {
+        if let Ok(mut guard) = self.ann_query_state_cache.lock() {
+            guard.retain(|key, _| key.index != *index);
+        }
+    }
+
     fn mark_ann_dirty_with_engine(
         &self,
         engine: &mut DatabaseEngine,
         index: &AnnIndexKey,
         dirty_at: i64,
     ) -> Result<(), StoreError> {
+        self.invalidate_ann_query_state(index);
         engine
             .upsert_node(
                 TYPE_ANN_DIRTY,
@@ -382,6 +445,7 @@ impl PhoenixOvergraphStore {
         payloads: &[AnnPayload],
         built_at: i64,
     ) -> Result<(), StoreError> {
+        self.invalidate_ann_query_state(index);
         if vectors.is_empty() {
             if let Some(node) = engine
                 .get_node_by_key(TYPE_ANN_HEAD, &ann_index_storage_key(index))
@@ -671,7 +735,7 @@ impl PhoenixOvergraphStore {
     ) -> Result<Option<AnnManifest>, StoreError> {
         Ok(self
             .load_ann_query_state(scope, family, kind)?
-            .map(|(manifest, _, _)| manifest))
+            .map(|state| state.manifest.clone()))
     }
 
     fn load_ann_query_state(
@@ -679,26 +743,153 @@ impl PhoenixOvergraphStore {
         scope: &ScopeKey,
         family: AnnIndexFamily,
         kind: Option<&str>,
-    ) -> Result<Option<(AnnManifest, HyperbolicDiskHnsw<AnnMetric>, Vec<AnnPayload>)>, StoreError>
-    {
-        let Some((_, manifest, payloads, cache_path)) =
-            self.load_ann_query_components(scope, family, kind, false)?
+    ) -> Result<Option<Arc<CachedAnnQueryState>>, StoreError> {
+        let Some(cache_key) = self.load_ann_query_generation(scope, family, kind, false)? else {
+            return Ok(None);
+        };
+        if let Some(state) = self.load_cached_ann_query_state(&cache_key) {
+            return Ok(Some(state));
+        }
+        match self.load_and_cache_ann_query_state(scope, family, kind, false)? {
+            Some(state) => Ok(Some(state)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_and_cache_ann_query_state(
+        &self,
+        scope: &ScopeKey,
+        family: AnnIndexFamily,
+        kind: Option<&str>,
+        force_rebuild: bool,
+    ) -> Result<Option<Arc<CachedAnnQueryState>>, StoreError> {
+        let Some((index, manifest, payloads, cache_path)) =
+            self.load_ann_query_components(scope, family, kind, force_rebuild)?
         else {
             return Ok(None);
         };
-
-        match self.open_ann_disk_index(&manifest, &cache_path) {
-            Ok(index_handle) => Ok(Some((manifest, index_handle, payloads))),
-            Err(_) => {
-                let Some((_, manifest, payloads, cache_path)) =
-                    self.load_ann_query_components(scope, family, kind, true)?
-                else {
-                    return Ok(None);
-                };
-                let index_handle = self.open_ann_disk_index(&manifest, &cache_path)?;
-                Ok(Some((manifest, index_handle, payloads)))
-            }
+        let cache_key = AnnQueryCacheKey {
+            index,
+            generation: manifest.generation_id,
+        };
+        if let Some(state) = self.load_cached_ann_query_state(&cache_key) {
+            return Ok(Some(state));
         }
+        match self.open_ann_disk_index(&manifest, &cache_path) {
+            Ok(index_handle) => {
+                let state = Arc::new(CachedAnnQueryState {
+                    key: cache_key,
+                    manifest,
+                    payloads: Arc::<[AnnPayload]>::from(payloads),
+                    index_handle: Arc::new(index_handle),
+                });
+                Ok(Some(self.cache_ann_query_state(state)))
+            }
+            Err(_) if !force_rebuild => {
+                self.load_and_cache_ann_query_state(scope, family, kind, true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn load_ann_query_generation(
+        &self,
+        scope: &ScopeKey,
+        family: AnnIndexFamily,
+        kind: Option<&str>,
+        force_rebuild: bool,
+    ) -> Result<Option<AnnQueryCacheKey>, StoreError> {
+        self.with_engine(|engine| {
+            let Some(scope_ord) = self.lookup_scope_ord_with_engine(engine, scope)? else {
+                return Ok(None);
+            };
+            let index = AnnIndexKey {
+                scope_ord,
+                family,
+                kind: kind.map(str::to_owned),
+            };
+            if force_rebuild {
+                self.rebuild_ann_index_with_engine(engine, &index, now_ms())?;
+            } else {
+                self.ensure_ann_index_ready_with_engine(engine, &index)?;
+            }
+            let Some(head) = engine
+                .get_node_by_key(TYPE_ANN_HEAD, &ann_index_storage_key(&index))
+                .map_err(store_query_error)?
+            else {
+                return Ok(None);
+            };
+            let Some(generation) = optional_u64_prop(&head, PROP_GENERATION).map(AnnGenerationId)
+            else {
+                return Ok(None);
+            };
+            Ok(Some(AnnQueryCacheKey { index, generation }))
+        })
+    }
+
+    fn load_ann_generation_components_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        index: &AnnIndexKey,
+    ) -> Result<Option<(AnnManifest, Vec<AnnPayload>, PathBuf)>, StoreError> {
+        let Some(cache_key) = self.load_current_ann_query_generation_with_engine(engine, index)?
+        else {
+            return Ok(None);
+        };
+        self.load_ann_generation_components_for_key_with_engine(engine, &cache_key)
+    }
+
+    fn load_current_ann_query_generation_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        index: &AnnIndexKey,
+    ) -> Result<Option<AnnQueryCacheKey>, StoreError> {
+        let Some(head) = engine
+            .get_node_by_key(TYPE_ANN_HEAD, &ann_index_storage_key(index))
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let Some(generation) = optional_u64_prop(&head, PROP_GENERATION).map(AnnGenerationId)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AnnQueryCacheKey {
+            index: index.clone(),
+            generation,
+        }))
+    }
+
+    fn load_ann_generation_components_for_key_with_engine(
+        &self,
+        engine: &mut DatabaseEngine,
+        cache_key: &AnnQueryCacheKey,
+    ) -> Result<Option<(AnnManifest, Vec<AnnPayload>, PathBuf)>, StoreError> {
+        let index = &cache_key.index;
+        let generation = cache_key.generation;
+        let Some(node) = engine
+            .get_node_by_key(
+                TYPE_ANN_GENERATION,
+                &ann_generation_storage_key(index, generation),
+            )
+            .map_err(store_query_error)?
+        else {
+            return Ok(None);
+        };
+        let manifest: AnnManifest = decode_record_prop_required(&node, PROP_RECORD)?;
+        let payloads: Vec<AnnPayload> = decode_archive(&required_bytes_prop(&node, PROP_PAYLOAD)?)?;
+        if payloads.len() != manifest.count {
+            return Err(StoreError::Query(format!(
+                "semantic payload count mismatch for generation {}: expected {}, got {}",
+                manifest.generation_id.0,
+                manifest.count,
+                payloads.len()
+            )));
+        }
+        let segments: AnnPackedSegments =
+            decode_archive(&required_bytes_prop(&node, PROP_SEGMENTS)?)?;
+        let cache_path = self.write_ann_generation_cache_file(&manifest, &segments)?;
+        Ok(Some((manifest, payloads, cache_path)))
     }
 
     fn load_ann_query_components(
@@ -726,46 +917,6 @@ impl PhoenixOvergraphStore {
                 .load_ann_generation_components_with_engine(engine, &index)?
                 .map(|(manifest, payloads, cache_path)| (index, manifest, payloads, cache_path)))
         })
-    }
-
-    fn load_ann_generation_components_with_engine(
-        &self,
-        engine: &mut DatabaseEngine,
-        index: &AnnIndexKey,
-    ) -> Result<Option<(AnnManifest, Vec<AnnPayload>, PathBuf)>, StoreError> {
-        let Some(head) = engine
-            .get_node_by_key(TYPE_ANN_HEAD, &ann_index_storage_key(index))
-            .map_err(store_query_error)?
-        else {
-            return Ok(None);
-        };
-        let Some(generation) = optional_u64_prop(&head, PROP_GENERATION).map(AnnGenerationId)
-        else {
-            return Ok(None);
-        };
-        let Some(node) = engine
-            .get_node_by_key(
-                TYPE_ANN_GENERATION,
-                &ann_generation_storage_key(index, generation),
-            )
-            .map_err(store_query_error)?
-        else {
-            return Ok(None);
-        };
-        let manifest: AnnManifest = decode_record_prop_required(&node, PROP_RECORD)?;
-        let payloads: Vec<AnnPayload> = decode_archive(&required_bytes_prop(&node, PROP_PAYLOAD)?)?;
-        if payloads.len() != manifest.count {
-            return Err(StoreError::Query(format!(
-                "semantic payload count mismatch for generation {}: expected {}, got {}",
-                manifest.generation_id.0,
-                manifest.count,
-                payloads.len()
-            )));
-        }
-        let segments: AnnPackedSegments =
-            decode_archive(&required_bytes_prop(&node, PROP_SEGMENTS)?)?;
-        let cache_path = self.write_ann_generation_cache_file(&manifest, &segments)?;
-        Ok(Some((manifest, payloads, cache_path)))
     }
 
     fn open_ann_disk_index(
@@ -810,15 +961,17 @@ impl PhoenixOvergraphStore {
             return Ok(Vec::new());
         }
         Self::validate_semantic_vector(query_vector, "query")?;
-        let Some((_, index, payloads)) = self.load_ann_query_state(scope, family, kind)? else {
+        let Some(state) = self.load_ann_query_state(scope, family, kind)? else {
             return Ok(Vec::new());
         };
         let search_limit = oversample.max(limit);
-        Ok(index
+        Ok(state
+            .index_handle
             .search(query_vector, search_limit, search_limit.max(16))
             .into_iter()
             .filter_map(|candidate| {
-                payloads
+                state
+                    .payloads
                     .get(candidate.id as usize)
                     .cloned()
                     .map(|payload| (candidate, payload))
@@ -1693,6 +1846,7 @@ impl PhoenixOvergraphStore {
                 },
             )
             .map_err(store_query_error)?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
         Ok(())
     }
 
@@ -2675,7 +2829,11 @@ impl PhoenixArchiveStoreV2 for PhoenixOvergraphStore {
                 self.persist_session_archive_native_with_engine(engine, session_archive, revision)?;
             }
             Ok(())
-        })
+        })?;
+        for dirty_scope in touched_scopes {
+            self.invalidate_scope_runtime_caches(&dirty_scope.scope_key)?;
+        }
+        Ok(())
     }
 
     fn persist_session_archive(
@@ -2919,7 +3077,11 @@ impl PhoenixErPatchStore for PhoenixOvergraphStore {
     }
 
     fn persist_er_patch_sidecar(&self, sidecar: &ErScopePatchSidecar) -> Result<(), StoreError> {
-        self.with_engine(|engine| self.persist_er_patch_sidecar_native_with_engine(engine, sidecar))
+        self.with_engine(|engine| {
+            self.persist_er_patch_sidecar_native_with_engine(engine, sidecar)
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_er_patch_sidecar(
@@ -2941,7 +3103,9 @@ impl PhoenixRelationPatchStore for PhoenixOvergraphStore {
     ) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_relation_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_relation_patch_sidecar(
@@ -2962,7 +3126,9 @@ impl PhoenixMemoryPatchStore for PhoenixOvergraphStore {
     fn persist_memory_patch_sidecar(&self, sidecar: &MemoryScopeSidecar) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_memory_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_memory_patch_sidecar(
@@ -2981,7 +3147,9 @@ impl PhoenixGraphPatchStore for PhoenixOvergraphStore {
     fn persist_graph_patch_sidecar(&self, sidecar: &GraphScopeSidecar) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_graph_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_graph_patch_sidecar(
@@ -3003,7 +3171,9 @@ impl PhoenixSemanticGraphPatchStore for PhoenixOvergraphStore {
     ) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_semantic_graph_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_semantic_graph_patch_sidecar(
@@ -3024,7 +3194,9 @@ impl PhoenixCausalPatchStore for PhoenixOvergraphStore {
     fn persist_causal_patch_sidecar(&self, sidecar: &CausalScopeSidecar) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_causal_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_causal_patch_sidecar(
@@ -3046,7 +3218,9 @@ impl PhoenixTemporalPatchStore for PhoenixOvergraphStore {
     ) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_temporal_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_temporal_patch_sidecar(
@@ -3070,7 +3244,9 @@ impl PhoenixEventIdentityPatchStore for PhoenixOvergraphStore {
     ) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_event_identity_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_event_identity_patch_sidecar(
@@ -3094,7 +3270,9 @@ impl PhoenixStateSchemaPatchStore for PhoenixOvergraphStore {
     ) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_state_schema_patch_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_state_schema_patch_sidecar(
@@ -3118,7 +3296,9 @@ impl PhoenixRelationMentionSeedStore for PhoenixOvergraphStore {
     ) -> Result<(), StoreError> {
         self.with_engine(|engine| {
             self.persist_relation_mention_seed_sidecar_native_with_engine(engine, sidecar)
-        })
+        })?;
+        self.invalidate_scope_runtime_image_cache(&sidecar.scope_key)?;
+        Ok(())
     }
 
     fn load_relation_mention_seed_sidecar(
@@ -3380,21 +3560,22 @@ impl PhoenixSemanticIndexStore for PhoenixOvergraphStore {
             .iter()
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
-        let Some((manifest, index, payloads)) =
-            self.load_ann_query_state(scope, AnnIndexFamily::Leaf, None)?
-        else {
+        let Some(state) = self.load_ann_query_state(scope, AnnIndexFamily::Leaf, None)? else {
             return Ok(Vec::new());
         };
         Self::validate_semantic_vector(query_vector, "query")?;
         let mut search_k = oversample
             .max(limit)
             .max(8)
-            .min(manifest.count.max(limit).max(1));
+            .min(state.manifest.count.max(limit).max(1));
         let mut hits = Vec::new();
-        while search_k <= manifest.count.max(limit) {
+        while search_k <= state.manifest.count.max(limit) {
             hits.clear();
-            for candidate in index.search(query_vector, search_k, search_k.max(16)) {
-                let Some(payload) = payloads.get(candidate.id as usize) else {
+            for candidate in state
+                .index_handle
+                .search(query_vector, search_k, search_k.max(16))
+            {
+                let Some(payload) = state.payloads.get(candidate.id as usize) else {
                     continue;
                 };
                 if let AnnPayload::Leaf {
@@ -3413,10 +3594,10 @@ impl PhoenixSemanticIndexStore for PhoenixOvergraphStore {
                     }
                 }
             }
-            if search_k >= manifest.count {
+            if search_k >= state.manifest.count {
                 break;
             }
-            search_k = (search_k * 2).min(manifest.count);
+            search_k = (search_k * 2).min(state.manifest.count);
         }
         Ok(hits)
     }
@@ -3461,6 +3642,14 @@ impl PhoenixSemanticIndexStore for PhoenixOvergraphStore {
             })
             .take(limit)
             .collect())
+    }
+
+    fn warm_semantic_node_index(&self, scope: &ScopeKey, kind: &str) -> Result<(), StoreError> {
+        if kind.is_empty() {
+            return Ok(());
+        }
+        let _ = self.load_ann_query_state(scope, AnnIndexFamily::NodePrototype, Some(kind))?;
+        Ok(())
     }
 
     fn load_semantic_document_vector_records(
@@ -4087,6 +4276,9 @@ fn entity_count_from_alias_entries(entries: &[AliasEntry]) -> usize {
 }
 
 #[cfg(test)]
+mod scope_runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4184,11 +4376,11 @@ mod tests {
             doc_hits.first().map(|hit| hit.document_id.as_str()),
             Some("doc-a")
         );
-        let (manifest, _, _) = store
+        let state = store
             .load_ann_query_state(&scope, AnnIndexFamily::Document, None)
             .expect("ann query state")
             .expect("document ann state");
-        assert_eq!(manifest.metric, AnnMetric::LABEL_SPHERE_GEODESIC);
+        assert_eq!(state.manifest.metric, AnnMetric::LABEL_SPHERE_GEODESIC);
 
         let leaf_hits = store
             .query_semantic_neighbors_in_documents(
@@ -4253,6 +4445,92 @@ mod tests {
         assert_eq!(
             updated_hits.first().map(|hit| hit.document_id.as_str()),
             Some("doc-b")
+        );
+    }
+
+    #[test]
+    fn ann_query_state_is_retained_until_generation_changes() {
+        let store = temp_store("ann-query-state-retained");
+        let scope = ScopeKey::default();
+
+        store
+            .upsert_semantic_node_vectors_native(&[
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "entity::a".to_owned(),
+                    node_kind: "entity".to_owned(),
+                    document_id: Some("doc-a".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(0),
+                    evidence_refs: vec!["graph_vertex:entity::a".to_owned()],
+                    updated_at: 1,
+                },
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "entity::b".to_owned(),
+                    node_kind: "entity".to_owned(),
+                    document_id: Some("doc-b".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(1),
+                    evidence_refs: vec!["graph_vertex:entity::b".to_owned()],
+                    updated_at: 1,
+                },
+            ])
+            .expect("upsert node vectors");
+
+        let initial = store
+            .load_ann_query_state(&scope, AnnIndexFamily::NodePrototype, Some("entity"))
+            .expect("initial ann query state")
+            .expect("initial ann query state present");
+        let retained = store
+            .load_ann_query_state(&scope, AnnIndexFamily::NodePrototype, Some("entity"))
+            .expect("retained ann query state")
+            .expect("retained ann query state present");
+        assert!(
+            std::sync::Arc::ptr_eq(&initial, &retained),
+            "expected repeated query-state loads to reuse the same retained runtime"
+        );
+
+        store
+            .upsert_semantic_node_vectors_native(&[
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "entity::a".to_owned(),
+                    node_kind: "entity".to_owned(),
+                    document_id: Some("doc-a".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(2),
+                    evidence_refs: vec!["graph_vertex:entity::a".to_owned()],
+                    updated_at: 2,
+                },
+                NativeSemanticNodeVectorRecord {
+                    scope: scope.clone(),
+                    node_id: "entity::b".to_owned(),
+                    node_kind: "entity".to_owned(),
+                    document_id: Some("doc-b".to_owned()),
+                    narrative_id: None,
+                    folder_id: None,
+                    values: semantic_test_vector(0),
+                    evidence_refs: vec!["graph_vertex:entity::b".to_owned()],
+                    updated_at: 2,
+                },
+            ])
+            .expect("update node vectors");
+
+        let refreshed = store
+            .load_ann_query_state(&scope, AnnIndexFamily::NodePrototype, Some("entity"))
+            .expect("refreshed ann query state")
+            .expect("refreshed ann query state present");
+        assert!(
+            !std::sync::Arc::ptr_eq(&initial, &refreshed),
+            "expected a new retained runtime after the ANN generation changed"
+        );
+        assert!(
+            refreshed.manifest.generation_id.0 > initial.manifest.generation_id.0,
+            "expected ANN generation to advance after vector updates"
         );
     }
 

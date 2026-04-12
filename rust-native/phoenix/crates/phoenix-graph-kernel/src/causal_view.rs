@@ -15,6 +15,8 @@ pub struct KernelCausalPathFeatures {
     pub temporal_consistency_ratio: f64,
     pub path_stability: f64,
     pub support_strength: f64,
+    pub pattern_strength: f64,
+    pub path_span_ms: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +237,8 @@ fn path_features(
         path_edges.iter().map(edge_stability).sum::<f64>() / path_edges.len() as f64;
     let support_strength =
         (avg_confidence * 0.8) + ((evidence_ref_count.min(10) as f64 / 10.0) * 0.2);
+    let pattern_strength =
+        path_edges.iter().map(edge_pattern_strength).sum::<f64>() / path_edges.len() as f64;
     KernelCausalPathFeatures {
         depth: path_edges.len(),
         avg_confidence,
@@ -244,7 +248,32 @@ fn path_features(
         temporal_consistency_ratio: temporal_consistency(path_vertex_indices, vertices),
         path_stability,
         support_strength,
+        pattern_strength,
+        path_span_ms: path_span_ms(path_vertex_indices, vertices),
     }
+}
+
+fn edge_pattern_strength(edge: &&KernelEdge) -> f64 {
+    let mut score: f64 = match edge.edge_type.0.as_str() {
+        "causal_link" => 1.0,
+        "semantic::same_process" => 0.82,
+        "semantic::related_event" => 0.72,
+        "supported_by" | "subject" | "object" => 0.58,
+        "semantic::missing_intermediate_cause" => 0.38,
+        _ => 0.45,
+    };
+    if matches!(edge.layer, KernelGraphLayer::Candidate) {
+        score *= 0.9;
+    }
+    if edge
+        .attributes
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("supported")
+    {
+        score += 0.08;
+    }
+    score.clamp(0.0, 1.1)
 }
 
 fn edge_stability(edge: &&KernelEdge) -> f64 {
@@ -278,6 +307,30 @@ fn temporal_consistency(path_vertex_indices: &[usize], vertices: &[KernelVertex]
         0.7
     } else {
         consistent as f64 / total as f64
+    }
+}
+
+fn path_span_ms(path_vertex_indices: &[usize], vertices: &[KernelVertex]) -> i64 {
+    let mut earliest = i64::MAX;
+    let mut latest = i64::MIN;
+    let mut saw_temporal = false;
+    for &index in path_vertex_indices {
+        let temporal = &vertices[index].temporal;
+        if let Some(start) = temporal.valid_from.or(temporal.valid_to) {
+            earliest = earliest.min(start);
+            latest = latest.max(start);
+            saw_temporal = true;
+        }
+        if let Some(end) = temporal.valid_to {
+            earliest = earliest.min(end);
+            latest = latest.max(end);
+            saw_temporal = true;
+        }
+    }
+    if saw_temporal {
+        latest.saturating_sub(earliest)
+    } else {
+        0
     }
 }
 

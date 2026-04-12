@@ -70,9 +70,17 @@ pub struct GraphSoftEdgeCount {
 pub struct GraphEvalMetrics {
     pub abstain: bool,
     pub abstain_reason: Option<String>,
+    pub candidate_count: usize,
+    pub best_candidate_id: Option<String>,
+    pub best_pre_structural_score_millis: Option<i64>,
+    pub best_post_structural_score_millis: Option<i64>,
+    pub best_candidate_hops: Option<usize>,
     pub selected_id: Option<String>,
     pub selected_label: Option<String>,
     pub selected_score_millis: Option<i64>,
+    pub selected_structural_model: Option<String>,
+    pub selected_structural_delta_millis: Option<i32>,
+    pub selected_structural_proximity_millis: Option<u32>,
     pub seed_count: usize,
     pub region: GraphRetrievedRegion,
     #[serde(default)]
@@ -243,7 +251,9 @@ where
             &query,
             until_valid_at,
             &timeline.vertices,
-            &region_snapshot.candidate_edges,
+            &timeline.vertices,
+            &timeline.asserted_edges,
+            &timeline.candidate_edges,
             &changes,
             &conflicts,
             &gaps,
@@ -338,9 +348,21 @@ fn metrics_from_world_state(
     region: GraphRetrievedRegion,
     snapshot: &KernelGraphSnapshot,
 ) -> GraphEvalMetrics {
+    let structural = answer
+        .selected
+        .as_ref()
+        .and_then(|candidate| candidate.graph_structural_rerank.as_ref());
+    let best = answer.candidates.first();
     GraphEvalMetrics {
         abstain: answer.abstain,
         abstain_reason: answer.abstain_reason.clone(),
+        candidate_count: answer.candidates.len(),
+        best_candidate_id: best.map(|candidate| candidate.state.state_vertex_id.clone()),
+        best_pre_structural_score_millis: best
+            .map(|candidate| (candidate.answer_score * 1000.0).round() as i64),
+        best_post_structural_score_millis: best
+            .map(|candidate| (candidate.answer_score * 1000.0).round() as i64),
+        best_candidate_hops: None,
         selected_id: answer
             .selected
             .as_ref()
@@ -353,6 +375,9 @@ fn metrics_from_world_state(
             .selected
             .as_ref()
             .map(|candidate| (candidate.answer_score * 1000.0).round() as i64),
+        selected_structural_model: structural.map(|score| score.model.clone()),
+        selected_structural_delta_millis: structural.map(|score| score.applied_delta_millis),
+        selected_structural_proximity_millis: structural.map(|score| score.proximity_score_millis),
         seed_count,
         region,
         soft_edge_counts: collect_soft_edge_counts(&snapshot.candidate_edges),
@@ -365,9 +390,21 @@ fn metrics_from_history(
     region: GraphRetrievedRegion,
     snapshot: &KernelGraphSnapshot,
 ) -> GraphEvalMetrics {
+    let structural = answer
+        .selected
+        .as_ref()
+        .and_then(|candidate| candidate.graph_structural_rerank.as_ref());
+    let best = answer.candidates.first();
     GraphEvalMetrics {
         abstain: answer.abstain,
         abstain_reason: answer.abstain_reason.clone(),
+        candidate_count: answer.candidates.len(),
+        best_candidate_id: best.map(|candidate| candidate.change.state.state_vertex_id.clone()),
+        best_pre_structural_score_millis: best
+            .map(|candidate| (candidate.answer_score * 1000.0).round() as i64),
+        best_post_structural_score_millis: best
+            .map(|candidate| (candidate.answer_score * 1000.0).round() as i64),
+        best_candidate_hops: None,
         selected_id: answer
             .selected
             .as_ref()
@@ -382,6 +419,9 @@ fn metrics_from_history(
             .selected
             .as_ref()
             .map(|candidate| (candidate.answer_score * 1000.0).round() as i64),
+        selected_structural_model: structural.map(|score| score.model.clone()),
+        selected_structural_delta_millis: structural.map(|score| score.applied_delta_millis),
+        selected_structural_proximity_millis: structural.map(|score| score.proximity_score_millis),
         seed_count,
         region,
         soft_edge_counts: collect_soft_edge_counts(&snapshot.candidate_edges),
@@ -394,9 +434,21 @@ fn metrics_from_causal(
     region: GraphRetrievedRegion,
     snapshot: &KernelGraphSnapshot,
 ) -> GraphEvalMetrics {
+    let structural = answer
+        .selected
+        .as_ref()
+        .and_then(|path| path.graph_structural_rerank.as_ref());
+    let best = answer.candidates.first();
     GraphEvalMetrics {
         abstain: answer.abstain,
         abstain_reason: answer.abstain_reason.clone(),
+        candidate_count: answer.candidates.len(),
+        best_candidate_id: best.map(|path| path.source_vertex_id.clone()),
+        best_pre_structural_score_millis: best
+            .map(|path| (path.answer_score * 1000.0).round() as i64),
+        best_post_structural_score_millis: best
+            .map(|path| (path.answer_score * 1000.0).round() as i64),
+        best_candidate_hops: best.map(|path| path.hops.len()),
         selected_id: answer
             .selected
             .as_ref()
@@ -409,6 +461,9 @@ fn metrics_from_causal(
             .selected
             .as_ref()
             .map(|path| (path.answer_score * 1000.0).round() as i64),
+        selected_structural_model: structural.map(|score| score.model.clone()),
+        selected_structural_delta_millis: structural.map(|score| score.applied_delta_millis),
+        selected_structural_proximity_millis: structural.map(|score| score.proximity_score_millis),
         seed_count,
         region,
         soft_edge_counts: collect_soft_edge_counts(&snapshot.candidate_edges),

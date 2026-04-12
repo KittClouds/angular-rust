@@ -1,6 +1,9 @@
 //! Canonical discovery and orchestration façade for Phoenix post-ingest
 //! pipeline stages.
 
+pub mod depth_audit;
+mod pipeline_scheduler;
+
 use serde::{Deserialize, Serialize};
 
 use phoenix_alex::{api as alex_api, AlexError, Lexicon};
@@ -14,11 +17,15 @@ use phoenix_state_schema_post::api as state_schema_api;
 use phoenix_store_native_core::{
     PhoenixArchiveStoreV2, PhoenixCausalPatchStore, PhoenixErPatchStore,
     PhoenixEventIdentityPatchStore, PhoenixGraphPatchStore, PhoenixMemoryPatchStore,
-    PhoenixRelationPatchStore, PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore,
-    PhoenixStateSchemaPatchStore, PhoenixTemporalPatchStore, StoreError,
+    PhoenixRelationPatchStore, PhoenixScopeRuntimeStore, PhoenixSemanticGraphPatchStore,
+    PhoenixSemanticIndexStore, PhoenixStateSchemaPatchStore, PhoenixTemporalPatchStore, StoreError,
 };
 use phoenix_temporal_post::api as temporal_api;
 use phoenix_types::{LexiconEntry, ScopeKey, SessionId};
+pub use pipeline_scheduler::{
+    PipelineGenerationContext, PipelineRunMetrics, PipelineRunRequest, PipelineRunShape,
+    PipelineStage, PipelineStageStatus, ScopeGenerationKey, StageProductEnvelope,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineApiError {
@@ -37,11 +44,16 @@ pub struct PostIngestRunReport {
     pub relation_case_count: usize,
     pub persisted_relation_edge_count: usize,
     pub state_schema_scope_count: usize,
+    pub state_schema_slot_family_count: usize,
+    pub state_schema_slot_definition_count: usize,
     pub state_schema_active_definition_count: usize,
     pub state_schema_candidate_count: usize,
+    pub state_schema_write_proposal_count: usize,
     pub memory_scope_count: usize,
     pub memory_state_count: usize,
     pub memory_card_count: usize,
+    #[serde(default)]
+    pub scheduler: PipelineRunMetrics,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +65,21 @@ pub struct StateSchemaRunReport {
     pub active_definition_count: usize,
     pub candidate_count: usize,
     pub write_proposal_count: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LateSidecarRunReport {
+    pub state_schema: StateSchemaRunReport,
+    pub memory_scope_count: usize,
+    pub memory_state_count: usize,
+    pub memory_event_count: usize,
+    pub memory_claim_count: usize,
+    pub memory_gap_count: usize,
+    pub memory_conflict_count: usize,
+    pub memory_card_count: usize,
+    #[serde(default)]
+    pub scheduler: PipelineRunMetrics,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +143,10 @@ impl<S> PhoenixPipelineApi<S> {
         Self { store }
     }
 
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
     pub fn store(&self) -> &S {
         &self.store
     }
@@ -168,6 +199,7 @@ where
         + PhoenixEventIdentityPatchStore
         + PhoenixRelationPatchStore
         + PhoenixMemoryPatchStore
+        + PhoenixScopeRuntimeStore
         + PhoenixCausalPatchStore
         + PhoenixStateSchemaPatchStore
         + PhoenixTemporalPatchStore,
@@ -180,63 +212,26 @@ where
         relation_created_at: i64,
         memory_created_at: i64,
     ) -> Result<PostIngestRunReport, PipelineApiError> {
-        let mut relation_batches = rel_api::derive_batches(&self.store, session_id)?;
-        let mut persisted_relation_edge_count = 0usize;
-        let mut relation_case_count = 0usize;
-        for batch in &mut relation_batches {
-            rel_api::run_glirel(batch, glirel_model, relation_specs)?;
-            let decisions = rel_api::draft_decisions(batch, relation_specs);
-            let sidecar = rel_api::persist_patch_sidecar(
-                &self.store,
-                batch,
-                &decisions,
-                relation_created_at,
-            )?;
-            relation_case_count += batch.review_cases.len();
-            persisted_relation_edge_count += sidecar.edge_additions.len();
-        }
+        pipeline_scheduler::run_post_ingest_pipeline(
+            &self.store,
+            PipelineRunRequest::post_ingest(session_id),
+            glirel_model,
+            relation_specs,
+            relation_created_at,
+            memory_created_at,
+        )
+    }
 
-        let mut state_schema_batches = state_schema_api::derive_batches(&self.store, session_id)?;
-        let mut state_schema_active_definition_count = 0usize;
-        let mut state_schema_candidate_count = 0usize;
-        for batch in &mut state_schema_batches {
-            state_schema_api::run_batch(batch, relation_created_at);
-            let sidecar =
-                state_schema_api::persist_patch_sidecar(&self.store, batch, relation_created_at)?;
-            state_schema_active_definition_count += sidecar
-                .slot_definitions
-                .iter()
-                .filter(|definition| {
-                    matches!(
-                        definition.lifecycle,
-                        phoenix_semantic_v2::StateSlotLifecycle::Active
-                            | phoenix_semantic_v2::StateSlotLifecycle::Stable
-                    )
-                })
-                .count();
-            state_schema_candidate_count += sidecar.slot_candidates.len();
-        }
-
-        let memory_batches = memory_api::derive_batches(&self.store, session_id)?;
-        let mut memory_state_count = 0usize;
-        let mut memory_card_count = 0usize;
-        for batch in &memory_batches {
-            let sidecar = memory_api::persist_patch_sidecar(&self.store, batch, memory_created_at)?;
-            memory_state_count += sidecar.states.len();
-            memory_card_count += sidecar.entity_cards.len();
-        }
-
-        Ok(PostIngestRunReport {
-            relation_scope_count: relation_batches.len(),
-            relation_case_count,
-            persisted_relation_edge_count,
-            state_schema_scope_count: state_schema_batches.len(),
-            state_schema_active_definition_count,
-            state_schema_candidate_count,
-            memory_scope_count: memory_batches.len(),
-            memory_state_count,
-            memory_card_count,
-        })
+    pub fn run_late_sidecar_scope(
+        &self,
+        session_id: Option<&SessionId>,
+        created_at: i64,
+    ) -> Result<LateSidecarRunReport, PipelineApiError> {
+        pipeline_scheduler::run_late_sidecar_pipeline(
+            &self.store,
+            PipelineRunRequest::late_sidecars(session_id),
+            created_at,
+        )
     }
 
     pub fn run_causal_scope(
@@ -411,7 +406,6 @@ where
             self.run_event_identity_scope(session_id, event_identity_created_at)?;
         let temporal = self.run_temporal_scope(session_id, temporal_created_at)?;
         let causal = self.run_causal_scope(session_id, causal_created_at)?;
-        let state_schema = self.run_state_schema_scope(session_id, relation_created_at)?;
         let post_ingest = self.run_post_ingest_scope(
             session_id,
             glirel_model,
@@ -419,6 +413,14 @@ where
             relation_created_at,
             memory_created_at,
         )?;
+        let state_schema = StateSchemaRunReport {
+            state_schema_scope_count: post_ingest.state_schema_scope_count,
+            slot_family_count: post_ingest.state_schema_slot_family_count,
+            slot_definition_count: post_ingest.state_schema_slot_definition_count,
+            active_definition_count: post_ingest.state_schema_active_definition_count,
+            candidate_count: post_ingest.state_schema_candidate_count,
+            write_proposal_count: post_ingest.state_schema_write_proposal_count,
+        };
 
         Ok(ContinuityRunReport {
             event_identity,
@@ -533,7 +535,8 @@ where
     S: PhoenixArchiveStoreV2
         + PhoenixErPatchStore
         + PhoenixCausalPatchStore
-        + PhoenixEventIdentityPatchStore,
+        + PhoenixEventIdentityPatchStore
+        + PhoenixTemporalPatchStore,
 {
     pub fn derive_batches(
         &self,

@@ -1,23 +1,25 @@
 use phoenix_graph_kernel::{
     entity_timeline_from_snapshot, what_changed_from_snapshot, KernelEdge, KernelQueryView,
-    KernelStateIssue, KernelVertex, KernelViewRequest, KernelWhatChangedRequest,
+    KernelRegionProfile, KernelStateIssue, KernelVertex, KernelViewRequest,
+    KernelWhatChangedRequest,
 };
 use phoenix_store_native_core::{
     PhoenixGraphPatchStore, PhoenixSemanticGraphPatchStore, PhoenixSemanticIndexStore,
 };
 use phoenix_types::ScopeKey;
 
-use crate::api::{
-    load_projection_kernel, rank_history_answer, GraphHistoryQueryRequest, GraphQueryError,
-};
+use crate::api::{rank_history_answer, GraphHistoryQueryRequest, GraphQueryError};
 use crate::phase4_graph_scoring::apply_graph_structural_history;
 use crate::phase4_scoring::apply_phase4_history;
+use crate::query_session::ScopeQuerySession;
 use crate::retrieval::{
-    GraphRetrievedHistoryAnswer, GraphRetrievedHistoryQueryRequest, GraphRetrievedSeed,
+    open_retrieved_query_session, GraphRetrievedHistoryAnswer, GraphRetrievedHistoryQueryRequest,
+    GraphRetrievedSeed,
 };
 use crate::retrieval_common::{
-    build_region_from_snapshot, build_region_from_view, now_ms, retrieve_query_seeds,
+    build_region_from_snapshot, build_region_from_view_profile, now_ms, retrieve_query_seeds,
 };
+use crate::runtime_telemetry::{measure_graph_runtime, GraphRuntimeMetric};
 
 const HISTORY_RETRIEVAL_KINDS: [&str; 5] = ["state", "claim", "event", "chunk", "entity"];
 
@@ -29,19 +31,31 @@ pub(crate) fn retrieved_history_impl<S>(
 where
     S: PhoenixGraphPatchStore + PhoenixSemanticGraphPatchStore + PhoenixSemanticIndexStore,
 {
-    let Some(kernel) = load_projection_kernel(store, scope)? else {
+    let Some(session) = open_retrieved_query_session(store, scope)? else {
         return Ok(None);
     };
+    retrieved_history_with_session_impl(store, &session, request)
+}
+
+pub(crate) fn retrieved_history_with_session_impl<S>(
+    store: &S,
+    session: &ScopeQuerySession,
+    request: &GraphRetrievedHistoryQueryRequest,
+) -> Result<Option<GraphRetrievedHistoryAnswer>, GraphQueryError>
+where
+    S: PhoenixSemanticIndexStore,
+{
+    let _timer = measure_graph_runtime(GraphRuntimeMetric::RetrievedHistory);
     let seeds = retrieve_query_seeds(
         store,
-        scope,
+        session.scope(),
         request.query_text.as_str(),
         &HISTORY_RETRIEVAL_KINDS,
         request.seed_limit,
         request.oversample,
     )?;
     let until_valid_at = request.until_valid_at.unwrap_or_else(now_ms);
-    let view = kernel.query_view(KernelViewRequest {
+    let view = session.kernel().query_view(KernelViewRequest {
         valid_at: Some(until_valid_at),
         recorded_at: request.recorded_at,
         include_candidate_graph: request.include_candidate_graph,
@@ -78,7 +92,9 @@ where
         &query,
         until_valid_at,
         &timeline.vertices,
-        &region_snapshot.candidate_edges,
+        &timeline.vertices,
+        &timeline.asserted_edges,
+        &timeline.candidate_edges,
         &changes,
         &timeline_issues(
             &timeline.vertices,
@@ -162,13 +178,14 @@ pub(crate) fn build_history_region_from_view(
         })
         .map(|vertex| vertex.id.0.clone())
         .collect::<Vec<_>>();
-    build_region_from_view(
+    build_region_from_view_profile(
         view,
         anchors,
         seeds,
         request.region_node_limit,
         request.expansion_hops,
         history_edge_allowed,
+        KernelRegionProfile::History,
     )
 }
 

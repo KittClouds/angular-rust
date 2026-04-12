@@ -17,6 +17,7 @@ tokenizers = { version = "0.22.2", default-features = false, features = ["onig"]
 rustc-hash.workspace = true
 phoenix-alex = { path = "../phoenix-alex" }
 phoenix-chunker = { path = "../phoenix-chunker" }
+phoenix-scope-analysis = { path = "../phoenix-scope-analysis" }
 phoenix-semantic-v2 = { path = "../phoenix-semantic-v2" }
 phoenix-store-native-core = { path = "../phoenix-store-native-core" }
 phoenix-store-overgraph = { path = "../phoenix-store-overgraph" }

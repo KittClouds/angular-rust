@@ -15,9 +15,14 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub mod schema;
+mod scope_runtime;
 pub use schema::{
     PhoenixColumnSpec, PhoenixColumnType, PhoenixRelationSpec, ALL_RELATIONS,
     CONTENT_SNAPSHOT_RELATIONS, DERIVED_SNAPSHOT_RELATIONS,
+};
+pub use scope_runtime::{
+    ArchiveSegmentMask, PhoenixScopeRuntimeStore, ScopeImageSpec, ScopeRuntimeImage,
+    ScopeRuntimeIndices, ScopeSidecarBundle, ScopeSidecarMask,
 };
 
 pub const SEMANTIC_VECTOR_DIM: usize = 384;
@@ -634,6 +639,7 @@ pub trait PhoenixSemanticIndexStore {
         limit: usize,
         oversample: usize,
     ) -> Result<Vec<SemanticNodeNeighbor>, StoreError>;
+    fn warm_semantic_node_index(&self, scope: &ScopeKey, kind: &str) -> Result<(), StoreError>;
     fn load_semantic_document_vector_records(
         &self,
         document_ids: &[String],

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use phoenix_scope_analysis::ScopeAnalysisContext;
 use phoenix_semantic_v2::{
     default_state_slot_definitions, default_state_slot_families, DocumentArchive,
     RelationScopePatchSidecar, StateSlotDefinitionRecord, StateSlotFamilyRecord,
@@ -190,6 +191,167 @@ pub fn normalize_state_schema_inputs(
                 positive: true,
             });
         }
+    }
+
+    StateSchemaNormalizedInputs {
+        slot_families,
+        seed_slot_definitions,
+        evidence_rows,
+        diagnostics,
+    }
+}
+
+pub fn normalize_state_schema_inputs_from_analysis(
+    analysis: &ScopeAnalysisContext,
+    relation_sidecar: Option<&RelationScopePatchSidecar>,
+) -> StateSchemaNormalizedInputs {
+    let slot_families = default_state_slot_families();
+    let seed_slot_definitions = default_state_slot_definitions();
+    let label_by_entity = analysis.label_by_entity.as_ref();
+    let seed_by_relation = seed_definitions_by_relation(&seed_slot_definitions);
+    let mut evidence_rows = Vec::new();
+    let mut diagnostics = BTreeMap::<String, usize>::new();
+
+    if let Some(sidecar) = relation_sidecar {
+        for edge in &sidecar.edge_additions {
+            let spec = classify_relation_family(&edge.edge_type, &seed_by_relation);
+            if should_filter_discovered_relation(&edge.edge_type, &spec.family_key) {
+                *diagnostics
+                    .entry(format!("filtered_relation_family:{}", edge.edge_type))
+                    .or_default() += 1;
+                continue;
+            }
+            evidence_rows.push(StateSchemaEvidenceRow {
+                slot_key: spec.slot_key,
+                family_key: spec.family_key,
+                relation_family: edge.edge_type.clone(),
+                source_document_id: edge.document_id.clone(),
+                source_entity_id: edge.source_entity_id.clone(),
+                target_entity_id: Some(edge.target_entity_id.clone()),
+                target_label: label_by_entity
+                    .get(&edge.target_entity_id.0)
+                    .cloned()
+                    .unwrap_or_else(|| edge.target_entity_id.0.clone()),
+                owner_type: spec.owner_type,
+                value_type: spec.value_type,
+                confidence_millis: edge.confidence_millis,
+                created_at: edge.created_at,
+                source_class: "relation_edge_addition".to_owned(),
+                positive: true,
+            });
+            *diagnostics
+                .entry(format!("relation_family:{}", edge.edge_type))
+                .or_default() += 1;
+        }
+
+        for judgment in &sidecar.support_judgments {
+            let spec = classify_relation_family(&judgment.edge_type, &seed_by_relation);
+            if should_filter_discovered_relation(&judgment.edge_type, &spec.family_key) {
+                *diagnostics
+                    .entry(format!("filtered_relation_family:{}", judgment.edge_type))
+                    .or_default() += 1;
+                continue;
+            }
+            evidence_rows.push(StateSchemaEvidenceRow {
+                slot_key: spec.slot_key,
+                family_key: spec.family_key,
+                relation_family: judgment.edge_type.clone(),
+                source_document_id: judgment.document_id.clone(),
+                source_entity_id: judgment.source_entity_id.clone(),
+                target_entity_id: Some(judgment.target_entity_id.clone()),
+                target_label: label_by_entity
+                    .get(&judgment.target_entity_id.0)
+                    .cloned()
+                    .unwrap_or_else(|| judgment.target_entity_id.0.clone()),
+                owner_type: spec.owner_type,
+                value_type: spec.value_type,
+                confidence_millis: judgment.confidence_millis,
+                created_at: judgment.created_at,
+                source_class: "relation_support_judgment".to_owned(),
+                positive: true,
+            });
+        }
+
+        for judgment in &sidecar.contradiction_judgments {
+            let spec = classify_relation_family(&judgment.edge_type, &seed_by_relation);
+            if should_filter_discovered_relation(&judgment.edge_type, &spec.family_key) {
+                *diagnostics
+                    .entry(format!("filtered_relation_family:{}", judgment.edge_type))
+                    .or_default() += 1;
+                continue;
+            }
+            evidence_rows.push(StateSchemaEvidenceRow {
+                slot_key: spec.slot_key,
+                family_key: spec.family_key,
+                relation_family: judgment.edge_type.clone(),
+                source_document_id: judgment.document_id.clone(),
+                source_entity_id: judgment.source_entity_id.clone(),
+                target_entity_id: Some(judgment.target_entity_id.clone()),
+                target_label: label_by_entity
+                    .get(&judgment.target_entity_id.0)
+                    .cloned()
+                    .unwrap_or_else(|| judgment.target_entity_id.0.clone()),
+                owner_type: spec.owner_type,
+                value_type: spec.value_type,
+                confidence_millis: judgment.confidence_millis,
+                created_at: judgment.created_at,
+                source_class: "relation_contradiction_judgment".to_owned(),
+                positive: false,
+            });
+        }
+    }
+
+    let mut archived_relation_keys = BTreeSet::new();
+    for row in &evidence_rows {
+        archived_relation_keys.insert((
+            row.source_document_id.clone(),
+            row.source_entity_id.0.clone(),
+            row.target_entity_id
+                .as_ref()
+                .map(|value| value.0.clone())
+                .unwrap_or_default(),
+            row.relation_family.clone(),
+        ));
+    }
+
+    for archived in analysis.archived_relations.iter() {
+        let key = (
+            archived.document_id.clone(),
+            archived.relation.source_entity_id.0.clone(),
+            archived.relation.target_entity_id.0.clone(),
+            archived.relation.edge_type.clone(),
+        );
+        if archived_relation_keys.contains(&key) {
+            continue;
+        }
+        let spec = classify_relation_family(&archived.relation.edge_type, &seed_by_relation);
+        if should_filter_discovered_relation(&archived.relation.edge_type, &spec.family_key) {
+            *diagnostics
+                .entry(format!(
+                    "filtered_relation_family:{}",
+                    archived.relation.edge_type
+                ))
+                .or_default() += 1;
+            continue;
+        }
+        evidence_rows.push(StateSchemaEvidenceRow {
+            slot_key: spec.slot_key,
+            family_key: spec.family_key,
+            relation_family: archived.relation.edge_type.clone(),
+            source_document_id: archived.document_id.clone(),
+            source_entity_id: archived.relation.source_entity_id.clone(),
+            target_entity_id: Some(archived.relation.target_entity_id.clone()),
+            target_label: label_by_entity
+                .get(&archived.relation.target_entity_id.0)
+                .cloned()
+                .unwrap_or_else(|| archived.relation.target_entity_id.0.clone()),
+            owner_type: spec.owner_type,
+            value_type: spec.value_type,
+            confidence_millis: 500,
+            created_at: archived.created_at,
+            source_class: "archive_relation".to_owned(),
+            positive: true,
+        });
     }
 
     StateSchemaNormalizedInputs {

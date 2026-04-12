@@ -8,8 +8,13 @@ authors.workspace = true
 [dependencies]
 compact_str.workspace = true
 memchr.workspace = true
+memmap2 = "0.9"
 rustc-hash.workspace = true
-scirs2-text = "0.4.1"
+scirs2-text = { version = "0.4.1", features = ["simd"] }
+serde_json.workspace = true
 smallvec.workspace = true
+thiserror.workspace = true
+phoenix-chunker = { path = "../phoenix-chunker" }
+phoenix-embed = { path = "../phoenix-embed" }
 phoenix-types = { path = "../phoenix-types" }
 serde.workspace = true

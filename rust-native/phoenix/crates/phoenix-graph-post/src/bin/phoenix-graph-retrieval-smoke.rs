@@ -1,7 +1,6 @@
 use std::env;
 use std::path::PathBuf;
 
-use phoenix_graph_kernel::KernelVertex;
 use phoenix_graph_post::api::{
     retrieved_causal_explanation, retrieved_history, retrieved_world_state,
     GraphRetrievedCausalExplanationQueryRequest, GraphRetrievedHistoryQueryRequest,
@@ -10,6 +9,10 @@ use phoenix_graph_post::api::{
 use phoenix_graph_post::semantic_graph::{
     derive_semantic_graph_review_batch_from_store, persist_semantic_graph_patch_sidecar,
     SemanticGraphConfig,
+};
+use phoenix_graph_post::smoke_support::{
+    discover_causal_target, discover_world_anchor, now_ms, string_arg, usize_arg, CausalTarget,
+    WorldAnchor,
 };
 use phoenix_graph_post::{
     derive_scope_review_batch, persist_graph_patch_sidecar, SemanticNliConfig,
@@ -22,7 +25,6 @@ use phoenix_store_native_core::{
 use phoenix_store_overgraph::PhoenixOvergraphStore;
 use phoenix_types::ScopeKey;
 use serde::Serialize;
-use serde_json::Value;
 
 #[derive(Clone, Debug)]
 struct SmokeConfig {
@@ -35,20 +37,9 @@ struct SmokeConfig {
     region_node_limit: usize,
     history_limit: usize,
     causal_limit: usize,
+    world_anchor: Option<WorldAnchor>,
+    causal_target: Option<CausalTarget>,
     graph: SemanticGraphConfig,
-}
-
-#[derive(Clone, Debug)]
-struct WorldAnchor {
-    entity_id: String,
-    slot_key: String,
-    query_text: String,
-}
-
-#[derive(Clone, Debug)]
-struct CausalTarget {
-    vertex_id: String,
-    query_text: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -146,9 +137,14 @@ fn run(config: SmokeConfig) -> Result<SmokeReport, String> {
                 .flatten()
                 .map(|manifest| manifest.metric)
         });
-    let vertices = graph_sidecar.graph_batch.vertices.as_slice();
-    let world_anchor = discover_world_anchor(vertices);
-    let causal_target = discover_causal_target(vertices);
+    let world_anchor = config
+        .world_anchor
+        .clone()
+        .or_else(|| discover_world_anchor(&graph_sidecar.graph_batch.vertices));
+    let causal_target = config
+        .causal_target
+        .clone()
+        .or_else(|| discover_causal_target(&graph_sidecar.graph_batch.vertices));
 
     let (world_state, world_state_error) = match world_anchor.as_ref() {
         Some(anchor) => match retrieved_world_state(
@@ -375,69 +371,6 @@ fn ensure_semantic_sidecar(
     Ok(batch.sidecar)
 }
 
-fn discover_world_anchor(vertices: &[KernelVertex]) -> Option<WorldAnchor> {
-    vertices
-        .iter()
-        .filter(|vertex| matches!(vertex.kind.as_str(), "state" | "claim"))
-        .find_map(|vertex| {
-            let entity_id = vertex.entity_id.as_ref()?;
-            let slot_key = slot_key_of(vertex)?;
-            Some(WorldAnchor {
-                entity_id: entity_id.clone(),
-                slot_key: slot_key.to_owned(),
-                query_text: format!("current {} for {}", slot_key, entity_id),
-            })
-        })
-}
-
-fn discover_causal_target(vertices: &[KernelVertex]) -> Option<CausalTarget> {
-    vertices
-        .iter()
-        .find(|vertex| vertex.kind == "event")
-        .or_else(|| vertices.iter().find(|vertex| vertex.kind == "claim"))
-        .map(|vertex| CausalTarget {
-            vertex_id: vertex.id.0.clone(),
-            query_text: format!("what led to {}", describe_vertex(vertex)),
-        })
-}
-
-fn slot_key_of(vertex: &KernelVertex) -> Option<&str> {
-    string_attr(&vertex.value, "slotKey").or_else(|| string_attr(&vertex.attributes, "slotKey"))
-}
-
-fn describe_vertex(vertex: &KernelVertex) -> String {
-    let mut parts = Vec::new();
-    if !vertex.labels.is_empty() {
-        parts.push(vertex.labels.join(" "));
-    }
-    for key in [
-        "kind",
-        "slotKey",
-        "value",
-        "status",
-        "oldValue",
-        "newValue",
-        "objectValue",
-    ] {
-        if let Some(value) =
-            string_attr(&vertex.value, key).or_else(|| string_attr(&vertex.attributes, key))
-        {
-            if !value.is_empty() {
-                parts.push(value.to_owned());
-            }
-        }
-    }
-    if parts.is_empty() {
-        vertex.id.0.clone()
-    } else {
-        parts.join(" ")
-    }
-}
-
-fn string_attr<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str)
-}
-
 fn parse_args(args: Vec<String>) -> SmokeConfig {
     let mut config = SmokeConfig {
         store_path: PathBuf::new(),
@@ -449,6 +382,8 @@ fn parse_args(args: Vec<String>) -> SmokeConfig {
         region_node_limit: 160,
         history_limit: 8,
         causal_limit: 6,
+        world_anchor: None,
+        causal_target: None,
         graph: SemanticGraphConfig::default(),
     };
     if let Some(path) = string_arg(&args, "--store-path") {
@@ -486,6 +421,26 @@ fn parse_args(args: Vec<String>) -> SmokeConfig {
             review_threshold_millis: 560,
         });
     }
+    if let (Some(entity_id), Some(slot_key)) = (
+        string_arg(&args, "--entity-id"),
+        string_arg(&args, "--slot-key"),
+    ) {
+        let query_text = string_arg(&args, "--world-query-text")
+            .unwrap_or_else(|| format!("current {} for {}", slot_key, entity_id));
+        config.world_anchor = Some(WorldAnchor {
+            entity_id,
+            slot_key,
+            query_text,
+        });
+    }
+    if let Some(vertex_id) = string_arg(&args, "--causal-target-id") {
+        let query_text = string_arg(&args, "--causal-query-text")
+            .unwrap_or_else(|| format!("what led to {}", vertex_id));
+        config.causal_target = Some(CausalTarget {
+            vertex_id,
+            query_text,
+        });
+    }
     if args.iter().any(|arg| arg == "--refresh-graph") {
         config.refresh_graph = true;
     }
@@ -493,20 +448,4 @@ fn parse_args(args: Vec<String>) -> SmokeConfig {
         config.refresh_semantic = true;
     }
     config
-}
-
-fn string_arg(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find_map(|window| (window[0] == flag).then(|| window[1].clone()))
-}
-
-fn usize_arg(args: &[String], flag: &str) -> Option<usize> {
-    string_arg(args, flag).and_then(|value| value.parse::<usize>().ok())
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }

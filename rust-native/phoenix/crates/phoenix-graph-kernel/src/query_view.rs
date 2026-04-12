@@ -1,9 +1,8 @@
 use crate::{
-    now_ms, KernelEdge, KernelExpandedRegion, KernelGraphSnapshot, KernelVertex,
-    KernelViewRequest, PhoenixGraphKernel,
+    chrono_region::expand_region_for_view, now_ms, KernelEdge, KernelExpandedRegion,
+    KernelRegionProfile, KernelVertex, KernelViewRequest, PhoenixGraphKernel,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
-use scirs2_graph::CsrGraph;
+use rustc_hash::FxHashSet;
 
 pub struct KernelQueryView<'a> {
     vertices: Vec<&'a KernelVertex>,
@@ -39,116 +38,34 @@ impl<'a> KernelQueryView<'a> {
         expansion_hops: usize,
         edge_allowed: fn(&KernelEdge) -> bool,
     ) -> KernelExpandedRegion {
-        let dense = self
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(index, vertex)| (vertex.id.0.as_str(), index))
-            .collect::<FxHashMap<_, _>>();
-        let seed_vertex_ids = seed_vertex_ids
-            .iter()
-            .filter(|vertex_id| dense.contains_key(vertex_id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if self.vertices.is_empty() {
-            return KernelExpandedRegion {
-                snapshot: KernelGraphSnapshot::default(),
-                seed_vertex_ids,
-                included_vertex_ids: Vec::new(),
-                truncated: false,
-            };
-        }
-
-        let traversal_edges = collect_traversal_edges(
-            self.asserted_edges.iter().copied(),
-            self.candidate_edges.iter().copied(),
-            &dense,
-            edge_allowed,
-        );
-        let graph = build_region_graph(self.vertices.len(), traversal_edges.as_slice());
-        let node_limit = region_node_limit.clamp(8, 256);
-        let max_hops = expansion_hops.clamp(1, 4);
-        let mut included = vec![false; self.vertices.len()];
-        let mut frontier = Vec::<usize>::new();
-        for vertex_id in anchor_vertex_ids.iter().chain(seed_vertex_ids.iter()) {
-            if let Some(&index) = dense.get(vertex_id.as_str()) {
-                if !included[index] {
-                    included[index] = true;
-                    frontier.push(index);
-                }
-            }
-        }
-
-        let mut included_count = frontier.len();
-        let mut truncated = false;
-        for _ in 0..max_hops {
-            if frontier.is_empty() || included_count >= node_limit {
-                break;
-            }
-            let mut next_frontier = Vec::new();
-            for vertex_index in frontier.drain(..) {
-                for (neighbor, _) in graph.neighbors(vertex_index) {
-                    if included[neighbor] {
-                        continue;
-                    }
-                    if included_count >= node_limit {
-                        truncated = true;
-                        continue;
-                    }
-                    included[neighbor] = true;
-                    included_count += 1;
-                    next_frontier.push(neighbor);
-                }
-            }
-            frontier = next_frontier;
-        }
-
-        let mut vertices = self
-            .vertices
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| included[*index])
-            .map(|(_, vertex)| (*vertex).clone())
-            .collect::<Vec<_>>();
-        let mut asserted_edges =
-            materialize_edges(self.asserted_edges.iter().copied(), &dense, &included, edge_allowed);
-        let mut candidate_edges = materialize_edges(
-            self.candidate_edges.iter().copied(),
-            &dense,
-            &included,
-            edge_allowed,
-        );
-        vertices.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-        asserted_edges.sort_by(|left, right| {
-            left.source_id
-                .0
-                .cmp(&right.source_id.0)
-                .then_with(|| left.target_id.0.cmp(&right.target_id.0))
-                .then_with(|| left.edge_type.0.cmp(&right.edge_type.0))
-        });
-        candidate_edges.sort_by(|left, right| {
-            left.source_id
-                .0
-                .cmp(&right.source_id.0)
-                .then_with(|| left.target_id.0.cmp(&right.target_id.0))
-                .then_with(|| left.edge_type.0.cmp(&right.edge_type.0))
-        });
-        let mut included_vertex_ids = vertices
-            .iter()
-            .map(|vertex| vertex.id.0.clone())
-            .collect::<Vec<_>>();
-        included_vertex_ids.sort();
-
-        KernelExpandedRegion {
-            snapshot: KernelGraphSnapshot {
-                vertices,
-                asserted_edges,
-                candidate_edges,
-            },
+        self.expand_region_with_profile(
+            anchor_vertex_ids,
             seed_vertex_ids,
-            included_vertex_ids,
-            truncated,
-        }
+            region_node_limit,
+            expansion_hops,
+            edge_allowed,
+            KernelRegionProfile::Generic,
+        )
+    }
+
+    pub fn expand_region_with_profile(
+        &self,
+        anchor_vertex_ids: &[String],
+        seed_vertex_ids: &[String],
+        region_node_limit: usize,
+        expansion_hops: usize,
+        edge_allowed: fn(&KernelEdge) -> bool,
+        profile: KernelRegionProfile,
+    ) -> KernelExpandedRegion {
+        expand_region_for_view(
+            self,
+            anchor_vertex_ids,
+            seed_vertex_ids,
+            region_node_limit,
+            expansion_hops,
+            edge_allowed,
+            profile,
+        )
     }
 }
 
@@ -255,70 +172,6 @@ impl PhoenixGraphKernel {
     }
 }
 
-fn collect_traversal_edges<'a>(
-    asserted_edges: impl Iterator<Item = &'a KernelEdge>,
-    candidate_edges: impl Iterator<Item = &'a KernelEdge>,
-    dense: &FxHashMap<&'a str, usize>,
-    edge_allowed: fn(&KernelEdge) -> bool,
-) -> Vec<(usize, usize, f64)> {
-    let mut seen = FxHashSet::default();
-    let mut edges = Vec::new();
-    for edge in asserted_edges.chain(candidate_edges).filter(|edge| edge_allowed(edge)) {
-        let Some(&source) = dense.get(edge.source_id.0.as_str()) else {
-            continue;
-        };
-        let Some(&target) = dense.get(edge.target_id.0.as_str()) else {
-            continue;
-        };
-        if source == target {
-            continue;
-        }
-        let key = undirected_key(source, target);
-        if !seen.insert(key) {
-            continue;
-        }
-        let weight = edge.weight.max(1) as f64;
-        edges.push((source, target, weight));
-    }
-    edges
-}
-
-fn materialize_edges<'a>(
-    edges: impl Iterator<Item = &'a KernelEdge>,
-    dense: &FxHashMap<&'a str, usize>,
-    included: &[bool],
-    edge_allowed: fn(&KernelEdge) -> bool,
-) -> Vec<crate::KernelEdge> {
-    edges
-        .filter(|edge| edge_allowed(edge))
-        .filter(|edge| {
-            let Some(&source) = dense.get(edge.source_id.0.as_str()) else {
-                return false;
-            };
-            let Some(&target) = dense.get(edge.target_id.0.as_str()) else {
-                return false;
-            };
-            included[source] && included[target]
-        })
-        .cloned()
-        .collect::<Vec<_>>()
-}
-
-fn build_region_graph(num_nodes: usize, edges: &[(usize, usize, f64)]) -> CsrGraph {
-    CsrGraph::from_edges_parallel(num_nodes, edges.to_vec(), false)
-        .or_else(|_| CsrGraph::from_edges(num_nodes, edges.to_vec(), false))
-        .expect("query-view region graph should build")
-}
-
-fn undirected_key(left: usize, right: usize) -> u64 {
-    let (small, large) = if left <= right {
-        (left as u64, right as u64)
-    } else {
-        (right as u64, left as u64)
-    };
-    (small << 32) | large
-}
-
 #[cfg(test)]
 mod tests {
     use super::PhoenixGraphKernel;
@@ -368,13 +221,10 @@ mod tests {
             include_candidate_graph: true,
             ..KernelViewRequest::default()
         });
-        let region = view.expand_region(
-            &["entity".to_owned()],
-            &["event".to_owned()],
-            8,
-            3,
-            |_| true,
-        );
+        let region =
+            view.expand_region(&["entity".to_owned()], &["event".to_owned()], 8, 3, |_| {
+                true
+            });
 
         assert_eq!(view.vertices().len(), 4);
         assert_eq!(region.snapshot.vertices.len(), 4);

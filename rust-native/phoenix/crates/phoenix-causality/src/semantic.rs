@@ -96,6 +96,7 @@ fn is_event_proposition(proposition: &Proposition) -> bool {
         || relation.contains("action")
         || is_event_relation_family(relation.as_str())
         || is_event_predicate(predicate.as_str())
+        || is_generic_relates_to_event(relation.as_str(), predicate.as_str())
 }
 
 fn is_state_proposition(proposition: &Proposition) -> bool {
@@ -120,6 +121,10 @@ fn normalize_semantic_label(value: &str) -> String {
         normalized.push(next);
     }
     normalized.trim_matches('_').to_owned()
+}
+
+fn is_generic_relates_to_event(relation: &str, predicate: &str) -> bool {
+    relation == "relates_to" && !predicate.is_empty() && !is_state_predicate(predicate)
 }
 
 fn is_state_predicate(predicate: &str) -> bool {
@@ -353,5 +358,19 @@ mod tests {
         let bundle = SemanticLowerer::lower(&[proposition("attacked", "attacks")]);
         assert_eq!(bundle.events.len(), 1);
         assert!(bundle.states.is_empty());
+    }
+
+    #[test]
+    fn lower_treats_generic_relates_to_verbs_as_events() {
+        let bundle = SemanticLowerer::lower(&[proposition("reinforced", "relates_to")]);
+        assert_eq!(bundle.events.len(), 1);
+        assert!(bundle.claims.is_empty());
+    }
+
+    #[test]
+    fn lower_keeps_generic_relates_to_work_predicates_stateful() {
+        let bundle = SemanticLowerer::lower(&[proposition("worked", "relates_to")]);
+        assert_eq!(bundle.states.len(), 1);
+        assert!(bundle.events.is_empty());
     }
 }

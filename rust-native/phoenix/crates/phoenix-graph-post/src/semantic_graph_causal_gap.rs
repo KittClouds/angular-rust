@@ -5,25 +5,18 @@ use phoenix_semantic_v2::{
     GraphScopeSidecar, SemanticCandidateStatus, SemanticEdgeFamily, SemanticGraphEdgeCandidate,
     SemanticGraphNodeKind,
 };
-use phoenix_store_native_core::PhoenixSemanticIndexStore;
-use phoenix_types::ScopeKey;
 
-use crate::semantic_graph::SemanticGraphError;
 use crate::semantic_graph_support::{truth_planes_compatible, Prototype, EVENT_KIND};
+use crate::semantic_graph_workspace::SemanticNeighborWorkspace;
 
-pub(crate) fn collect_missing_intermediate_cause_edges_from_store<S>(
-    store: &S,
-    scope: &ScopeKey,
+pub(crate) fn collect_missing_intermediate_cause_edges(
+    workspace: &mut SemanticNeighborWorkspace<'_>,
     prototypes: &[Prototype],
-    embeddings: &[Vec<f32>],
     graph_sidecar: Option<&GraphScopeSidecar>,
     neighbor_limit: usize,
     oversample: usize,
     min_score_millis: u32,
-) -> Result<Vec<SemanticGraphEdgeCandidate>, SemanticGraphError>
-where
-    S: PhoenixSemanticIndexStore,
-{
+) -> Vec<SemanticGraphEdgeCandidate> {
     let prototype_by_id = prototypes
         .iter()
         .map(|prototype| (prototype.node_id.as_str(), prototype))
@@ -36,18 +29,16 @@ where
         .unwrap_or_default();
     let mut seen = HashSet::new();
     let mut edges = Vec::new();
-    for (source, embedding) in prototypes.iter().zip(embeddings.iter()) {
+    for (source_index, source) in prototypes.iter().enumerate() {
         if source.node_kind != SemanticGraphNodeKind::Event {
             continue;
         }
-        let hits = store.query_semantic_node_neighbors(
-            embedding,
-            scope,
+        let hits = workspace.query_semantic_node_neighbors(
+            source_index,
             EVENT_KIND,
-            Some(&source.node_id),
             neighbor_limit,
             oversample,
-        )?;
+        );
         for hit in hits {
             let Some(target) = prototype_by_id.get(hit.node_id.as_str()) else {
                 continue;
@@ -90,7 +81,7 @@ where
         }
     }
     edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
-    Ok(edges)
+    edges
 }
 
 fn missing_cause_compatible<'a>(

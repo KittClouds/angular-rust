@@ -5,7 +5,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
-use memchr::memchr3_iter;
 use phoenix_alex::Lexicon;
 use phoenix_causality::{CausalityLowerer, CausalityRequest, SemanticLowerer};
 use phoenix_chunker::{build_chunks, ChunkerConfig};
@@ -14,7 +13,9 @@ use phoenix_kernel::{
     KernelGraphLayer, KernelGraphSnapshot, KernelMutationBatch, KernelMutationScope,
     KernelProvenance, KernelResolutionFacet, KernelVertex, KernelVertexId,
 };
-use phoenix_machine::SurfaceCompileArtifacts;
+use phoenix_machine::{
+    MachineConfig, MachineExtractionConfig, SurfaceCompileArtifacts, SurfaceCompiler,
+};
 use phoenix_proposition::PropositionLowerer;
 use phoenix_semantic_v2::{
     scope_storage_key, AliasConfirmation, AliasEntry, AliasPosting, CandidateEntity,
@@ -37,11 +38,11 @@ use phoenix_store_native_core::{
 };
 use phoenix_time::TimeKernel;
 use phoenix_types::{
-    BiTemporalWindow, BoundaryKind, ChunkKind, ChunkSpan, Diagnostic, DocumentId, EntityId,
+    BiTemporalWindow, BoundaryKind, ChunkSpan, Diagnostic, DocumentId, EntityId,
     EntityKind, EvidenceSpan, FrameSlot, IndexedSpan, IndexedTextField, IngestDocument,
     IngestDocumentSummary, IngestResult, KnownMatch, KnownMatchSource, LexicalField, LexiconEntry,
-    MentionEntityRef, MentionSource, MentionSpan, NarrativeTransitivity, NarrativeVerbHit, PosTag,
-    RelationCandidate, ResolverEntitySeed, ResolverLink, ResolverLinkKind, ScanArtifact, ScopeKey,
+    MentionEntityRef, MentionSource, MentionSpan, NarrativeVerbHit, PosTag, RelationCandidate,
+    ResolverEntitySeed, ResolverLink, ResolverLinkKind, ScanArtifact, ScopeKey,
     SemanticNodeRef, SentenceFrame, SentenceSpan, SessionDocumentState, SessionId,
     StructureArtifact, TextRange, TokenClass, TokenSpan, VerbFrame,
 };
@@ -61,6 +62,10 @@ use std::time::Instant;
 use stop_words::{get, LANGUAGE};
 #[cfg(feature = "background-verifier")]
 use thiserror::Error;
+
+mod bench;
+
+pub use bench::{IngestBenchmarkCounts, IngestBenchmarkReport};
 
 #[cfg(feature = "background-verifier")]
 use gliner::model::input::text::TextInput;
@@ -156,6 +161,22 @@ impl Default for InvarantV3CorefConfig {
     }
 }
 
+fn machine_extraction_config(
+    extraction: &InvarantV3ExtractionConfig,
+) -> MachineExtractionConfig {
+    MachineExtractionConfig {
+        enable_scirs2_rule_ner: extraction.enable_scirs2_rule_ner,
+        enable_scirs2_pattern_ner: extraction.enable_scirs2_pattern_ner,
+        enable_native_refinement: extraction.enable_native_refinement,
+    }
+}
+
+fn machine_compiler_for_extraction(extraction: &InvarantV3ExtractionConfig) -> SurfaceCompiler {
+    SurfaceCompiler::new(MachineConfig {
+        extraction: machine_extraction_config(extraction),
+    })
+}
+
 fn encode_archive<T: Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
     let payload =
         rmp_serde::to_vec_named(value).map_err(|error| StoreError::Query(error.to_string()))?;
@@ -231,106 +252,8 @@ fn scope_lex_sidecar_header(
     }
 }
 
-fn tokenize(text: &str) -> Vec<TokenSpan> {
-    let mut tokens = Vec::new();
-    let mut chars = text.char_indices().peekable();
-    while let Some((start, ch)) = chars.next() {
-        if ch.is_whitespace() {
-            continue;
-        }
-        if ch.is_alphanumeric() || ch == '\'' || ch == '-' {
-            let mut end = start + ch.len_utf8();
-            while let Some((next_ix, next)) = chars.peek().copied() {
-                if next.is_alphanumeric() || next == '\'' || next == '-' {
-                    chars.next();
-                    end = next_ix + next.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let token = &text[start..end];
-            let lower = token.to_ascii_lowercase();
-            let pos = if is_pronoun(&lower) {
-                Some(PosTag::Pronoun)
-            } else if is_verb_token(&lower) {
-                Some(PosTag::Verb)
-            } else if token
-                .chars()
-                .next()
-                .is_some_and(|value| value.is_uppercase())
-            {
-                Some(PosTag::ProperNoun)
-            } else {
-                Some(PosTag::Noun)
-            };
-            tokens.push(TokenSpan {
-                range: to_range(start, end),
-                token_class: Some(if token.chars().all(|value| value.is_numeric()) {
-                    TokenClass::Number
-                } else {
-                    TokenClass::Word
-                }),
-                pos,
-                masked: false,
-                capitalized: token
-                    .chars()
-                    .next()
-                    .is_some_and(|value| value.is_uppercase()),
-            });
-        } else {
-            tokens.push(TokenSpan {
-                range: to_range(start, start + ch.len_utf8()),
-                token_class: Some(if ch.is_ascii_punctuation() {
-                    TokenClass::Punctuation
-                } else {
-                    TokenClass::Symbol
-                }),
-                pos: Some(PosTag::Punctuation),
-                masked: false,
-                capitalized: false,
-            });
-        }
-    }
-    tokens
-}
-
-fn sentence_spans(text: &str) -> Vec<SentenceSpan> {
-    if text.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut ranges = Vec::new();
-    let mut current_start = 0usize;
-    for boundary in memchr3_iter(b'.', b'!', b'?', text.as_bytes()) {
-        let end = boundary + 1;
-        let trimmed_start = trim_start_offset(text, current_start, end);
-        let trimmed_end = trim_end_offset(text, trimmed_start, end);
-        if trimmed_start < trimmed_end {
-            ranges.push((trimmed_start, trimmed_end));
-        }
-        current_start = end;
-    }
-    if current_start < text.len() {
-        let trimmed_start = trim_start_offset(text, current_start, text.len());
-        let trimmed_end = trim_end_offset(text, trimmed_start, text.len());
-        if trimmed_start < trimmed_end {
-            ranges.push((trimmed_start, trimmed_end));
-        }
-    }
-    ranges
-        .into_iter()
-        .enumerate()
-        .map(|(index, (start, end))| SentenceSpan {
-            index,
-            range: to_range(start, end),
-        })
-        .collect()
-}
-
 const RULE_NER_MAX_BYTES_WITHOUT_SEEDS: usize = 256 * 1024;
 const HOT_PATH_PATTERN_NER_MAX_BYTES: usize = 512 * 1024;
-const SCAN_WINDOW_TARGET_BYTES: usize = 256 * 1024;
-const SCAN_WINDOW_OVERLAP_SENTENCES: usize = 8;
-const SCAN_WINDOW_MIN_SENTENCES: usize = 128;
 const EXPENSIVE_NER_SENTENCE_PAD: usize = 1;
 const EXPENSIVE_NER_MAX_SENTENCE_FRACTION_DIVISOR: usize = 8;
 const EXPENSIVE_NER_MAX_SENTENCES_ABSOLUTE: usize = 4096;
@@ -379,22 +302,6 @@ struct SentenceNeed {
     has_discourse_cue: bool,
     proposal_count: u16,
     named_like_count: u16,
-}
-
-#[derive(Clone, Debug)]
-struct ScanWindowPlan {
-    window_ix: u32,
-    sentence_start: usize,
-    sentence_end: usize,
-    token_start: usize,
-    token_end: usize,
-}
-
-#[derive(Clone, Debug)]
-struct WindowScanOutput {
-    window_ix: u32,
-    mentions: Vec<MentionSpan>,
-    narrative_hits: Vec<NarrativeVerbHit>,
 }
 
 fn mention_source_for_detected(
@@ -1322,256 +1229,6 @@ fn hot_path_extraction_config(
     hot_config
 }
 
-fn mention_priority(mention: &MentionSpan) -> (u8, bool, usize, i32) {
-    let source_rank = match mention.source {
-        Some(MentionSource::Known) => 5,
-        Some(MentionSource::Alias) => 4,
-        Some(MentionSource::Fuzzy) => 3,
-        Some(MentionSource::Discovery) => 2,
-        None => 1,
-    };
-    (
-        source_rank,
-        mention.entity_ref.is_some(),
-        (mention.range.end - mention.range.start) as usize,
-        (mention.confidence * 1000.0).round() as i32,
-    )
-}
-
-fn compare_mention_spans(left: &MentionSpan, right: &MentionSpan) -> Ordering {
-    mention_priority(left)
-        .cmp(&mention_priority(right))
-        .then_with(|| left.range.start.cmp(&right.range.start).reverse())
-}
-
-fn dedupe_mention_spans(mut mentions: Vec<MentionSpan>) -> Vec<MentionSpan> {
-    if mentions.is_empty() {
-        return mentions;
-    }
-    mentions.sort_by(|left, right| {
-        left.range
-            .start
-            .cmp(&right.range.start)
-            .then_with(|| right.range.end.cmp(&left.range.end))
-            .then_with(|| compare_mention_spans(left, right).reverse())
-    });
-    let mut deduped = Vec::with_capacity(mentions.len());
-    let mut index = 0usize;
-    while index < mentions.len() {
-        let mut best = mentions[index].clone();
-        let mut cluster_end = mentions[index].range.end;
-        let mut cursor = index + 1;
-        while cursor < mentions.len() && mentions[cursor].range.start < cluster_end {
-            cluster_end = cluster_end.max(mentions[cursor].range.end);
-            if compare_mention_spans(&mentions[cursor], &best).is_gt() {
-                best = mentions[cursor].clone();
-            }
-            cursor += 1;
-        }
-        deduped.push(best);
-        index = cursor;
-    }
-    deduped.sort_by_key(|mention| mention.range.start);
-    deduped
-}
-
-fn dedupe_narrative_hits(mut hits: Vec<NarrativeVerbHit>) -> Vec<NarrativeVerbHit> {
-    hits.sort_by(|left, right| {
-        left.range
-            .start
-            .cmp(&right.range.start)
-            .then_with(|| left.range.end.cmp(&right.range.end))
-            .then_with(|| left.relation_type.cmp(&right.relation_type))
-            .then_with(|| left.lemma.cmp(&right.lemma))
-            .then_with(|| left.sentence_index.cmp(&right.sentence_index))
-    });
-    hits.dedup_by(|left, right| {
-        left.range == right.range
-            && left.relation_type == right.relation_type
-            && left.lemma == right.lemma
-            && left.sentence_index == right.sentence_index
-    });
-    hits
-}
-
-fn plan_scan_windows(sentences: &[SentenceSpan], tokens: &[TokenSpan]) -> Vec<ScanWindowPlan> {
-    if sentences.is_empty() {
-        return Vec::new();
-    }
-    let mut windows = Vec::new();
-    let mut sentence_start = 0usize;
-    let mut token_cursor = 0usize;
-    while sentence_start < sentences.len() {
-        let window_start_byte = sentences[sentence_start].range.start as usize;
-        let mut sentence_end = sentence_start + 1;
-        while sentence_end < sentences.len()
-            && (sentences[sentence_end - 1].range.end as usize).saturating_sub(window_start_byte)
-                < SCAN_WINDOW_TARGET_BYTES
-        {
-            sentence_end += 1;
-        }
-        let sentence_end = sentence_end.min(sentences.len());
-        while token_cursor < tokens.len()
-            && tokens[token_cursor].range.end <= sentences[sentence_start].range.start
-        {
-            token_cursor += 1;
-        }
-        let token_start = token_cursor;
-        let window_end_range = sentences[sentence_end - 1].range.end;
-        while token_cursor < tokens.len() && tokens[token_cursor].range.start < window_end_range {
-            token_cursor += 1;
-        }
-        windows.push(ScanWindowPlan {
-            window_ix: windows.len() as u32,
-            sentence_start,
-            sentence_end,
-            token_start,
-            token_end: token_cursor,
-        });
-        if sentence_end >= sentences.len() {
-            break;
-        }
-        let window_len = sentence_end.saturating_sub(sentence_start);
-        let overlap = SCAN_WINDOW_OVERLAP_SENTENCES.min(window_len.saturating_sub(1));
-        let next_start = sentence_end.saturating_sub(overlap);
-        sentence_start = next_start.max(sentence_start + 1);
-    }
-    windows
-}
-
-fn scan_window(
-    text: &str,
-    tokens: &[TokenSpan],
-    sentences: &[SentenceSpan],
-    plan: &ScanWindowPlan,
-    seed_gazetteer: Option<&CompiledSeedGazetteer>,
-    resolver_seed: &[ResolverEntitySeed],
-    extraction: &InvarantV3ExtractionConfig,
-) -> WindowScanOutput {
-    let token_slice = &tokens[plan.token_start..plan.token_end];
-    let sentence_slice = &sentences[plan.sentence_start..plan.sentence_end];
-    WindowScanOutput {
-        window_ix: plan.window_ix,
-        mentions: detect_mentions(
-            text,
-            token_slice,
-            sentence_slice,
-            seed_gazetteer,
-            resolver_seed,
-            extraction,
-        ),
-        narrative_hits: discover_narrative_hits(text, token_slice, sentence_slice),
-    }
-}
-
-fn scan_mentions_and_hits(
-    text: &str,
-    tokens: &[TokenSpan],
-    sentences: &[SentenceSpan],
-    seed_gazetteer: Option<&CompiledSeedGazetteer>,
-    resolver_seed: &[ResolverEntitySeed],
-    extraction: &InvarantV3ExtractionConfig,
-) -> (Vec<MentionSpan>, Vec<NarrativeVerbHit>) {
-    if sentences.len() < SCAN_WINDOW_MIN_SENTENCES || text.len() <= SCAN_WINDOW_TARGET_BYTES * 2 {
-        rayon::join(
-            || {
-                detect_mentions(
-                    text,
-                    tokens,
-                    sentences,
-                    seed_gazetteer,
-                    resolver_seed,
-                    extraction,
-                )
-            },
-            || discover_narrative_hits(text, tokens, sentences),
-        )
-    } else {
-        let plans = plan_scan_windows(sentences, tokens);
-        if plans.len() <= 1 {
-            rayon::join(
-                || {
-                    detect_mentions(
-                        text,
-                        tokens,
-                        sentences,
-                        seed_gazetteer,
-                        resolver_seed,
-                        extraction,
-                    )
-                },
-                || discover_narrative_hits(text, tokens, sentences),
-            )
-        } else {
-            let outputs = plans
-                .par_iter()
-                .map(|plan| {
-                    scan_window(
-                        text,
-                        tokens,
-                        sentences,
-                        plan,
-                        seed_gazetteer,
-                        resolver_seed,
-                        extraction,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut ordered = outputs;
-            ordered.sort_by_key(|output| output.window_ix);
-            let mut mentions = Vec::new();
-            let mut narrative_hits = Vec::new();
-            for output in ordered {
-                mentions.extend(output.mentions);
-                narrative_hits.extend(output.narrative_hits);
-            }
-            (
-                dedupe_mention_spans(mentions),
-                dedupe_narrative_hits(narrative_hits),
-            )
-        }
-    }
-}
-
-fn build_resolver_links(mentions: &[MentionSpan]) -> Vec<ResolverLink> {
-    let mut links = Vec::new();
-    let mut last_entity_by_surface = FxHashMap::<String, usize>::default();
-    let mut antecedent = None::<usize>;
-    for (index, mention) in mentions.iter().enumerate() {
-        let normalized = normalize_surface(&mention.surface);
-        if is_pronoun(&normalized) {
-            if let Some(target_ix) = antecedent {
-                let target = &mentions[target_ix];
-                links.push(ResolverLink {
-                    source_range: mention.range,
-                    target_range: Some(target.range),
-                    target_entity: target.entity_ref.clone(),
-                    link_kind: Some(ResolverLinkKind::Pronoun),
-                    confidence: 0.72,
-                    sentence_index: mention.sentence_index,
-                });
-            }
-            continue;
-        }
-        if let Some(previous_ix) = last_entity_by_surface.get(&normalized).copied() {
-            let previous = &mentions[previous_ix];
-            links.push(ResolverLink {
-                source_range: mention.range,
-                target_range: Some(previous.range),
-                target_entity: previous.entity_ref.clone(),
-                link_kind: Some(ResolverLinkKind::AliasCandidate),
-                confidence: 0.61,
-                sentence_index: mention.sentence_index,
-            });
-        }
-        if mention.entity_ref.is_some() {
-            antecedent = Some(index);
-        }
-        last_entity_by_surface.insert(normalized, index);
-    }
-    links
-}
-
 fn should_register_surface_binding(
     mention: &MentionSpan,
     coref_kind: CorefMentionKind,
@@ -1651,24 +1308,13 @@ fn build_entity_library(
     mention_coref_kinds: &[CorefMentionKind],
     surface_counts: &[u32],
 ) -> AlexEntityLibrary {
-    let surface_bindings = build_surface_library_bindings(
-        mentions,
-        mention_surface_ords,
-        mention_coref_kinds,
-        surface_counts,
-    );
-    let resolved_surface_count = surface_bindings
-        .iter()
-        .filter(|binding| binding.entity_ref.is_some() && !binding.ambiguous)
-        .count();
-    let ambiguous_surface_count = surface_bindings
-        .iter()
-        .filter(|binding| binding.ambiguous)
-        .count();
     AlexEntityLibrary {
-        surface_bindings,
-        resolved_surface_count,
-        ambiguous_surface_count,
+        surface_bindings: build_surface_library_bindings(
+            mentions,
+            mention_surface_ords,
+            mention_coref_kinds,
+            surface_counts,
+        ),
     }
 }
 
@@ -1719,23 +1365,15 @@ fn build_occurrence_layers(
     mention_surface_ords: &[u32],
     mention_coref_kinds: &[CorefMentionKind],
     entity_library: &AlexEntityLibrary,
-) -> (
-    Vec<OccurrenceAtom>,
-    Vec<MentionFamily>,
-    Vec<Option<u32>>,
-    PronounLane,
-) {
-    let mut occurrences = Vec::with_capacity(mentions.len());
+) -> (Vec<MentionFamily>, Vec<Option<u32>>) {
     let mut mention_families = Vec::<MentionFamily>::new();
     let mut family_ord_by_surface = FxHashMap::<u32, u32>::default();
     let mut family_ord_by_mention = vec![None; mentions.len()];
-    let mut pronoun_lane = PronounLane::default();
 
     for (mention_ix, mention) in mentions.iter().enumerate() {
         let surface_ord = mention_surface_ords[mention_ix];
         let mention_kind = mention_coref_kinds[mention_ix];
         let family_ord = if mention_kind == CorefMentionKind::Pronoun {
-            pronoun_lane.mention_indexes.push(mention_ix);
             None
         } else if let Some(existing) = family_ord_by_surface.get(&surface_ord).copied() {
             Some(existing)
@@ -1743,7 +1381,6 @@ fn build_occurrence_layers(
             let family_ord = mention_families.len() as u32;
             let binding = &entity_library.surface_bindings[surface_ord as usize];
             mention_families.push(MentionFamily {
-                surface_ord,
                 mention_kind,
                 representative_mention_ix: mention_ix,
                 member_indexes: Vec::new(),
@@ -1775,21 +1412,9 @@ fn build_occurrence_layers(
                 }
             }
         }
-        occurrences.push(OccurrenceAtom {
-            mention_ix,
-            surface_ord,
-            family_ord,
-            sentence_index: mention.sentence_index,
-            mention_kind,
-        });
     }
 
-    (
-        occurrences,
-        mention_families,
-        family_ord_by_mention,
-        pronoun_lane,
-    )
+    (mention_families, family_ord_by_mention)
 }
 
 fn build_resolver_links_native(
@@ -1845,32 +1470,6 @@ fn build_resolver_links_native(
         last_entity_by_surface.insert(surface_ord, index);
     }
     links
-}
-
-fn discover_narrative_hits(
-    text: &str,
-    tokens: &[TokenSpan],
-    sentences: &[SentenceSpan],
-) -> Vec<NarrativeVerbHit> {
-    let mut hits = Vec::new();
-    let mut sentence_cursor = 0usize;
-    for token in tokens {
-        if !matches!(token.pos, Some(PosTag::Verb)) {
-            continue;
-        }
-        let normalized = normalize_token_surface(slice_or_empty(text, token.range));
-        let (lemma, event_class, relation_type, transitivity) = classify_verb(&normalized);
-        hits.push(NarrativeVerbHit {
-            range: token.range,
-            lemma,
-            event_class,
-            relation_type,
-            transitivity,
-            sentence_index: locate_sentence_cursor(sentences, &mut sentence_cursor, token.range),
-            confidence: 0.7,
-        });
-    }
-    hits
 }
 
 fn build_chunk_records(
@@ -1941,19 +1540,13 @@ fn scan_native_compact(
     resolver_seed: &[ResolverEntitySeed],
     extraction: &InvarantV3ExtractionConfig,
 ) -> NativeScanRows {
-    let tokens = tokenize(text);
-    let sentences = sentence_spans(text);
     let hot_config = hot_path_extraction_config(text.len(), resolver_seed, extraction);
-    let seed_gazetteer = build_seed_gazetteer(scope, resolver_seed);
-    let (mut mentions, narrative_hits) = scan_mentions_and_hits(
-        text,
-        &tokens,
-        &sentences,
-        seed_gazetteer.as_ref(),
-        resolver_seed,
-        &hot_config,
-    );
+    let compiler = machine_compiler_for_extraction(&hot_config);
+    let scan = compiler.compatibility_scan_parts(text, scope, resolver_seed);
+    let mut mentions = scan.mentions;
     mentions.retain(hot_path_should_keep_mention);
+    let sentences = scan.sentences;
+    let narrative_hits = scan.narrative_hits;
     let mut surface_ord_by_normalized = FxHashMap::<String, u32>::default();
     let mut acronym_ord_by_value = FxHashMap::<String, u32>::default();
     let mut surface_atoms = Vec::<SurfaceAtom>::new();
@@ -2016,7 +1609,7 @@ fn scan_native_compact(
         &mention_coref_kinds,
         &entity_library.surface_bindings,
     );
-    let (occurrences, mention_families, family_ord_by_mention, pronoun_lane) =
+    let (mention_families, family_ord_by_mention) =
         build_occurrence_layers(
             &mentions,
             &mention_surface_ords,
@@ -2046,10 +1639,8 @@ fn scan_native_compact(
         mentions,
         resolver_links,
         narrative_hits,
-        occurrences,
         mention_families,
         family_ord_by_mention,
-        pronoun_lane,
         entity_library,
         surface_atoms,
         surface_counts,
@@ -6151,14 +5742,6 @@ fn build_kernel_batch(
     }
 }
 
-fn frame_slot_from_mention(mention: &MentionSpan) -> FrameSlot {
-    FrameSlot {
-        range: mention.range,
-        entity_ref: mention.entity_ref.clone(),
-        confidence: mention.confidence,
-    }
-}
-
 fn locate_sentence(sentences: &[SentenceSpan], range: TextRange) -> Option<usize> {
     let mut left = 0usize;
     let mut right = sentences.len();
@@ -6379,283 +5962,8 @@ fn is_pronoun(value: &str) -> bool {
     )
 }
 
-fn is_verb_token(value: &str) -> bool {
-    matches!(
-        value,
-        "attack"
-            | "attacked"
-            | "attacks"
-            | "met"
-            | "meet"
-            | "meets"
-            | "rose"
-            | "rise"
-            | "rises"
-            | "woke"
-            | "wake"
-            | "wakes"
-            | "wrote"
-            | "write"
-            | "writes"
-            | "mapped"
-            | "map"
-            | "maps"
-            | "gave"
-            | "give"
-            | "gives"
-            | "waited"
-            | "wait"
-            | "waits"
-            | "saw"
-            | "see"
-            | "sees"
-            | "found"
-            | "find"
-            | "finds"
-            | "fought"
-            | "fight"
-            | "fights"
-            | "moved"
-            | "move"
-            | "moves"
-            | "crossed"
-            | "cross"
-            | "crosses"
-            | "join"
-            | "joined"
-            | "joins"
-            | "work"
-            | "worked"
-            | "works"
-            | "belong"
-            | "belonged"
-            | "belongs"
-            | "live"
-            | "lived"
-            | "lives"
-            | "reside"
-            | "resided"
-            | "resides"
-            | "stay"
-            | "stayed"
-            | "stays"
-            | "base"
-            | "based"
-            | "bases"
-            | "command"
-            | "commanded"
-            | "commands"
-            | "protect"
-            | "protected"
-            | "protects"
-            | "lead"
-            | "leads"
-            | "led"
-            | "manage"
-            | "managed"
-            | "manages"
-            | "head"
-            | "headed"
-            | "heads"
-            | "travel"
-            | "traveled"
-            | "travels"
-            | "arrive"
-            | "arrived"
-            | "arrives"
-            | "leave"
-            | "left"
-            | "leaves"
-            | "report"
-            | "reported"
-            | "reports"
-            | "announce"
-            | "announced"
-            | "announces"
-            | "say"
-            | "said"
-            | "says"
-            | "tell"
-            | "told"
-            | "tells"
-            | "build"
-            | "built"
-            | "builds"
-            | "create"
-            | "created"
-            | "creates"
-            | "destroy"
-            | "destroyed"
-            | "destroys"
-            | "start"
-            | "started"
-            | "starts"
-            | "begin"
-            | "began"
-            | "begins"
-            | "end"
-            | "ended"
-            | "ends"
-    ) || value.ends_with("ed")
-}
-
-fn classify_verb(value: &str) -> (String, String, String, Option<NarrativeTransitivity>) {
-    match value {
-        "attack" | "attacked" | "attacks" | "fight" | "fought" | "fights" => (
-            "attack".to_owned(),
-            "conflict".to_owned(),
-            "attacks".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "met" | "meet" | "meets" => (
-            "meet".to_owned(),
-            "interaction".to_owned(),
-            "meets".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "gave" | "give" | "gives" => (
-            "give".to_owned(),
-            "transfer".to_owned(),
-            "gives".to_owned(),
-            Some(NarrativeTransitivity::Ditransitive),
-        ),
-        "wrote" | "write" | "writes" | "mapped" | "map" | "maps" => (
-            value
-                .trim_end_matches("ed")
-                .trim_end_matches('s')
-                .to_owned(),
-            "creation".to_owned(),
-            "writes".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "join" | "joined" | "joins" | "belong" | "belonged" | "belongs" => (
-            match value {
-                "joined" | "joins" => "join",
-                _ => "belong",
-            }
-            .to_owned(),
-            "affiliation".to_owned(),
-            "member_of".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "work" | "worked" | "works" => (
-            "work".to_owned(),
-            "affiliation".to_owned(),
-            "works_for".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "live" | "lived" | "lives" | "reside" | "resided" | "resides" | "stay" | "stayed"
-        | "stays" | "base" | "based" | "bases" => (
-            match value {
-                "base" | "based" | "bases" => "base",
-                "stay" | "stayed" | "stays" => "stay",
-                "reside" | "resided" | "resides" => "reside",
-                _ => "live",
-            }
-            .to_owned(),
-            "location".to_owned(),
-            "located_in".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "command" | "commanded" | "commands" | "lead" | "leads" | "led" | "manage" | "managed"
-        | "manages" | "head" | "headed" | "heads" => (
-            match value {
-                "lead" | "leads" | "led" => "lead",
-                "manage" | "managed" | "manages" => "manage",
-                "head" | "headed" | "heads" => "head",
-                _ => "command",
-            }
-            .to_owned(),
-            "leadership".to_owned(),
-            "commands".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "protect" | "protected" | "protects" => (
-            "protect".to_owned(),
-            "conflict".to_owned(),
-            "protects".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "move" | "moved" | "moves" | "travel" | "traveled" | "travels" | "arrive" | "arrived"
-        | "arrives" | "leave" | "left" | "leaves" | "cross" | "crossed" | "crosses" => (
-            match value {
-                "travel" | "traveled" | "travels" => "travel",
-                "arrive" | "arrived" | "arrives" => "arrive",
-                "leave" | "left" | "leaves" => "leave",
-                "cross" | "crossed" | "crosses" => "cross",
-                _ => "move",
-            }
-            .to_owned(),
-            "movement".to_owned(),
-            "moves".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "report" | "reported" | "reports" | "announce" | "announced" | "announces" | "say"
-        | "said" | "says" | "tell" | "told" | "tells" => (
-            match value {
-                "announce" | "announced" | "announces" => "announce",
-                "say" | "said" | "says" => "say",
-                "tell" | "told" | "tells" => "tell",
-                _ => "report",
-            }
-            .to_owned(),
-            "communication".to_owned(),
-            "reports".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "build" | "built" | "builds" | "create" | "created" | "creates" => (
-            match value {
-                "build" | "built" | "builds" => "build",
-                _ => "create",
-            }
-            .to_owned(),
-            "creation".to_owned(),
-            "creates".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "destroy" | "destroyed" | "destroys" => (
-            "destroy".to_owned(),
-            "conflict".to_owned(),
-            "destroys".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        "start" | "started" | "starts" | "begin" | "began" | "begins" | "end" | "ended"
-        | "ends" => (
-            match value {
-                "begin" | "began" | "begins" => "begin",
-                "end" | "ended" | "ends" => "end",
-                _ => "start",
-            }
-            .to_owned(),
-            "lifecycle".to_owned(),
-            match value {
-                "end" | "ended" | "ends" => "ends",
-                _ => "starts",
-            }
-            .to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-        other => (
-            other
-                .trim_end_matches("ed")
-                .trim_end_matches('s')
-                .to_owned(),
-            "action".to_owned(),
-            "relates_to".to_owned(),
-            Some(NarrativeTransitivity::Transitive),
-        ),
-    }
-}
-
 fn range_contains(container: TextRange, inner: TextRange) -> bool {
     container.start <= inner.start && container.end >= inner.end
-}
-
-fn count_token_words(tokens: &[TokenSpan]) -> usize {
-    tokens
-        .iter()
-        .filter(|token| matches!(token.token_class, Some(TokenClass::Word)))
-        .count()
 }
 
 fn slice_or_empty(text: &str, range: TextRange) -> &str {
@@ -6680,16 +5988,6 @@ fn to_range(start: usize, end: usize) -> TextRange {
     }
 }
 
-fn trim_start_offset(text: &str, start: usize, end: usize) -> usize {
-    let slice = &text[start..end];
-    start + slice.len().saturating_sub(slice.trim_start().len())
-}
-
-fn trim_end_offset(text: &str, start: usize, end: usize) -> usize {
-    let slice = &text[start..end];
-    start + slice.trim_end().len()
-}
-
 fn is_front_matter_label(label: &str) -> bool {
     matches!(
         label.trim().to_ascii_lowercase().as_str(),
@@ -6700,12 +5998,13 @@ fn is_front_matter_label(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phoenix_machine::SurfaceCompiler;
     use phoenix_kernel::KernelVertexClass;
     use phoenix_store_native_core::PhoenixGraphKernelStoreV2;
     use phoenix_store_overgraph::PhoenixOvergraphStore;
     use phoenix_types::{GenderHint, NoteId};
     use std::env;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         env::temp_dir().join(format!(
@@ -6801,6 +6100,129 @@ mod tests {
     }
 
     #[test]
+    fn public_scan_and_structure_match_machine_runtime() {
+        let text = "Luffy attacked Zoro in Shells Town.";
+        let scope = ScopeKey::default();
+        let resolver_seed = vec![
+            ResolverEntitySeed {
+                entity_id: EntityId("luffy".to_owned()),
+                canonical_name: "Luffy".to_owned(),
+                aliases: vec!["Straw Hat".to_owned()],
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: scope.clone(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("zoro".to_owned()),
+                canonical_name: "Zoro".to_owned(),
+                aliases: vec!["Roronoa Zoro".to_owned()],
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: scope.clone(),
+            },
+        ];
+        let engine = PhoenixInvarantV3::default();
+        let compiler = SurfaceCompiler::default();
+
+        let engine_scan = engine.scan_parts(text, &scope, &resolver_seed);
+        let engine_structure = engine.build_structure_parts(text, &engine_scan);
+        let machine_scan = compiler.compatibility_scan_parts(text, &scope, &resolver_seed);
+        let machine_structure = compiler.compatibility_structure_parts(text, &machine_scan);
+
+        assert_eq!(engine_scan, machine_scan);
+        assert_eq!(engine_structure, machine_structure);
+    }
+
+    #[test]
+    #[ignore = "perf smoke"]
+    fn public_scan_and_structure_perf_smoke() {
+        let text = concat!(
+            "Luffy attacked Zoro in Shells Town. ",
+            "Nami mapped the harbor while Sanji fed the crew at dawn. ",
+            "The Straw Hat crew met Marines near Orange Town and then escaped by sunset. ",
+            "Robin reported that Baroque Works had agents in Alubarna. ",
+            "Chopper treated Vivi after the battle in the palace square. ",
+            "Franky repaired the Thousand Sunny in Water Seven before the next voyage. "
+        )
+        .repeat(24);
+        let scope = ScopeKey::default();
+        let resolver_seed = vec![
+            ResolverEntitySeed {
+                entity_id: EntityId("luffy".to_owned()),
+                canonical_name: "Luffy".to_owned(),
+                aliases: vec!["Straw Hat".to_owned()],
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: scope.clone(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("zoro".to_owned()),
+                canonical_name: "Zoro".to_owned(),
+                aliases: vec!["Roronoa Zoro".to_owned()],
+                kind: Some(EntityKind::Character),
+                gender: Some(GenderHint::Male),
+                number: None,
+                scope: scope.clone(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("sunny".to_owned()),
+                canonical_name: "Thousand Sunny".to_owned(),
+                aliases: vec!["Sunny".to_owned()],
+                kind: Some(EntityKind::Item),
+                gender: None,
+                number: None,
+                scope: scope.clone(),
+            },
+            ResolverEntitySeed {
+                entity_id: EntityId("baroque".to_owned()),
+                canonical_name: "Baroque Works".to_owned(),
+                aliases: Vec::new(),
+                kind: Some(EntityKind::Organization),
+                gender: None,
+                number: None,
+                scope: scope.clone(),
+            },
+        ];
+        let engine = PhoenixInvarantV3::default();
+        let compiler = SurfaceCompiler::default();
+        let iterations = 128usize;
+
+        let machine_start = Instant::now();
+        let mut machine_checksum = 0usize;
+        for _ in 0..iterations {
+            let scan = compiler.compatibility_scan_parts(&text, &scope, &resolver_seed);
+            let structure = compiler.compatibility_structure_parts(&text, &scan);
+            machine_checksum += scan.mentions.len() + structure.relations.len();
+        }
+        let machine_elapsed = machine_start.elapsed();
+
+        let engine_start = Instant::now();
+        let mut engine_checksum = 0usize;
+        for _ in 0..iterations {
+            let scan = engine.scan_parts(&text, &scope, &resolver_seed);
+            let structure = engine.build_structure_parts(&text, &scan);
+            engine_checksum += scan.mentions.len() + structure.relations.len();
+        }
+        let engine_elapsed = engine_start.elapsed();
+
+        println!(
+            "perf_smoke iterations={iterations} machine_total_ms={} machine_per_iter_ms={:.3} engine_total_ms={} engine_per_iter_ms={:.3} checksum={}/{}",
+            machine_elapsed.as_millis(),
+            machine_elapsed.as_secs_f64() * 1000.0 / iterations as f64,
+            engine_elapsed.as_millis(),
+            engine_elapsed.as_secs_f64() * 1000.0 / iterations as f64,
+            machine_checksum,
+            engine_checksum
+        );
+
+        assert_eq!(machine_checksum, engine_checksum);
+        assert!(machine_checksum > 0);
+    }
+
+    #[test]
     fn hybrid_ee_detects_seeded_lowercase_and_multiword_entities() {
         let engine = PhoenixInvarantV3::default();
         let scan = engine.scan_parts(
@@ -6824,15 +6246,6 @@ mod tests {
         assert!(surfaces.iter().any(|surface| surface == "luffy"));
         assert!(surfaces.iter().any(|surface| surface == "Acme Corporation"));
         assert!(surfaces.iter().any(|surface| surface == "New York"));
-    }
-
-    #[test]
-    fn classify_verb_promotes_state_and_event_families() {
-        assert_eq!(classify_verb("worked").2, "works_for");
-        assert_eq!(classify_verb("joined").2, "member_of");
-        assert_eq!(classify_verb("lived").2, "located_in");
-        assert_eq!(classify_verb("reported").2, "reports");
-        assert_eq!(classify_verb("started").2, "starts");
     }
 
     #[test]
@@ -7671,12 +7084,18 @@ impl Default for InvarantV3Config {
     }
 }
 
-#[derive(Default)]
 pub struct PhoenixInvarantV3 {
     config: InvarantV3Config,
+    compiler: SurfaceCompiler,
 }
 
 pub type PhoenixIngestNative = PhoenixInvarantV3;
+
+impl Default for PhoenixInvarantV3 {
+    fn default() -> Self {
+        Self::new(InvarantV3Config::default())
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct V2IngestArtifacts {
@@ -7764,35 +7183,16 @@ struct SurfaceLibraryBinding {
 #[derive(Clone, Debug, Default)]
 struct AlexEntityLibrary {
     surface_bindings: Vec<SurfaceLibraryBinding>,
-    resolved_surface_count: usize,
-    ambiguous_surface_count: usize,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Copy, Debug)]
-struct OccurrenceAtom {
-    mention_ix: usize,
-    surface_ord: u32,
-    family_ord: Option<u32>,
-    sentence_index: usize,
-    mention_kind: CorefMentionKind,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct MentionFamily {
-    surface_ord: u32,
     mention_kind: CorefMentionKind,
     representative_mention_ix: usize,
     member_indexes: Vec<usize>,
     resolved_entity_ref: Option<MentionEntityRef>,
     ambiguous: bool,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Clone, Debug, Default)]
-struct PronounLane {
-    mention_indexes: Vec<usize>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -7802,10 +7202,8 @@ struct NativeScanRows {
     mentions: Vec<MentionSpan>,
     resolver_links: Vec<ResolverLink>,
     narrative_hits: Vec<NarrativeVerbHit>,
-    occurrences: Vec<OccurrenceAtom>,
     mention_families: Vec<MentionFamily>,
     family_ord_by_mention: Vec<Option<u32>>,
-    pronoun_lane: PronounLane,
     entity_library: AlexEntityLibrary,
     surface_atoms: Vec<SurfaceAtom>,
     surface_counts: Vec<u32>,
@@ -8209,7 +7607,8 @@ struct IngestedDocumentOutcome {
 
 impl PhoenixInvarantV3 {
     pub fn new(config: InvarantV3Config) -> Self {
-        Self { config }
+        let compiler = machine_compiler_for_extraction(&config.extraction);
+        Self { config, compiler }
     }
 
     pub fn config(&self) -> &InvarantV3Config {
@@ -8258,209 +7657,29 @@ impl PhoenixInvarantV3 {
     pub fn scan_parts(
         &self,
         text: &str,
-        _scope: &ScopeKey,
+        scope: &ScopeKey,
         resolver_seed: &[ResolverEntitySeed],
     ) -> ScanArtifact {
         let progress = native_progress_enabled();
         let phase_started = Instant::now();
-        let tokens = tokenize(text);
+        let scan = self
+            .compiler
+            .compatibility_scan_parts(text, scope, resolver_seed);
         if progress {
             eprintln!(
-                "[runtime-ingest] scan_subphase=tokenize wall_ms={} tokens={}",
+                "[runtime-ingest] scan_subphase=compatibility_scan_parts wall_ms={} sentences={} mentions={} resolver_links={} narrative_hits={}",
                 phase_started.elapsed().as_millis(),
-                tokens.len(),
+                scan.sentences.len(),
+                scan.mentions.len(),
+                scan.resolver_links.len(),
+                scan.narrative_hits.len(),
             );
         }
-        let phase_started = Instant::now();
-        let sentences = sentence_spans(text);
-        if progress {
-            eprintln!(
-                "[runtime-ingest] scan_subphase=sentence_spans wall_ms={} sentences={}",
-                phase_started.elapsed().as_millis(),
-                sentences.len(),
-            );
-        }
-        let phase_started = Instant::now();
-        let seed_gazetteer = build_seed_gazetteer(_scope, resolver_seed);
-        let mentions = detect_mentions(
-            text,
-            &tokens,
-            &sentences,
-            seed_gazetteer.as_ref(),
-            resolver_seed,
-            &self.config.extraction,
-        );
-        if progress {
-            eprintln!(
-                "[runtime-ingest] scan_subphase=discover_mentions wall_ms={} mentions={}",
-                phase_started.elapsed().as_millis(),
-                mentions.len(),
-            );
-        }
-        let phase_started = Instant::now();
-        let resolver_links = build_resolver_links(&mentions);
-        if progress {
-            eprintln!(
-                "[runtime-ingest] scan_subphase=build_resolver_links wall_ms={} resolver_links={}",
-                phase_started.elapsed().as_millis(),
-                resolver_links.len(),
-            );
-        }
-        let phase_started = Instant::now();
-        let narrative_hits = discover_narrative_hits(text, &tokens, &sentences);
-        if progress {
-            eprintln!(
-                "[runtime-ingest] scan_subphase=discover_narrative_hits wall_ms={} narrative_hits={}",
-                phase_started.elapsed().as_millis(),
-                narrative_hits.len(),
-            );
-        }
-        let chunks = sentences
-            .iter()
-            .map(|sentence| ChunkSpan {
-                kind: Some(ChunkKind::Clause),
-                range: sentence.range,
-                head: sentence.range,
-                modifiers: Vec::new(),
-                sentence_index: sentence.index,
-            })
-            .collect::<Vec<_>>();
-        ScanArtifact {
-            diagnostics: vec![Diagnostic {
-                code: "PX_INVARANT_V2_SCAN".to_owned(),
-                message: format!(
-                    "Invarant V2 scanned {} tokens, {} sentences, and {} mentions.",
-                    count_token_words(&tokens),
-                    sentences.len(),
-                    mentions.len()
-                ),
-            }],
-            sentences,
-            tokens,
-            mentions,
-            chunks,
-            resolver_links,
-            narrative_hits,
-        }
+        scan
     }
 
     pub fn build_structure_parts(&self, text: &str, scan: &ScanArtifact) -> StructureArtifact {
-        let mut sentence_mentions = vec![Vec::<MentionSpan>::new(); scan.sentences.len()];
-        for mention in &scan.mentions {
-            if let Some(bucket) = sentence_mentions.get_mut(mention.sentence_index) {
-                bucket.push(mention.clone());
-            }
-        }
-        let mut sentence_chunks = vec![Vec::<ChunkSpan>::new(); scan.sentences.len()];
-        for chunk in &scan.chunks {
-            if let Some(bucket) = sentence_chunks.get_mut(chunk.sentence_index) {
-                bucket.push(chunk.clone());
-            }
-        }
-        let mut sentence_hits = vec![Vec::<NarrativeVerbHit>::new(); scan.sentences.len()];
-        for hit in &scan.narrative_hits {
-            if let Some(bucket) = sentence_hits.get_mut(hit.sentence_index) {
-                bucket.push(hit.clone());
-            }
-        }
-
-        let mut sentence_frames = Vec::with_capacity(scan.sentences.len());
-        let mut relations = Vec::new();
-        let mut evidence_spans = Vec::new();
-
-        for sentence in &scan.sentences {
-            let index = sentence.index;
-            let mentions = sentence_mentions.get(index).cloned().unwrap_or_default();
-            let chunks = sentence_chunks.get(index).cloned().unwrap_or_default();
-            let hits = sentence_hits.get(index).cloned().unwrap_or_default();
-            let mut diagnostics = Vec::new();
-            let mut verb_frames = Vec::new();
-
-            for hit in hits {
-                let subject = mentions
-                    .iter()
-                    .filter(|mention| mention.range.end <= hit.range.start)
-                    .max_by_key(|mention| mention.range.end)
-                    .map(frame_slot_from_mention);
-                let trailing = mentions
-                    .iter()
-                    .filter(|mention| mention.range.start >= hit.range.end)
-                    .collect::<Vec<_>>();
-                let object = trailing
-                    .first()
-                    .map(|mention| frame_slot_from_mention(mention));
-                let recipient = trailing
-                    .get(1)
-                    .map(|mention| frame_slot_from_mention(mention));
-                let evidence = vec![EvidenceSpan {
-                    document_id: None,
-                    note_id: None,
-                    label: slice_or_empty(text, sentence.range).trim().to_owned(),
-                    kind: Some("sentence".to_owned()),
-                    range: sentence.range,
-                }];
-                evidence_spans.extend(evidence.iter().cloned());
-                let attachments = chunks
-                    .iter()
-                    .filter(|chunk| chunk.range.start >= hit.range.end)
-                    .take(1)
-                    .map(|chunk| chunk.range)
-                    .collect::<Vec<_>>();
-                if subject.is_none() {
-                    diagnostics.push(Diagnostic {
-                        code: "PX_INVARANT_V2_STRUCTURE_SUBJECT_GAP".to_owned(),
-                        message: format!(
-                            "Invarant V2 inferred relation '{}' without a clear subject.",
-                            hit.relation_type
-                        ),
-                    });
-                }
-                relations.push(RelationCandidate {
-                    sentence_index: index,
-                    verb_range: hit.range,
-                    lemma: hit.lemma.clone(),
-                    event_class: hit.event_class.clone(),
-                    relation_type: hit.relation_type.clone(),
-                    subject: subject.clone(),
-                    object: object.clone(),
-                    recipient: recipient.clone(),
-                    attachments: attachments.clone(),
-                    evidence: evidence.clone(),
-                });
-                verb_frames.push(VerbFrame {
-                    verb_range: hit.range,
-                    lemma: hit.lemma,
-                    event_class: hit.event_class,
-                    relation_type: hit.relation_type,
-                    transitivity: hit.transitivity,
-                    subject_candidates: subject.into_iter().collect(),
-                    object_candidates: object.into_iter().collect(),
-                    recipient_candidates: recipient.into_iter().collect(),
-                    pp_attachments: attachments,
-                    clause_range: sentence.range,
-                    evidence,
-                });
-            }
-
-            sentence_frames.push(SentenceFrame {
-                sentence: sentence.clone(),
-                mentions,
-                chunks,
-                verb_frames,
-                clause_ranges: vec![sentence.range],
-                diagnostics,
-            });
-        }
-
-        StructureArtifact {
-            sentence_frames,
-            relations,
-            evidence_spans,
-            diagnostics: vec![Diagnostic {
-                code: "PX_INVARANT_V2_STRUCTURE".to_owned(),
-                message: "Invarant V2 built sentence frames and relation candidates.".to_owned(),
-            }],
-        }
+        self.compiler.compatibility_structure_parts(text, scan)
     }
 
     pub fn ingest_documents(

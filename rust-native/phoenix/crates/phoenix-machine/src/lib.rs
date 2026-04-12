@@ -1,12 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use compact_str::CompactString;
-use memchr::memchr3_iter;
+use phoenix_embed::OrtTextEmbedder;
 use phoenix_types::{
-    Attachment, ChunkKind, ChunkSpan, Clause, Diagnostic, EntityKind, EvidenceSpan, FrameSlot,
+    Attachment, ChunkKind, Clause, Diagnostic, EntityKind, EvidenceSpan, FrameSlot,
     MentionEntityRef, MentionSource, MentionSpan, NarrativeTransitivity, NarrativeVerbHit,
     PhraseKind, PhraseNode, PosTag, QuoteBlock, RelationCandidate, ResolverEntitySeed,
     ResolverLink, ResolverLinkKind, ScanArtifact, ScanRequest, ScopeKey, SentenceFrame,
@@ -22,6 +22,14 @@ use scirs2_text::named_entity_recognition::{
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+
+mod semantic_chunks;
+mod syntax;
+
+pub use semantic_chunks::{
+    build_semantic_units, build_semantic_units_from_embeddings, MachineSemanticChunkConfig,
+    SemanticChunkError,
+};
 
 const RULE_NER_MAX_BYTES_WITHOUT_SEEDS: usize = 256 * 1024;
 const HOT_PATH_PATTERN_NER_MAX_BYTES: usize = 512 * 1024;
@@ -66,9 +74,11 @@ pub struct SurfaceCompileArtifacts {
     pub surface: SurfaceDocument,
 }
 
+pub type ScirsTextAnalysis = SurfaceCompileArtifacts;
+
 pub struct SurfaceCompiler {
     config: MachineConfig,
-    seed_cache: RwLock<Option<CachedSeedResources>>,
+    seed_cache: RwLock<Option<Arc<CachedSeedResources>>>,
 }
 
 impl Default for SurfaceCompiler {
@@ -90,6 +100,15 @@ impl SurfaceCompiler {
 
     pub fn config(&self) -> &MachineConfig {
         &self.config
+    }
+
+    pub fn analyze_document(
+        &self,
+        text: &str,
+        scope: &ScopeKey,
+        resolver_seed: &[ResolverEntitySeed],
+    ) -> ScirsTextAnalysis {
+        self.compile(text, scope, resolver_seed)
     }
 
     pub fn compile(
@@ -118,9 +137,9 @@ impl SurfaceCompiler {
         _scope: &ScopeKey,
         resolver_seed: &[ResolverEntitySeed],
     ) -> ScanArtifact {
-        let tokenized = tokenize(text);
+        let tokenized = syntax::tokenize(text);
         let seed_resources = self.seed_resources(resolver_seed);
-        let sentences = sentence_spans(text);
+        let sentences = syntax::sentence_spans(text);
         let detected = detect_mentions_hot_path(
             text,
             &tokenized,
@@ -133,16 +152,8 @@ impl SurfaceCompiler {
         let resolver_links = build_resolver_links(&mentions, &detected.normalized_surfaces);
         let narrative_hits =
             discover_narrative_hits(&tokenized.tokens, &tokenized.normalized_tokens, &sentences);
-        let chunks = sentences
-            .iter()
-            .map(|sentence| ChunkSpan {
-                kind: Some(ChunkKind::Clause),
-                range: sentence.range,
-                head: sentence.range,
-                modifiers: Vec::new(),
-                sentence_index: sentence.index,
-            })
-            .collect::<Vec<_>>();
+        let chunks =
+            syntax::build_chunks(text, &tokenized.tokens, &tokenized.normalized_tokens, &sentences);
 
         ScanArtifact {
             diagnostics: vec![Diagnostic {
@@ -161,6 +172,16 @@ impl SurfaceCompiler {
             resolver_links,
             narrative_hits,
         }
+    }
+
+    pub fn semantic_units(
+        &self,
+        text: &str,
+        embedder: &OrtTextEmbedder,
+        config: &MachineSemanticChunkConfig,
+    ) -> Result<Vec<SurfaceUnit>, SemanticChunkError> {
+        let _ = self;
+        build_semantic_units(text, embedder, config)
     }
 
     pub fn build_structure_parts(&self, text: &str, scan: &ScanArtifact) -> StructureArtifact {
@@ -277,8 +298,13 @@ impl SurfaceCompiler {
         self.build_structure_parts(text, scan)
     }
 
-    pub fn compatibility_scan(&self, request: &ScanRequest) -> ScanArtifact {
-        let mut scan = self.scan_parts(&request.text, &request.scope, &request.resolver_seed);
+    pub fn compatibility_scan_parts(
+        &self,
+        text: &str,
+        scope: &ScopeKey,
+        resolver_seed: &[ResolverEntitySeed],
+    ) -> ScanArtifact {
+        let mut scan = self.scan_parts(text, scope, resolver_seed);
         scan.diagnostics = vec![Diagnostic {
             code: "PX_INVARANT_V2_SCAN".to_owned(),
             message: format!(
@@ -291,8 +317,12 @@ impl SurfaceCompiler {
         scan
     }
 
-    pub fn compatibility_structure(&self, request: &StructureRequest) -> StructureArtifact {
-        let mut structure = self.build_structure_parts(&request.text, &request.scan);
+    pub fn compatibility_structure_parts(
+        &self,
+        text: &str,
+        scan: &ScanArtifact,
+    ) -> StructureArtifact {
+        let mut structure = self.build_structure_parts(text, scan);
         for frame in &mut structure.sentence_frames {
             for diagnostic in &mut frame.diagnostics {
                 if diagnostic.code == "PX_MACHINE_STRUCTURE_SUBJECT_GAP" {
@@ -310,7 +340,15 @@ impl SurfaceCompiler {
         structure
     }
 
-    fn seed_resources(&self, resolver_seed: &[ResolverEntitySeed]) -> CachedSeedResources {
+    pub fn compatibility_scan(&self, request: &ScanRequest) -> ScanArtifact {
+        self.compatibility_scan_parts(&request.text, &request.scope, &request.resolver_seed)
+    }
+
+    pub fn compatibility_structure(&self, request: &StructureRequest) -> StructureArtifact {
+        self.compatibility_structure_parts(&request.text, &request.scan)
+    }
+
+    fn seed_resources(&self, resolver_seed: &[ResolverEntitySeed]) -> Arc<CachedSeedResources> {
         let cache_key = seed_cache_key(resolver_seed);
         if let Some(cached) = self
             .seed_cache
@@ -322,11 +360,13 @@ impl SurfaceCompiler {
         {
             return cached;
         }
-        let built = CachedSeedResources {
+        let rule_seed_sets = build_rule_seed_sets(resolver_seed);
+        let built = Arc::new(CachedSeedResources {
             cache_key,
             gazetteer: build_seed_gazetteer(resolver_seed),
-            rule_seed_sets: build_rule_seed_sets(resolver_seed),
-        };
+            rule_ner: build_rule_ner(&rule_seed_sets),
+            rule_seed_sets,
+        });
         *self
             .seed_cache
             .write()
@@ -379,11 +419,11 @@ struct CachedRuleSeedSets {
     locations: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
 struct CachedSeedResources {
     cache_key: u64,
     gazetteer: SeedGazetteer,
     rule_seed_sets: CachedRuleSeedSets,
+    rule_ner: RuleBasedNER,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -470,7 +510,7 @@ fn surface_from_artifacts(
             })
         })
         .collect::<Vec<_>>();
-    let units = scan
+    let mut units = scan
         .sentences
         .iter()
         .map(|sentence| SurfaceUnit {
@@ -481,6 +521,28 @@ fn surface_from_artifacts(
             chunk_id_hint: None,
         })
         .collect::<Vec<_>>();
+    units.extend(structure.sentence_frames.iter().flat_map(|frame| {
+        frame.clause_ranges.iter().map(|range| SurfaceUnit {
+            kind: SurfaceUnitKind::Clause,
+            key: None,
+            range: SourceRange::from(*range),
+            sentence_index: frame.sentence.index,
+            chunk_id_hint: None,
+        })
+    }));
+    units.extend(scan.chunks.iter().map(|chunk| SurfaceUnit {
+        kind: SurfaceUnitKind::Phrase,
+        key: None,
+        range: SourceRange::from(chunk.range),
+        sentence_index: chunk.sentence_index,
+        chunk_id_hint: Some(CompactString::from(match chunk.kind {
+            Some(ChunkKind::Np) => "phrase:np",
+            Some(ChunkKind::Vp) => "phrase:vp",
+            Some(ChunkKind::Pp) => "phrase:pp",
+            Some(ChunkKind::AdjP) => "phrase:ap",
+            Some(ChunkKind::Clause) | None => "phrase:clause",
+        })),
+    }));
 
     SurfaceDocument {
         tokens,
@@ -492,107 +554,6 @@ fn surface_from_artifacts(
         attachments,
         units,
     }
-}
-
-fn tokenize(text: &str) -> TokenizedDocument {
-    let mut tokens = Vec::new();
-    let mut normalized_tokens = Vec::new();
-    let mut chars = text.char_indices().peekable();
-    while let Some((start, ch)) = chars.next() {
-        if ch.is_whitespace() {
-            continue;
-        }
-        if ch.is_alphanumeric() || ch == '\'' || ch == '-' {
-            let mut end = start + ch.len_utf8();
-            while let Some((next_ix, next)) = chars.peek().copied() {
-                if next.is_alphanumeric() || next == '\'' || next == '-' {
-                    chars.next();
-                    end = next_ix + next.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            let token = &text[start..end];
-            let normalized = normalize_token_surface(token);
-            let pos = if is_pronoun(&normalized) {
-                Some(PosTag::Pronoun)
-            } else if is_verb_token(&normalized) {
-                Some(PosTag::Verb)
-            } else if token
-                .chars()
-                .next()
-                .is_some_and(|value| value.is_uppercase())
-            {
-                Some(PosTag::ProperNoun)
-            } else {
-                Some(PosTag::Noun)
-            };
-            tokens.push(TokenSpan {
-                range: to_range(start, end),
-                token_class: Some(if token.chars().all(|value| value.is_numeric()) {
-                    TokenClass::Number
-                } else {
-                    TokenClass::Word
-                }),
-                pos,
-                masked: false,
-                capitalized: token
-                    .chars()
-                    .next()
-                    .is_some_and(|value| value.is_uppercase()),
-            });
-            normalized_tokens.push(normalized);
-        } else {
-            tokens.push(TokenSpan {
-                range: to_range(start, start + ch.len_utf8()),
-                token_class: Some(if ch.is_ascii_punctuation() {
-                    TokenClass::Punctuation
-                } else {
-                    TokenClass::Symbol
-                }),
-                pos: Some(PosTag::Punctuation),
-                masked: false,
-                capitalized: false,
-            });
-            normalized_tokens.push(String::new());
-        }
-    }
-    TokenizedDocument {
-        tokens,
-        normalized_tokens,
-    }
-}
-
-fn sentence_spans(text: &str) -> Vec<SentenceSpan> {
-    if text.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut ranges = Vec::new();
-    let mut current_start = 0usize;
-    for boundary in memchr3_iter(b'.', b'!', b'?', text.as_bytes()) {
-        let end = boundary + 1;
-        let trimmed_start = trim_start_offset(text, current_start, end);
-        let trimmed_end = trim_end_offset(text, trimmed_start, end);
-        if trimmed_start < trimmed_end {
-            ranges.push((trimmed_start, trimmed_end));
-        }
-        current_start = end;
-    }
-    if current_start < text.len() {
-        let trimmed_start = trim_start_offset(text, current_start, text.len());
-        let trimmed_end = trim_end_offset(text, trimmed_start, text.len());
-        if trimmed_start < trimmed_end {
-            ranges.push((trimmed_start, trimmed_end));
-        }
-    }
-    ranges
-        .into_iter()
-        .enumerate()
-        .map(|(index, (start, end))| SentenceSpan {
-            index,
-            range: to_range(start, end),
-        })
-        .collect()
 }
 
 fn map_ie_entity_kind(kind: &IeEntityType) -> Option<EntityKind> {
@@ -794,7 +755,25 @@ fn seeded_gazetteer_mentions(
     mentions
 }
 
-fn build_rule_entities_from_sets(text: &str, seed_sets: &CachedRuleSeedSets) -> Vec<IeEntity> {
+fn build_rule_ner(seed_sets: &CachedRuleSeedSets) -> RuleBasedNER {
+    let mut ner = RuleBasedNER::with_basic_knowledge();
+    if !seed_sets.people.is_empty() {
+        ner.add_person_names(seed_sets.people.iter().cloned());
+    }
+    if !seed_sets.organizations.is_empty() {
+        ner.add_organizations(seed_sets.organizations.iter().cloned());
+    }
+    if !seed_sets.locations.is_empty() {
+        ner.add_locations(seed_sets.locations.iter().cloned());
+    }
+    ner
+}
+
+fn build_rule_entities_from_sets(
+    text: &str,
+    seed_sets: &CachedRuleSeedSets,
+    rule_ner: &RuleBasedNER,
+) -> Vec<IeEntity> {
     if seed_sets.people.is_empty()
         && seed_sets.organizations.is_empty()
         && seed_sets.locations.is_empty()
@@ -802,27 +781,21 @@ fn build_rule_entities_from_sets(text: &str, seed_sets: &CachedRuleSeedSets) -> 
     {
         return Vec::new();
     }
-    let mut ner = RuleBasedNER::with_basic_knowledge();
-    if !seed_sets.people.is_empty() {
-        ner.add_person_names(seed_sets.people.clone());
-    }
-    if !seed_sets.organizations.is_empty() {
-        ner.add_organizations(seed_sets.organizations.clone());
-    }
-    if !seed_sets.locations.is_empty() {
-        ner.add_locations(seed_sets.locations.clone());
-    }
-    ner.extract_entities(text).unwrap_or_default()
+    rule_ner.extract_entities(text).unwrap_or_default()
 }
 
 fn scirs2_rule_mentions(
     text: &str,
     sentences: &[SentenceSpan],
     resolver_seed: &[ResolverEntitySeed],
-    seed_sets: &CachedRuleSeedSets,
+    seed_resources: &CachedSeedResources,
 ) -> Vec<DetectedMention> {
     let mut sentence_cursor = 0usize;
-    build_rule_entities_from_sets(text, seed_sets)
+    build_rule_entities_from_sets(
+        text,
+        &seed_resources.rule_seed_sets,
+        &seed_resources.rule_ner,
+    )
         .into_iter()
         .filter_map(|entity| {
             let type_hint = map_ie_entity_kind(&entity.entity_type)?;
@@ -1248,7 +1221,7 @@ fn detect_mentions(
                 text,
                 sentences,
                 resolver_seed,
-                &seed_resources.rule_seed_sets,
+                seed_resources,
             ),
         );
     }
@@ -1388,18 +1361,60 @@ fn discover_narrative_hits(
             .get(index)
             .map(String::as_str)
             .unwrap_or_default();
-        let (lemma, event_class, relation_type, transitivity) = classify_verb(&normalized);
+        let sentence_index = locate_sentence_cursor(sentences, &mut sentence_cursor, token.range);
+        let sentence = sentences.get(sentence_index);
+        let (lemma, event_class, mut relation_type, transitivity) = classify_verb(&normalized);
+        if relation_type == "action"
+            && (normalized.ends_with("ed") || normalized.ends_with("ing"))
+            && should_demote_generic_action_relation(tokens, normalized_tokens, index, sentence)
+        {
+            relation_type = "relates_to".to_owned();
+        }
         hits.push(NarrativeVerbHit {
             range: token.range,
             lemma,
             event_class,
             relation_type,
             transitivity,
-            sentence_index: locate_sentence_cursor(sentences, &mut sentence_cursor, token.range),
+            sentence_index,
             confidence: 0.7,
         });
     }
     hits
+}
+
+fn should_demote_generic_action_relation(
+    tokens: &[TokenSpan],
+    normalized_tokens: &[String],
+    index: usize,
+    sentence: Option<&SentenceSpan>,
+) -> bool {
+    let Some(sentence) = sentence else {
+        return false;
+    };
+    let sentence_start = sentence.range.start;
+    let mut saw_strong_nominal = false;
+    for prior_index in (0..index).rev() {
+        let token = &tokens[prior_index];
+        if token.range.start < sentence_start {
+            break;
+        }
+        let normalized = normalized_tokens
+            .get(prior_index)
+            .map(String::as_str)
+            .unwrap_or_default();
+        if normalized.is_empty() || is_discourse_surface(normalized) {
+            continue;
+        }
+        if matches!(
+            token.pos,
+            Some(PosTag::ProperNoun | PosTag::Pronoun | PosTag::Noun)
+        ) {
+            saw_strong_nominal = true;
+            break;
+        }
+    }
+    !saw_strong_nominal
 }
 
 fn frame_slot_from_mention(mention: &MentionSpan) -> FrameSlot {
@@ -1482,6 +1497,10 @@ fn is_pronoun(value: &str) -> bool {
     )
 }
 
+fn is_discourse_surface(value: &str) -> bool {
+    matches!(value, "hey" | "oh" | "ah" | "wow" | "hmm" | "uh" | "um")
+}
+
 fn is_verb_token(value: &str) -> bool {
     matches!(
         value,
@@ -1556,13 +1575,117 @@ fn classify_verb(value: &str) -> (String, String, String, Option<NarrativeTransi
             "writes".to_owned(),
             Some(NarrativeTransitivity::Transitive),
         ),
+        "join" | "joined" | "joins" | "belong" | "belonged" | "belongs" => (
+            match value {
+                "joined" | "joins" => "join",
+                _ => "belong",
+            }
+            .to_owned(),
+            "affiliation".to_owned(),
+            "member_of".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "work" | "worked" | "works" => (
+            "work".to_owned(),
+            "affiliation".to_owned(),
+            "works_for".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "live" | "lived" | "lives" | "reside" | "resided" | "resides" | "stay" | "stayed"
+        | "stays" | "base" | "based" | "bases" => (
+            match value {
+                "base" | "based" | "bases" => "base",
+                "stay" | "stayed" | "stays" => "stay",
+                "reside" | "resided" | "resides" => "reside",
+                _ => "live",
+            }
+            .to_owned(),
+            "location".to_owned(),
+            "located_in".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "command" | "commanded" | "commands" | "lead" | "leads" | "led" | "manage" | "managed"
+        | "manages" | "head" | "headed" | "heads" => (
+            match value {
+                "lead" | "leads" | "led" => "lead",
+                "manage" | "managed" | "manages" => "manage",
+                "head" | "headed" | "heads" => "head",
+                _ => "command",
+            }
+            .to_owned(),
+            "leadership".to_owned(),
+            "commands".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "protect" | "protected" | "protects" => (
+            "protect".to_owned(),
+            "conflict".to_owned(),
+            "protects".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "move" | "moved" | "moves" | "travel" | "traveled" | "travels" | "arrive" | "arrived"
+        | "arrives" | "leave" | "left" | "leaves" | "cross" | "crossed" | "crosses" => (
+            match value {
+                "travel" | "traveled" | "travels" => "travel",
+                "arrive" | "arrived" | "arrives" => "arrive",
+                "leave" | "left" | "leaves" => "leave",
+                "cross" | "crossed" | "crosses" => "cross",
+                _ => "move",
+            }
+            .to_owned(),
+            "movement".to_owned(),
+            "moves".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "report" | "reported" | "reports" | "announce" | "announced" | "announces" | "say"
+        | "said" | "says" | "tell" | "told" | "tells" => (
+            match value {
+                "announce" | "announced" | "announces" => "announce",
+                "say" | "said" | "says" => "say",
+                "tell" | "told" | "tells" => "tell",
+                _ => "report",
+            }
+            .to_owned(),
+            "communication".to_owned(),
+            "reports".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "build" | "built" | "builds" | "create" | "created" | "creates" => (
+            match value {
+                "build" | "built" | "builds" => "build",
+                _ => "create",
+            }
+            .to_owned(),
+            "creation".to_owned(),
+            "creates".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "destroy" | "destroyed" | "destroys" => (
+            "destroy".to_owned(),
+            "conflict".to_owned(),
+            "destroys".to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
+        "start" | "started" | "starts" | "begin" | "began" | "begins" | "end" | "ended"
+        | "ends" => (
+            match value {
+                "begin" | "began" | "begins" => "begin",
+                "end" | "ended" | "ends" => "end",
+                _ => "start",
+            }
+            .to_owned(),
+            "lifecycle".to_owned(),
+            match value {
+                "end" | "ended" | "ends" => "ends",
+                _ => "starts",
+            }
+            .to_owned(),
+            Some(NarrativeTransitivity::Transitive),
+        ),
         other => (
-            other
-                .trim_end_matches("ed")
-                .trim_end_matches('s')
-                .to_owned(),
+            other.to_owned(),
             "action".to_owned(),
-            "relates_to".to_owned(),
+            "action".to_owned(),
             Some(NarrativeTransitivity::Transitive),
         ),
     }
@@ -1606,12 +1729,59 @@ fn to_range(start: usize, end: usize) -> TextRange {
     }
 }
 
-fn trim_start_offset(text: &str, start: usize, end: usize) -> usize {
-    let slice = &text[start..end];
-    start + slice.len().saturating_sub(slice.trim_start().len())
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-fn trim_end_offset(text: &str, start: usize, end: usize) -> usize {
-    let slice = &text[start..end];
-    start + slice.trim_end().len()
+    use super::{classify_verb, SurfaceCompiler};
+    use phoenix_types::{EntityId, EntityKind, ResolverEntitySeed, ScopeKey};
+
+    #[test]
+    fn classify_verb_promotes_known_state_and_event_families() {
+        assert_eq!(classify_verb("worked").2, "works_for");
+        assert_eq!(classify_verb("joined").2, "member_of");
+        assert_eq!(classify_verb("lived").2, "located_in");
+        assert_eq!(classify_verb("reported").2, "reports");
+        assert_eq!(classify_verb("started").2, "starts");
+    }
+
+    #[test]
+    fn classify_verb_keeps_unknown_actions_eventive_and_readable() {
+        let (lemma, event_class, relation_type, _) = classify_verb("reinforced");
+        assert_eq!(lemma, "reinforced");
+        assert_eq!(event_class, "action");
+        assert_eq!(relation_type, "action");
+    }
+
+    #[test]
+    fn seed_resources_reuse_cached_rule_ner_for_same_seed_universe() {
+        let compiler = SurfaceCompiler::default();
+        let scope = ScopeKey::default();
+        let seeds = vec![ResolverEntitySeed {
+            entity_id: EntityId("luffy".to_owned()),
+            canonical_name: "Luffy".to_owned(),
+            aliases: vec!["Straw Hat".to_owned()],
+            kind: Some(EntityKind::Character),
+            gender: None,
+            number: None,
+            scope: scope.clone(),
+        }];
+
+        let first = compiler.seed_resources(&seeds);
+        let second = compiler.seed_resources(&seeds);
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let changed = compiler.seed_resources(&[ResolverEntitySeed {
+            entity_id: EntityId("zoro".to_owned()),
+            canonical_name: "Zoro".to_owned(),
+            aliases: Vec::new(),
+            kind: Some(EntityKind::Character),
+            gender: None,
+            number: None,
+            scope,
+        }]);
+
+        assert!(!Arc::ptr_eq(&first, &changed));
+    }
 }
